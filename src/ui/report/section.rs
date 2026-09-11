@@ -3,6 +3,7 @@
 //! gone, so this renders bare content (no page shell or scrolling).
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{NaiveDate, Utc};
 use gpui::{
@@ -21,9 +22,8 @@ use crate::report::{report_stats, ReportStats};
 /// The report content: summary cards on top, 365-day heatmap below.
 pub fn report_section(app: &TokenMonitorApp, cx: &Context<TokenMonitorApp>) -> AnyElement {
     let p = crate::ui::palette(cx);
-    let data = app.state.report.data.clone();
 
-    let content = match &data {
+    let content = match &app.state.report.data {
         Some(snap) => {
             let today = east8_local(Utc::now()).date_naive();
             let stats = report_stats(&snap.days, today);
@@ -34,7 +34,7 @@ pub fn report_section(app: &TokenMonitorApp, cx: &Context<TokenMonitorApp>) -> A
                 .gap_4()
                 .child(summary_panel(&stats, cx))
                 .child(heatmap_card(
-                    &snap.days,
+                    snap.days.clone(),
                     app.state.report.heatmap_bounds,
                     hover,
                     &on_hover,
@@ -162,7 +162,7 @@ fn busiest_label(stats: &ReportStats) -> String {
 
 /// The heatmap card: header with legend on the right, grid below.
 fn heatmap_card(
-    days: &[(NaiveDate, SumStats)],
+    days: Arc<Vec<(NaiveDate, SumStats)>>,
     bounds: Bounds<Pixels>,
     hover: Option<ReportHover>,
     on_hover: &Rc<HoverCallback>,
@@ -192,7 +192,7 @@ fn heatmap_card(
         .child(if days.is_empty() {
             empty_hint("暂无数据，扫描完成后将在这里显示热力图", p.muted_foreground)
         } else {
-            ContributionHeatmap::new(days.to_vec()).render(
+            ContributionHeatmap::from_arc(days).render(
                 east8_local(Utc::now()).date_naive(),
                 bounds,
                 hover,

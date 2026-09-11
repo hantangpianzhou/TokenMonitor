@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use gpui::{Bounds, Pixels};
@@ -319,9 +320,14 @@ impl ChartsState {
 
 /// Raw per-day series for the report page. Days are East-8 calendar dates in
 /// chronological ascending order; only days with recorded usage are present.
+/// The series is held behind an `Rc` so the render path can share it with the
+/// heatmap without deep-copying 365 `SumStats` entries on every frame.
 #[derive(Debug, Clone, Default)]
 pub struct ReportSnapshot {
-    pub days: Vec<(NaiveDate, SumStats)>,
+    /// Shared behind an `Arc` because the snapshot crosses the aggregate
+    /// worker thread boundary; cloning it (per render, per page) only bumps a
+    /// refcount instead of deep-copying 365 `SumStats` entries.
+    pub days: Arc<Vec<(NaiveDate, SumStats)>>,
 }
 
 /// Report page loaded-data state.

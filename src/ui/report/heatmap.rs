@@ -9,6 +9,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use gpui::prelude::FluentBuilder as _;
@@ -46,15 +47,55 @@ const TOOLTIP_GAP: f32 = 8.0;
 const GUTTER: f32 = 30.0;
 
 /// A day-keyed usage heatmap for the report page.
+///
+/// Holds the day series behind an `Arc` so cloning the heatmap (which GPUI's
+/// builder APIs may do) only bumps a refcount instead of deep-copying 365
+/// `SumStats` entries on every render. `Arc` (not `Rc`) because the series
+/// originates in the aggregate worker thread and crosses into the UI.
 #[derive(Debug, Clone, Default)]
 pub struct ContributionHeatmap {
-    days: Vec<(NaiveDate, SumStats)>,
+    days: Arc<Vec<(NaiveDate, SumStats)>>,
 }
 
 impl ContributionHeatmap {
     /// Create a heatmap from per-day stats (East-8 calendar dates).
     pub fn new(days: Vec<(NaiveDate, SumStats)>) -> Self {
+        Self {
+            days: Arc::new(days),
+        }
+    }
+
+    /// Create a heatmap that shares the day series via `Arc` — no deep copy.
+    /// Callers that already hold an `Arc<Vec<…>>` (e.g. cloned from app state)
+    /// should prefer this to avoid the 365-element `Vec` clone per render.
+    pub fn from_arc(days: Arc<Vec<(NaiveDate, SumStats)>>) -> Self {
         Self { days }
+    }
+
+    /// Align the ascending day series onto `len` grid cells that start at
+    /// `start` and advance one day per cell, zero-filling days without usage.
+    ///
+    /// Both sides are ascending, so this is a single O(days + len) merge with
+    /// no hashing — the grid previously paid a 365-entry `HashMap` build plus
+    /// 365 hashed lookups on every frame (including every hover).
+    fn aligned_cells(&self, start: NaiveDate, len: usize) -> Vec<SumStats> {
+        let mut out: Vec<SumStats> = Vec::with_capacity(len);
+        let mut it = self.days.iter().copied().peekable();
+        for i in 0..len {
+            let date = start + Duration::days(i as i64);
+            // Skip series entries that predate this cell (e.g. outside grid).
+            while it.peek().is_some_and(|(d, _)| *d < date) {
+                it.next();
+            }
+            match it.peek() {
+                Some((d, stats)) if *d == date => {
+                    out.push(*stats);
+                    it.next();
+                }
+                _ => out.push(SumStats::default()),
+            }
+        }
+        out
     }
 
     pub fn render(
@@ -69,12 +110,17 @@ impl ContributionHeatmap {
         let p = palette(cx);
         let start = grid_start(today);
         let weeks = week_count(start, today);
-        let map: HashMap<NaiveDate, SumStats> = self.days.iter().copied().collect();
-        let max = map
-            .values()
+        // The grid walks dates in ascending chronological order (week-major,
+        // then weekday), and `self.days` is already sorted ascending — so a
+        // single merge pass aligns the series to grid cells without hashing.
+        // Replaces a per-frame 365-entry HashMap build + 365 lookups.
+        let cells = self.aligned_cells(start, weeks * ROWS as usize);
+        let max = cells
+            .iter()
             .map(|stats| stats.total_tokens())
             .max()
             .unwrap_or(0);
+        let cells = cells.as_slice();
         let colors = level_colors();
         // Cell size from the card bounds measured on the previous frame; the
         // prepaint callback below re-renders us when the bounds change, so the
@@ -87,7 +133,7 @@ impl ContributionHeatmap {
             let week_start = start + Duration::days(w as i64 * ROWS);
             v_flex().gap(px(GAP)).children((0..ROWS).map(|row| {
                 let date = week_start + Duration::days(row);
-                let stats = map.get(&date).copied().unwrap_or_default();
+                let stats = cells.get(w as usize * ROWS as usize + row as usize).copied().unwrap_or_default();
                 let level = level_for(stats.total_tokens(), max);
                 let color = if level == 0 {
                     p.muted
