@@ -619,7 +619,7 @@ fn compute_view_snapshot(
 fn compute_report_snapshot(conn: &Connection, window: TimeWindow) -> ReportSnapshot {
     let mut snap = ReportSnapshot::default();
     if let Ok(days) = crate::report::data::load_report_days(conn, &window) {
-        snap.days = days;
+        snap.days = Arc::new(days);
     }
     snap
 }

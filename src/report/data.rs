@@ -2,7 +2,6 @@
 //! TUI frontends so both aggregate the same 365-day East-8 view.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::NaiveDate;
@@ -18,7 +17,7 @@ use crate::storage::repository::UsageRepo;
 pub fn load_report_days(
     conn: &Connection,
     window: &TimeWindow,
-) -> Result<Arc<Vec<(NaiveDate, SumStats)>>> {
+) -> Result<Vec<(NaiveDate, SumStats)>> {
     let days: Vec<(NaiveDate, SumStats)> = UsageRepo::new(conn)
         .daily_series(window)?
         .into_iter()
@@ -28,7 +27,7 @@ pub fn load_report_days(
                 .map(|date| (date, stats))
         })
         .collect();
-    Ok(Arc::new(days))
+    Ok(days)
 }
 
 /// Per-provider ("agent") aggregates over `window`, sorted by token usage
