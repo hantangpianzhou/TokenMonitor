@@ -1,0 +1,58 @@
+{
+  "id": "a1b2c3d4-0000-1111-2222-333344445555",
+  "working_dir": "D:/project/dbpt-zw",
+  "created_at": 1788774900000,
+  "updated_at": 1788775500000,
+  "turn_stats": [
+    {
+      "turn_id": 1,
+      "used_tokens": 0,
+      "model_usage": [
+        {
+          "model_id": "zhipu/glm-5",
+          "tokens": {
+            "input": 12000,
+            "output": 3400,
+            "cached_input": 8800
+          }
+        },
+        {
+          "model_id": "alibaba/qwen3.7-max",
+          "tokens": {
+            "input": 9000,
+            "output": 2100,
+            "cached_input": 5000
+          }
+        }
+      ]
+    },
+    {
+      "turn_id": 2,
+      "used_tokens": 0,
+      "model_usage": [
+        {
+          "model_id": "deepseek/deepseek-v4-pro",
+          "tokens": {
+            "input": 22000,
+            "output": 6000,
+            "cached_input": 15000
+          }
+        }
+      ]
+    },
+    {
+      "turn_id": 3,
+      "used_tokens": 0,
+      "model_usage": [
+        {
+          "model_id": "longcat/2.0",
+          "tokens": {
+            "input": 5000,
+            "output": 1200,
+            "cached_input": 3000
+          }
+        }
+      ]
+    }
+  ]
+}
