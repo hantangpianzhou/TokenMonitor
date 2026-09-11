@@ -20,6 +20,23 @@ pub fn format_cost_usd(micros: u64) -> String {
     format!("${:.2}", micros as f64 / 1e6)
 }
 
+/// Full integer with thousands separators: `123456789` → "123,456,789".
+/// Used where the compact M/K/亿 abbreviation must NOT be applied (e.g. the
+/// floating usage ball shows the raw total on purpose).
+pub fn format_int_grouped(v: u64) -> String {
+    let s = v.to_string();
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n + n / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (n - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 /// Compact token count for chart `f64` values. Token counts are integral, so
 /// the truncating cast is lossless.
 pub fn format_tokens_compact_f64(v: f64) -> String {

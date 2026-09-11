@@ -29,6 +29,9 @@ const SCAN_INTERVAL_KEY: &str = "scan.interval_seconds";
 /// Settings key holding the app accent theme color (a `ThemeColor` key).
 const THEME_COLOR_KEY: &str = "theme.color";
 
+/// Settings key for whether the floating usage ball is shown on launch.
+const FLOATING_WINDOW_KEY: &str = "floating.window.visible";
+
 /// Settings key + current value for the CodeBuddy fingerprint scheme. Bumping
 /// the value triggers a one-time rebuild of CodeBuddy rows so they land with the
 /// stable, request-id-based dedup keys instead of the old line-number keys.
@@ -208,6 +211,22 @@ impl Collector {
     pub fn set_theme_color(&self, color: ThemeColor) -> Result<()> {
         let conn = self.db.lock().expect("db lock poisoned");
         SettingsRepo::new(&conn).set(THEME_COLOR_KEY, color.key())
+    }
+
+    /// Whether the floating usage ball should be shown (defaults to `true`).
+    pub fn floating_window_visible(&self) -> bool {
+        let conn = self.db.lock().expect("db lock poisoned");
+        SettingsRepo::new(&conn)
+            .get(FLOATING_WINDOW_KEY)
+            .ok()
+            .flatten()
+            .map(|value| value == "true")
+            .unwrap_or(true)
+    }
+
+    pub fn set_floating_window_visible(&self, visible: bool) -> Result<()> {
+        let conn = self.db.lock().expect("db lock poisoned");
+        SettingsRepo::new(&conn).set(FLOATING_WINDOW_KEY, if visible { "true" } else { "false" })
     }
 
     /// The update version the user last chose to skip, if any.

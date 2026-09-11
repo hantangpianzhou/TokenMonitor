@@ -1,26 +1,34 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_channel::{unbounded, Receiver, Sender};
 use chrono::{NaiveDate, Utc};
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, WeakEntity, Window,
+    px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, Styled, Task, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
 };
 use gpui_component::calendar::Date;
 use gpui_component::date_picker::{DatePickerEvent, DatePickerState};
 use gpui_component::select::{SelectEvent, SelectState};
 use gpui_component::{v_flex, Colorize, IndexPath};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use rusqlite::Connection;
 
 use crate::collector::{scheduler, Collector, CollectorEvent};
 use crate::core::aggregation::SumStats;
 use crate::core::model::{Provider, ThemeColor, TimeWindow};
+use crate::platform::{
+    get_floating_hwnd, is_floating_visible, register_floating_hwnd, set_always_on_top,
+    set_floating_visible, show_window,
+};
 use crate::storage::default_db_path;
 use crate::storage::repository::UsageRepo;
 use crate::storage::sqlite;
 use crate::ui;
+#[cfg(target_os = "windows")]
+use crate::ui::floating::FloatingView;
 
 use super::state::{
     ActivePage, AppState, ChartApp, ChartMetric, ChartRange, ChartRangeItem, ChartsSnapshot,
@@ -57,6 +65,13 @@ pub struct TokenMonitorApp {
     /// Wakes the scheduler thread when the interval changes so the new value
     /// takes effect immediately instead of after the old cycle elapses.
     scheduler_wake: std::sync::mpsc::Sender<()>,
+    /// Weak handle to the floating usage-ball window, if it has been opened.
+    /// Windows-only: the ball is a separate always-on-top GPUI window.
+    #[cfg(target_os = "windows")]
+    pub floating: Option<WeakEntity<FloatingView>>,
+    /// Keeps the tray-command listener alive for the app's lifetime. Windows-only.
+    #[cfg(target_os = "windows")]
+    pub tray_task: Option<Task<()>>,
 }
 
 impl TokenMonitorApp {
@@ -65,6 +80,10 @@ impl TokenMonitorApp {
         window.focus(&focus_handle, cx);
         let db_path = default_db_path().expect("resolve app data dir");
         let collector = Arc::new(Collector::open(&db_path).expect("open collector"));
+        // Share the collector with the floating ball (which has no window of
+        // its own to open a DB connection) so it can persist its visibility
+        // preference on close.
+        COLLECTOR.set(collector.clone()).ok();
         let scan_interval_secs = collector.scan_interval_seconds();
         let scan_interval = Arc::new(AtomicU64::new(scan_interval_secs));
         let (scheduler_wake, scheduler_wake_rx) = std::sync::mpsc::channel();
@@ -120,7 +139,14 @@ impl TokenMonitorApp {
             scan_interval,
             scheduler_wake,
             theme_color,
+            #[cfg(target_os = "windows")]
+            floating: None,
+            #[cfg(target_os = "windows")]
+            tray_task: None,
         };
+        // Expose a weak handle to this app so the floating ball can link
+        // itself back onto the app when it is opened from the tray menu.
+        APP_WEAK.set(app.weak_self.clone()).ok();
         app.sync_chart_app_select(window, cx);
 
         // Dispatch dropdown / date-picker events back into app handlers.
@@ -457,6 +483,24 @@ impl TokenMonitorApp {
         if let Some(error) = snap.error {
             self.state.last_error = Some(error);
         }
+        // Keep the floating usage ball in sync with the dashboard summary.
+        #[cfg(target_os = "windows")]
+        if let Some(f) = &self.floating {
+            if let Some(f) = f.upgrade() {
+                if let Some(s) = &snap.summary {
+                    let total = s.input_tokens
+                        + s.output_tokens
+                        + s.cache_read_tokens
+                        + s.cache_write_tokens;
+                    f.update(cx, |view, cx| {
+                        view.set_totals(total, s.cost_micros);
+                        cx.notify();
+                    });
+                }
+            } else {
+                self.floating = None;
+            }
+        }
         cx.notify();
     }
 }
@@ -631,5 +675,59 @@ impl Render for TokenMonitorApp {
             .text_color(p.foreground)
             .child(ui::topbar::render_topbar(self, window, cx))
             .child(ui::router(self, window, cx))
+    }
+}
+
+/// Edge length of the floating window (px), matching `WINDOW_SIZE` in
+/// `ui::floating`.
+const FLOAT_WIN: f32 = 240.0;
+
+/// Shared so the floating ball can persist its visibility preference on close
+/// without holding its own `Collector` reference.
+pub(crate) static COLLECTOR: OnceLock<Arc<Collector>> = OnceLock::new();
+
+/// Weak handle to the main app, used to stash the floating window's entity.
+pub(crate) static APP_WEAK: OnceLock<WeakEntity<TokenMonitorApp>> = OnceLock::new();
+
+/// Show, hide, or create the floating usage ball. Once the window exists, the
+/// toggle is a pure Win32 show/hide; the first call opens it through GPUI.
+#[cfg(target_os = "windows")]
+pub fn ensure_floating_window(cx: &mut App) {
+    let hwnd = get_floating_hwnd();
+    if hwnd != 0 {
+        let visible = !is_floating_visible();
+        show_window(hwnd, visible);
+        set_floating_visible(visible);
+        return;
+    }
+    let bounds = Bounds::centered(None, size(px(FLOAT_WIN), px(FLOAT_WIN)), cx);
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            kind: WindowKind::PopUp,
+            focus: false,
+            show: true,
+            window_background: WindowBackgroundAppearance::Transparent,
+            window_decorations: None,
+            ..Default::default()
+        },
+        |window, cx| {
+            if let Ok(h) = HasWindowHandle::window_handle(&*window) {
+                if let RawWindowHandle::Win32(win) = h.as_raw() {
+                    let hwnd = win.hwnd.get();
+                    register_floating_hwnd(hwnd);
+                    set_always_on_top(hwnd, true);
+                }
+            }
+            cx.new(|cx| FloatingView::new(window, cx))
+        },
+    );
+    if let Ok(handle) = handle {
+        set_floating_visible(true);
+        if let Ok(entity) = handle.entity(cx) {
+            if let Some(app) = APP_WEAK.get().and_then(|w| w.upgrade()) {
+                app.update(cx, |app, _| app.floating = Some(entity.downgrade()));
+            }
+        }
     }
 }

@@ -14,8 +14,11 @@ pub use state::{
 
 use std::sync::Arc;
 
+use async_channel::unbounded;
 use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
 use gpui_component::Root;
+
+use crate::app::actions::ToggleFloatingWindow;
 
 /// GPUI bootstrap: init components, open the main window, run the app.
 pub fn run() -> anyhow::Result<()> {
@@ -28,6 +31,27 @@ pub fn run() -> anyhow::Result<()> {
         // the English "Search...".
         gpui_component::set_locale("zh-CN");
         cx.on_action(|_: &Quit, cx| cx.quit());
+
+        // Windows: wire the system-tray icon's "悬浮窗" item to the floating ball.
+        // The tray forwards a `TrayCommand::Floating` over an async channel; here
+        // we translate it into the `ToggleFloatingWindow` action the app handles
+        // by showing / hiding / creating the ball window. The spawned `Task` is
+        // handed to the app entity so the listener survives for the app's life.
+        #[cfg(target_os = "windows")]
+        let tray_task;
+        #[cfg(target_os = "windows")]
+        {
+            let (tray_tx, tray_rx) = unbounded();
+            crate::platform::init_tray_commands(tray_tx.clone());
+            cx.on_action(|_: &ToggleFloatingWindow, cx| {
+                crate::app::app::ensure_floating_window(cx);
+            });
+            tray_task = cx.spawn(async move |cx| {
+                while let Ok(_cmd) = tray_rx.recv().await {
+                    cx.update(|app| app.dispatch_action(&ToggleFloatingWindow));
+                }
+            });
+        }
         // GitHub release check + installer download go through this client.
         let http_client = reqwest_client::ReqwestClient::user_agent(concat!(
             "TokenMonitor/",
@@ -66,6 +90,20 @@ pub fn run() -> anyhow::Result<()> {
             },
         )
         .expect("failed to open TokenMonitor window");
+        // Keep the tray-command listener alive for the app's lifetime.
+        #[cfg(target_os = "windows")]
+        if let Some(app) = crate::app::app::APP_WEAK.get().and_then(|w| w.upgrade()) {
+            app.update(cx, |app, _| app.tray_task = Some(tray_task));
+        }
+        // On launch, restore the floating ball if the user left it visible.
+        #[cfg(target_os = "windows")]
+        if crate::app::app::COLLECTOR
+            .get()
+            .map(|c| c.floating_window_visible())
+            .unwrap_or(false)
+        {
+            crate::app::app::ensure_floating_window(cx);
+        }
         // Keep the native titlebar dark to match the dark panels, independent
         // of the OS light/dark theme. No-op on non-Windows platforms.
         crate::platform::apply_dark_titlebar();

@@ -8,13 +8,18 @@
 //!
 //! Behavior:
 //! - Left-click:  show / restore the main window.
-//! - Right-click: context menu (打开 TokenMonitor / 退出).
+//! - Right-click: context menu (显示/隐藏主窗口 / 显示/隐藏悬浮窗 / 退出).
 //! - Close (X):   hide to tray; quit from the tray menu.
+//!
+//! The floating-window toggle forwards a `TrayCommand::Floating` into the GPUI
+//! app, which owns the ball window; window show/hide and quit stay pure Win32.
 
 use std::mem;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::sync::OnceLock;
+
+use async_channel::Sender;
 
 // Win32 message / constant values.
 const WM_CLOSE: u32 = 0x0010;
@@ -41,8 +46,17 @@ const TPM_RIGHTBUTTON: u32 = 0x0002;
 const GWLP_WNDPROC: i32 = -4;
 
 const TRAY_ID: u32 = 1;
-const TRAY_CMD_OPEN: usize = 1;
+const TRAY_CMD_TOGGLE_WINDOW: usize = 1;
 const TRAY_CMD_EXIT: usize = 2;
+const TRAY_CMD_FLOATING: usize = 3;
+
+/// Commands the tray icon sends to the GPUI app. Only `Floating` needs to
+/// cross into GPUI (to create / toggle the floating window); window show/hide
+/// and quit stay pure Win32.
+#[derive(Clone, Copy)]
+pub enum TrayCommand {
+    Floating,
+}
 
 #[link(name = "shell32")]
 unsafe extern "system" {
@@ -56,6 +70,7 @@ unsafe extern "system" {
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
     fn SetForegroundWindow(hwnd: isize) -> i32;
+    fn IsWindowVisible(hwnd: isize) -> i32;
     fn GetCursorPos(point: *mut Point) -> i32;
     fn CreatePopupMenu() -> isize;
     fn AppendMenuW(menu: isize, flags: u32, id_new_item: usize, new_item: *const u16) -> i32;
@@ -111,6 +126,13 @@ static PREV_WND_PROC: AtomicUsize = AtomicUsize::new(0);
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 
+/// Sends tray menu commands into the GPUI app's event loop.
+static TRAY_CMD_TX: OnceLock<Sender<TrayCommand>> = OnceLock::new();
+/// Native handle of the floating window (0 = not yet created).
+static FLOATING_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Whether the floating window is currently visible.
+static FLOATING_VISIBLE: AtomicBool = AtomicBool::new(false);
+
 /// Install the tray icon and hook the main window. Call once, on the main
 /// thread, after the GPUI window exists. No-op on subsequent calls.
 pub fn start_tray(main_hwnd: isize) {
@@ -129,6 +151,41 @@ pub fn start_tray(main_hwnd: isize) {
         PREV_WND_PROC.store(prev as usize, Relaxed);
 
         add_tray_icon();
+    }
+}
+
+/// Hand the tray the sender side of the command channel. Call once, on the
+/// main thread, before the tray can forward menu selections to the app.
+pub fn init_tray_commands(tx: Sender<TrayCommand>) {
+    let _ = TRAY_CMD_TX.set(tx);
+}
+
+/// Record the floating window's native handle (called when it is created) so
+/// the tray menu and the ball's own close button can show/hide it.
+pub fn register_floating_hwnd(hwnd: isize) {
+    FLOATING_HWND.store(hwnd, Relaxed);
+}
+
+/// Native handle of the floating window, or 0 if it has not been created.
+pub fn get_floating_hwnd() -> isize {
+    FLOATING_HWND.load(Relaxed)
+}
+
+/// Whether the floating window is currently shown.
+pub fn is_floating_visible() -> bool {
+    FLOATING_VISIBLE.load(Relaxed)
+}
+
+/// Update the floating window's visible flag (kept in sync with the ball UI).
+pub fn set_floating_visible(visible: bool) {
+    FLOATING_VISIBLE.store(visible, Relaxed);
+}
+
+/// Forward a tray command into the app's event loop (no-op until
+/// `init_tray_commands` has been called).
+pub fn send_tray_command(cmd: TrayCommand) {
+    if let Some(tx) = TRAY_CMD_TX.get() {
+        let _ = tx.send(cmd);
     }
 }
 
@@ -190,8 +247,12 @@ unsafe extern "system" fn main_subclass_proc(
             }
         }
         WM_COMMAND => match wparam & 0xFFFF {
-            TRAY_CMD_OPEN => {
-                show_main_window();
+            TRAY_CMD_TOGGLE_WINDOW => {
+                toggle_main_window();
+                0
+            }
+            TRAY_CMD_FLOATING => {
+                send_tray_command(TrayCommand::Floating);
                 0
             }
             TRAY_CMD_EXIT => {
@@ -225,6 +286,19 @@ unsafe fn show_main_window() {
     SetForegroundWindow(hwnd);
 }
 
+/// Toggle the main window: hide it to tray if visible, otherwise restore it.
+unsafe fn toggle_main_window() {
+    let Some(&hwnd) = MAIN_HWND.get() else {
+        return;
+    };
+    if IsWindowVisible(hwnd) != 0 {
+        ShowWindow(hwnd, SW_HIDE);
+    } else {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+}
+
 unsafe fn show_context_menu() {
     let Some(&hwnd) = MAIN_HWND.get() else {
         return;
@@ -233,9 +307,25 @@ unsafe fn show_context_menu() {
     if menu == 0 {
         return;
     }
-    let open = wide("打开 TokenMonitor");
+    // Dynamic labels reflect current visibility state.
+    let main_visible = MAIN_HWND
+        .get()
+        .map(|&h| IsWindowVisible(h) != 0)
+        .unwrap_or(false);
+    let floating_visible = is_floating_visible();
+    let main_label = if main_visible {
+        wide("隐藏主窗口")
+    } else {
+        wide("显示主窗口")
+    };
+    let floating_label = if floating_visible {
+        wide("隐藏悬浮窗")
+    } else {
+        wide("显示悬浮窗")
+    };
     let exit = wide("退出");
-    AppendMenuW(menu, MF_STRING, TRAY_CMD_OPEN, open.as_ptr());
+    AppendMenuW(menu, MF_STRING, TRAY_CMD_TOGGLE_WINDOW, main_label.as_ptr());
+    AppendMenuW(menu, MF_STRING, TRAY_CMD_FLOATING, floating_label.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_CMD_EXIT, exit.as_ptr());
     let mut point = Point { x: 0, y: 0 };
     GetCursorPos(&mut point);

@@ -7,6 +7,10 @@ pub mod report;
 pub mod settings;
 pub mod topbar;
 
+// The floating usage ball is a Windows-only, always-on-top overlay window.
+#[cfg(target_os = "windows")]
+pub mod floating;
+
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, AnyElement, App, Context, Div, InteractiveElement, ParentElement, Stateful,
