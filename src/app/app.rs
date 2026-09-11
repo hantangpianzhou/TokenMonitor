@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use async_channel::{unbounded, Receiver, Sender};
+use async_channel::{bounded, Receiver, Sender};
 use chrono::{NaiveDate, Utc};
 use gpui::{
     px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -36,6 +36,18 @@ use super::state::{
 };
 use super::update_check::UpdateCheckUiState;
 
+/// One aggregate request: everything the background worker needs to compute
+/// a `ViewSnapshot` without touching app state (so the main thread is never
+/// blocked). Produced on the main thread, consumed on the worker thread.
+struct AggRequest {
+    seq: u64,
+    time_tab: TimeTab,
+    db_path: std::path::PathBuf,
+    window: TimeWindow,
+    charts: Option<(TimeWindow, ChartApp)>,
+    report: Option<TimeWindow>,
+}
+
 /// Root application entity: owns app state, the collector, and the window focus.
 pub struct TokenMonitorApp {
     pub state: AppState,
@@ -44,11 +56,16 @@ pub struct TokenMonitorApp {
     pub weak_self: WeakEntity<TokenMonitorApp>,
     /// Keeps the periodic auto-rescan thread alive for the app's lifetime.
     _scheduler: std::thread::JoinHandle<()>,
-    view_tx: Sender<ViewSnapshot>,
+    _view_tx: Sender<ViewSnapshot>,
     view_rx: Receiver<ViewSnapshot>,
     view_seq: u64,
     /// Highest snapshot seq applied so far; snapshots older than this are stale.
     applied_seq: u64,
+    /// Aggregate-worker control channel: bounded(1), latest-wins. The worker
+    /// stays alive for the app's lifetime, reusing a single read-only SQLite
+    /// connection instead of spawning a fresh thread + open per refresh.
+    agg_req_tx: Sender<AggRequest>,
+    _agg_worker: std::thread::JoinHandle<()>,
     /// Stateful dropdown / date-picker entities for the charts page controls.
     pub chart_metric_select: Entity<SelectState<Vec<ChartMetric>>>,
     pub chart_app_select: Entity<SelectState<Vec<ChartApp>>>,
@@ -89,7 +106,38 @@ impl TokenMonitorApp {
         let (scheduler_wake, scheduler_wake_rx) = std::sync::mpsc::channel();
         let scheduler =
             scheduler::start_scheduler(collector.clone(), scan_interval.clone(), scheduler_wake_rx);
-        let (view_tx, view_rx) = unbounded();
+        let (view_tx, view_rx) = bounded(1);
+
+        // Long-lived aggregate worker: one background thread owns a single
+        // read-only SQLite connection and drains an `AggRequest` queue bounded
+        // to 1 (latest-wins). This replaces the old scheme where every
+        // `refresh_view` spawned a fresh thread + opened a new connection,
+        // which could fire 14+ times during one full scan cycle.
+        let (agg_req_tx, agg_req_rx) =
+            async_channel::bounded::<AggRequest>(1);
+        let agg_db_path = db_path.clone();
+        let agg_view_tx = view_tx.clone();
+        let _agg_worker = std::thread::Builder::new()
+            .name("tokenmonitor-aggregate".into())
+            .spawn(move || {
+                let conn = match sqlite::open_read(&agg_db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[TokenMonitor] aggregate worker: open db failed: {e}");
+                        return;
+                    }
+                };
+                while let Ok(req) = agg_req_rx.recv_blocking() {
+                    let snapshot = compute_view_snapshot(
+                        &conn, req.seq, req.time_tab, &req.db_path,
+                        req.window, req.charts, req.report,
+                    );
+                    // bounded(1): if the UI is busy, the latest snapshot
+                    // displaces the stale one in the channel.
+                    let _ = agg_view_tx.try_send(snapshot);
+                }
+            })
+            .expect("spawn aggregate worker");
 
         let check_updates_on_startup = collector.check_updates_on_startup();
         let skipped_update_version = collector.skipped_update_version();
@@ -125,10 +173,12 @@ impl TokenMonitorApp {
             focus_handle,
             weak_self: cx.weak_entity(),
             _scheduler: scheduler,
-            view_tx,
+            _view_tx: view_tx,
             view_rx,
             view_seq: 0,
             applied_seq: 0,
+            agg_req_tx,
+            _agg_worker,
             chart_metric_select,
             chart_app_select,
             chart_range_select,
@@ -429,9 +479,15 @@ impl TokenMonitorApp {
         cx.notify();
     }
 
-    /// Kick off a background aggregation. Runs on a dedicated read-only SQLite
-    /// connection (WAL, so it never blocks the scan writer), then posts the
-    /// result back through `view_tx` for the event loop to apply.
+    /// Kick off a background aggregation. Runs on the **long-lived aggregate
+    /// worker** (a single background thread owning one read-only SQLite
+    /// connection opened at startup), then posts the result back through
+    /// `view_tx` (bounded(1), latest-wins) for the event loop to apply.
+    ///
+    /// Multiple rapid triggers (e.g. one per provider during a full scan)
+    /// collapse: the request channel is bounded to 1, so only the latest
+    /// pending request survives — intermediate stale requests are
+    /// overwritten before the worker picks them up.
     fn refresh_view(&mut self, _cx: &mut Context<Self>) {
         let seq = self.view_seq.wrapping_add(1);
         self.view_seq = seq;
@@ -448,16 +504,19 @@ impl TokenMonitorApp {
         // The report section is embedded in the dashboard, so its 365-day
         // snapshot is always loaded alongside the window aggregates.
         let report = Some(TimeWindow::last_n_days(365, now));
-        let tx = self.view_tx.clone();
 
-        std::thread::Builder::new()
-            .name("tokenmonitor-aggregate".into())
-            .spawn(move || {
-                let snapshot =
-                    compute_view_snapshot(seq, time_tab, &db_path, window, charts, report);
-                let _ = tx.send_blocking(snapshot);
-            })
-            .expect("spawn aggregate thread");
+        let req = AggRequest {
+            seq,
+            time_tab,
+            db_path,
+            window,
+            charts,
+            report,
+        };
+        // bounded(1): if a previous request is still queued, this `try_send`
+        // fails and we silently drop the older one — the worker will pick up
+        // this newer request next. If the worker is idle, this succeeds.
+        let _ = self.agg_req_tx.try_send(req);
     }
 
     fn apply_snapshot(&mut self, snap: ViewSnapshot, cx: &mut Context<Self>) {
@@ -506,10 +565,13 @@ impl TokenMonitorApp {
 }
 
 /// Compute the aggregate view snapshot on the calling (background) thread.
+/// Reuses the worker's long-lived read-only connection instead of opening a
+/// new one per call.
 fn compute_view_snapshot(
+    conn: &Connection,
     seq: u64,
     time_tab: TimeTab,
-    db_path: &std::path::Path,
+    _db_path: &std::path::Path,
     window: TimeWindow,
     charts: Option<(TimeWindow, ChartApp)>,
     report: Option<TimeWindow>,
@@ -519,14 +581,7 @@ fn compute_view_snapshot(
         time_tab,
         ..ViewSnapshot::default()
     };
-    let conn = match sqlite::open_read(db_path) {
-        Ok(conn) => conn,
-        Err(e) => {
-            snap.error = Some(format!("open read db failed: {e}"));
-            return snap;
-        }
-    };
-    let repo = UsageRepo::new(&conn);
+    let repo = UsageRepo::new(conn);
 
     // Keep the old partial-success semantics: a failing query sets the error
     // but does not discard the other aggregates.
