@@ -10,9 +10,10 @@
 //!
 //! The ball is drawn in code (not a PNG) so the color always follows the
 //! theme. A linear gradient + a gloss highlight + a bottom inner shadow give
-//! it a rounded, spherical read; a soft accent halo behind it sells the
-//! "floating" look. GPUI this revision has no radial gradient / image tint, so
-//! a code-drawn sphere is the only way to stay on-theme.
+//! it a rounded, spherical read. A soft, layered accent **halo** behind the
+//! ball sells the "floating" glow — concentric translucent circles fade
+//! outward to fake a radial glow (GPUI this revision has no `box_shadow` /
+//! image blur, so we stack rings instead). No animation: the glow is static.
 
 use gpui::{
     div, px, Context, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
@@ -36,8 +37,16 @@ const REF_TOKENS: f64 = 200_000_000.0;
 const SPHERE_FRACTION: f32 = 0.65;
 /// Hover pop scale — the ball lifts / grows a touch when the mouse is over it.
 const HOVER_SCALE: f32 = 1.06;
-/// Static accent halo opacity behind the ball (no animation).
-const GLOW_OPACITY: f32 = 0.12;
+
+/// Concentric halo rings behind the ball, as `(diameter×sphere, opacity)`.
+/// Outer rings are larger and fainter, inner rings tighter and stronger, so the
+/// stack reads as a soft radial glow. Static — no breathing / pulsing.
+const HALO_LAYERS: [(f32, f32); 4] = [
+    (1.50, 0.05),
+    (1.32, 0.08),
+    (1.18, 0.12),
+    (1.08, 0.18),
+];
 
 pub struct FloatingView {
     hwnd: isize,
@@ -92,14 +101,13 @@ impl Render for FloatingView {
             ..accent
         };
 
-        // Region (incl. a small static glow margin) diameter: usage-scaled +
-        // hover-popped. Both the ball and the halo are centered in this region.
         let drawn = self.drawn_diameter();
-        let region = drawn * 1.03;
         // Resting sphere diameter.
         let sphere_d = drawn * SPHERE_FRACTION;
-        // Halo sits just inside the region so its faint rim masks the hard clip edge.
-        let glow_d = region * 0.98;
+        // Window region must enclose the widest halo ring, clamped to the
+        // square window so the soft glow never runs past the frame.
+        let halo_outer = (sphere_d * HALO_LAYERS[0].0).min(WINDOW_SIZE * 0.98);
+        let region = halo_outer * 1.05;
         let off = px((WINDOW_SIZE - sphere_d) / 2.0);
 
         // Clip the whole window to the drawn circle: kills the square frame /
@@ -111,7 +119,7 @@ impl Render for FloatingView {
         let fs = px((sphere_d * 0.16).clamp(11.0, 30.0));
         let cost_fs = px((sphere_d * 0.16 * 0.5).clamp(9.0, 16.0));
 
-        div()
+        let mut root = div()
             .id("floating-root")
             .size_full()
             .relative()
@@ -134,84 +142,90 @@ impl Render for FloatingView {
                     this.hovered = *hovered;
                     cx.notify();
                 });
-            })
-            // Soft accent halo behind the ball — the "floating" feel. Static:
-            // no pulsing, so it reads as a calm glow rather than a breathing lamp.
-            .child(
+            });
+
+        // Soft, layered accent halo (static glow) behind the ball. Each ring is
+        // a centered translucent circle; painted first so the sphere sits on top.
+        for (i, &(scale, op)) in HALO_LAYERS.iter().enumerate() {
+            let d = sphere_d * scale;
+            let o = px((WINDOW_SIZE - d) / 2.0);
+            root = root.child(
                 div()
-                    .id("glow")
+                    .id(format!("glow-{i}"))
                     .absolute()
-                    .top(px((WINDOW_SIZE - glow_d) / 2.0))
-                    .left(px((WINDOW_SIZE - glow_d) / 2.0))
-                    .w(px(glow_d))
-                    .h(px(glow_d))
+                    .top(o)
+                    .left(o)
+                    .w(px(d))
+                    .h(px(d))
                     .rounded_full()
                     .bg(accent)
-                    .opacity(GLOW_OPACITY),
-            )
-            // The sphere: theme-colored, gradient-shaded, draggable. The number
-            // + cost are composited on top and re-centered on hover.
-            .child(
-                div()
-                    .id("ball")
-                    .absolute()
-                    .top(off)
-                    .left(off)
-                    .w(px(sphere_d))
-                    .h(px(sphere_d))
-                    .rounded_full()
-                    .bg(gpui::linear_gradient(
-                        135.0,
-                        gpui::linear_color_stop(lighter, 0.0),
-                        gpui::linear_color_stop(darker, 1.0),
-                    ))
-                    // Bottom-right inner shadow for depth.
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom(px(sphere_d * 0.05))
-                            .right(px(sphere_d * 0.10))
-                            .w(px(sphere_d * 0.6))
-                            .h(px(sphere_d * 0.42))
-                            .rounded_full()
-                            .bg(BLACK.opacity(0.20)),
-                    )
-                    // Top-left gloss highlight.
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(sphere_d * 0.14))
-                            .left(px(sphere_d * 0.16))
-                            .w(px(sphere_d * 0.34))
-                            .h(px(sphere_d * 0.34))
-                            .rounded_full()
-                            .bg(WHITE.opacity(0.28)),
-                    )
-                    // Overlaid number + cost.
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .w_full()
-                            .h_full()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_color(WHITE)
-                                    .text_size(fs)
-                                    .font_semibold()
-                                    .child(tokens.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_color(WHITE.opacity(0.82))
-                                    .text_size(cost_fs)
-                                    .child(cost.clone()),
-                            ),
-                    ),
-            )
+                    .opacity(op),
+            );
+        }
+
+        // The sphere: theme-colored, gradient-shaded, draggable. The number +
+        // cost are composited on top and re-centered on hover.
+        root.child(
+            div()
+                .id("ball")
+                .absolute()
+                .top(off)
+                .left(off)
+                .w(px(sphere_d))
+                .h(px(sphere_d))
+                .rounded_full()
+                .bg(gpui::linear_gradient(
+                    135.0,
+                    gpui::linear_color_stop(lighter, 0.0),
+                    gpui::linear_color_stop(darker, 1.0),
+                ))
+                // Bottom-right inner shadow for depth.
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(sphere_d * 0.05))
+                        .right(px(sphere_d * 0.10))
+                        .w(px(sphere_d * 0.6))
+                        .h(px(sphere_d * 0.42))
+                        .rounded_full()
+                        .bg(BLACK.opacity(0.20)),
+                )
+                // Top-left gloss highlight.
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(sphere_d * 0.14))
+                        .left(px(sphere_d * 0.16))
+                        .w(px(sphere_d * 0.34))
+                        .h(px(sphere_d * 0.34))
+                        .rounded_full()
+                        .bg(WHITE.opacity(0.28)),
+                )
+                // Overlaid number + cost.
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .w_full()
+                        .h_full()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_color(WHITE)
+                                .text_size(fs)
+                                .font_semibold()
+                                .child(tokens.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(WHITE.opacity(0.82))
+                                .text_size(cost_fs)
+                                .child(cost.clone()),
+                        ),
+                ),
+        )
     }
 }
 
