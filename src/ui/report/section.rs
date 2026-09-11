@@ -192,7 +192,14 @@ fn heatmap_card(
         .child(if days.is_empty() {
             empty_hint("暂无数据，扫描完成后将在这里显示热力图", p.muted_foreground)
         } else {
-            ContributionHeatmap::new(days.to_vec()).render(bounds, hover, on_hover, on_resize, cx)
+            ContributionHeatmap::new(days.to_vec()).render(
+                east8_local(Utc::now()).date_naive(),
+                bounds,
+                hover,
+                on_hover,
+                on_resize,
+                cx,
+            )
         })
         .into_any_element()
 }

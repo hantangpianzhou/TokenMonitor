@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
+use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, AnyElement, App, Bounds, Div, ElementId, Hsla, InteractiveElement, IntoElement,
@@ -20,7 +20,6 @@ use gpui_component::{h_flex, v_flex, ElementExt};
 
 use crate::app::state::ReportHover;
 use crate::core::aggregation::SumStats;
-use crate::core::time::east8_local;
 use crate::format::{format_cost_f64, format_tokens_compact_f64};
 use crate::report::heatmap::{grid_start, level_for, month_labels, week_count, ROWS};
 use crate::ui::{hsla_from_hex, palette};
@@ -60,6 +59,7 @@ impl ContributionHeatmap {
 
     pub fn render(
         &self,
+        today: NaiveDate,
         measured: Bounds<Pixels>,
         hover: Option<ReportHover>,
         on_hover: &Rc<HoverCallback>,
@@ -67,7 +67,6 @@ impl ContributionHeatmap {
         cx: &App,
     ) -> AnyElement {
         let p = palette(cx);
-        let today = east8_local(Utc::now()).date_naive();
         let start = grid_start(today);
         let weeks = week_count(start, today);
         let map: HashMap<NaiveDate, SumStats> = self.days.iter().copied().collect();
@@ -326,6 +325,9 @@ mod tests {
     /// events back into its own state, mirroring `page.rs::hover_callback`.
     struct HeatmapHarness {
         heatmap: ContributionHeatmap,
+        /// Reference "today" for the grid, injected so the test is
+        /// deterministic instead of tracking the wall clock.
+        today: NaiveDate,
         /// Last measured card bounds, fed back into the heatmap on the next
         /// render - mirrors `ReportState::heatmap_bounds` in `page.rs`.
         bounds: Bounds<Pixels>,
@@ -396,6 +398,7 @@ mod tests {
             // page's card/shell hierarchy, so coordinate-space bugs in tooltip
             // pinning show up as wrong positions here too.
             v_flex().pt(px(200.0)).child(self.heatmap.render(
+                self.today,
                 self.bounds,
                 self.hover,
                 &on_hover,
@@ -446,6 +449,7 @@ mod tests {
                         ..Default::default()
                     },
                 )]),
+                today,
                 bounds: Bounds::default(),
                 hover: None,
                 events,
