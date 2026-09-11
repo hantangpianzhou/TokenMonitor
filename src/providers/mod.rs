@@ -1,7 +1,9 @@
 //! Provider data-source adapters: one per AI coding tool.
 
 pub mod antigravity;
+pub mod atomcode;
 pub mod claude;
+pub mod codearts;
 pub mod codebuddy;
 pub mod codex;
 pub mod deepseek;
@@ -20,7 +22,7 @@ pub use source::{FileStates, ProviderConfig, ProviderError, ProviderSource, Scan
 use crate::core::model::Provider;
 
 /// All providers TokenMonitor can track, in display order.
-pub fn all_providers() -> [Provider; 12] {
+pub fn all_providers() -> [Provider; 14] {
     Provider::ALL
 }
 
@@ -70,6 +72,12 @@ pub fn build_sources(configs: &[ProviderConfig]) -> Vec<Box<dyn ProviderSource>>
             }
             Provider::Pi => Box::new(pi::PiSource::new(c.clone())) as Box<dyn ProviderSource>,
             Provider::Trae => Box::new(trae::TraeSource::new(c.clone())) as Box<dyn ProviderSource>,
+            Provider::AtomCode => {
+                Box::new(atomcode::AtomCodeSource::new(c.clone())) as Box<dyn ProviderSource>
+            }
+            Provider::CodeArts => {
+                Box::new(codearts::CodeArtsSource::new(c.clone())) as Box<dyn ProviderSource>
+            }
         })
         .collect()
 }

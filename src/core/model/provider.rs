@@ -21,6 +21,8 @@ pub enum Provider {
     DeepSeek,
     Pi,
     Trae,
+    AtomCode,
+    CodeArts,
 }
 
 impl std::fmt::Display for Provider {
@@ -30,7 +32,7 @@ impl std::fmt::Display for Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 12] = [
+    pub const ALL: [Provider; 14] = [
         Provider::Claude,
         Provider::Codex,
         Provider::Gemini,
@@ -43,6 +45,8 @@ impl Provider {
         Provider::DeepSeek,
         Provider::Pi,
         Provider::Trae,
+        Provider::AtomCode,
+        Provider::CodeArts,
     ];
 
     /// Stable lowercase identifier, used as the DB provider column and serde tag.
@@ -60,6 +64,8 @@ impl Provider {
             Provider::DeepSeek => "deepseek",
             Provider::Pi => "pi",
             Provider::Trae => "trae",
+            Provider::AtomCode => "atomcode",
+            Provider::CodeArts => "codearts",
         }
     }
 
@@ -77,6 +83,8 @@ impl Provider {
             Provider::DeepSeek => "DeepSeek Harness",
             Provider::Pi => "Pi",
             Provider::Trae => "Trae",
+            Provider::AtomCode => "AtomCode",
+            Provider::CodeArts => "CodeArts",
         }
     }
 
