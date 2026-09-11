@@ -13,20 +13,10 @@
 //! it a rounded, spherical read; a soft accent halo behind it sells the
 //! "floating" look. GPUI this revision has no radial gradient / image tint, so
 //! a code-drawn sphere is the only way to stay on-theme.
-//!
-//! Two calm, looping animations make the ball feel alive (both respect
-//! `App::reduce_motion` — they freeze at the mid-breath frame when the user
-//! asks the OS to reduce motion):
-//!   * **breathing scale** — the sphere gently swells and settles (≈0.96×–1.0×)
-//!     on a ~2.4 s sine cycle, driven by `with_animation` + `pulsating_between`.
-//!   * **halo pulse** — the accent glow behind the ball breathes in opacity in
-//!     the same phase, so the light and the ball move together.
-
-use std::time::Duration;
 
 use gpui::{
-    div, px, Animation, AnimationExt, Context, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, WindowControlArea, pulsating_between,
+    div, px, Context, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window, WindowControlArea,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -46,14 +36,8 @@ const REF_TOKENS: f64 = 200_000_000.0;
 const SPHERE_FRACTION: f32 = 0.65;
 /// Hover pop scale — the ball lifts / grows a touch when the mouse is over it.
 const HOVER_SCALE: f32 = 1.06;
-/// Breathing amplitude: the sphere scales between `(1 - BREATH_AMP)`× and `1.0`×.
-const BREATH_AMP: f32 = 0.04;
-/// Halo opacity at the trough / peak of its breathing pulse.
-const GLOW_MIN: f32 = 0.08;
-const GLOW_MAX: f32 = 0.20;
-/// One full breathing cycle (swell → settle). Shared by the ball and the halo
-/// via `repeat_synced` so they stay perfectly in phase.
-const BREATH_PERIOD: Duration = Duration::from_millis(2400);
+/// Static accent halo opacity behind the ball (no animation).
+const GLOW_OPACITY: f32 = 0.12;
 
 pub struct FloatingView {
     hwnd: isize,
@@ -73,8 +57,6 @@ impl FloatingView {
     }
 
     /// Drawn diameter (region, glow included), usage-scaled and hover-popped.
-    /// Breathing is applied on top of this at paint time, so the window region
-    /// is sized with extra headroom to keep the swelling ball from clipping.
     fn drawn_diameter(&self) -> f32 {
         let base = if self.total_tokens == 0 {
             MIN_DIAMETER
@@ -110,15 +92,15 @@ impl Render for FloatingView {
             ..accent
         };
 
-        // Region (incl. halo) diameter: usage-scaled + hover-popped, with
-        // headroom for the breathing scale so the ball never hard-clips at the
-        // OS edge. Both the ball and the halo are centered in this region.
+        // Region (incl. a small static glow margin) diameter: usage-scaled +
+        // hover-popped. Both the ball and the halo are centered in this region.
         let drawn = self.drawn_diameter();
-        let region = drawn * (1.0 + BREATH_AMP + 0.03);
-        // Resting (un-breathing) sphere diameter — the animator scales around it.
+        let region = drawn * 1.03;
+        // Resting sphere diameter.
         let sphere_d = drawn * SPHERE_FRACTION;
         // Halo sits just inside the region so its faint rim masks the hard clip edge.
         let glow_d = region * 0.98;
+        let off = px((WINDOW_SIZE - sphere_d) / 2.0);
 
         // Clip the whole window to the drawn circle: kills the square frame /
         // shadow and lets desktop clicks pass through outside the ball.
@@ -126,11 +108,8 @@ impl Render for FloatingView {
 
         let tokens = format_int_grouped(self.total_tokens);
         let cost = format_cost_usd(self.cost_micros);
-
-        // One shared, phase-locked breathing cycle for the ball and the halo.
-        let breath = Animation::new(BREATH_PERIOD)
-            .repeat_synced()
-            .with_easing(pulsating_between(0.0, 1.0));
+        let fs = px((sphere_d * 0.16).clamp(11.0, 30.0));
+        let cost_fs = px((sphere_d * 0.16 * 0.5).clamp(9.0, 16.0));
 
         div()
             .id("floating-root")
@@ -156,9 +135,8 @@ impl Render for FloatingView {
                     cx.notify();
                 });
             })
-            // Soft accent halo behind the ball — the "floating" feel. It breathes
-            // in opacity, in phase with the ball, so the light and the sphere
-            // pulse together.
+            // Soft accent halo behind the ball — the "floating" feel. Static:
+            // no pulsing, so it reads as a calm glow rather than a breathing lamp.
             .child(
                 div()
                     .id("glow")
@@ -169,81 +147,70 @@ impl Render for FloatingView {
                     .h(px(glow_d))
                     .rounded_full()
                     .bg(accent)
-                    .with_animation("glow-breath", breath.clone(), |el, delta| {
-                        el.opacity(GLOW_MIN + (GLOW_MAX - GLOW_MIN) * delta)
-                    }),
+                    .opacity(GLOW_OPACITY),
             )
-            // The sphere: theme-colored, gradient-shaded, draggable, and it
-            // gently breathes in size. Each frame we rebuild it at the current
-            // breathing diameter and re-center it, so the number + cost stay
-            // composited on top.
+            // The sphere: theme-colored, gradient-shaded, draggable. The number
+            // + cost are composited on top and re-centered on hover.
             .child(
                 div()
                     .id("ball")
+                    .absolute()
+                    .top(off)
+                    .left(off)
+                    .w(px(sphere_d))
+                    .h(px(sphere_d))
                     .rounded_full()
                     .bg(gpui::linear_gradient(
                         135.0,
                         gpui::linear_color_stop(lighter, 0.0),
                         gpui::linear_color_stop(darker, 1.0),
                     ))
-                    .with_animation("ball-breath", breath, move |el, delta| {
-                        let s = 1.0 - BREATH_AMP + BREATH_AMP * delta;
-                        let sd = sphere_d * s;
-                        let off = px((WINDOW_SIZE - sd) / 2.0);
-                        let fs = px((sd * 0.16).clamp(11.0, 30.0));
-                        let cost_fs = px((sd * 0.16 * 0.5).clamp(9.0, 16.0));
-                        el.absolute()
-                            .top(off)
-                            .left(off)
-                            .w(px(sd))
-                            .h(px(sd))
-                            // Bottom-right inner shadow for depth.
+                    // Bottom-right inner shadow for depth.
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom(px(sphere_d * 0.05))
+                            .right(px(sphere_d * 0.10))
+                            .w(px(sphere_d * 0.6))
+                            .h(px(sphere_d * 0.42))
+                            .rounded_full()
+                            .bg(BLACK.opacity(0.20)),
+                    )
+                    // Top-left gloss highlight.
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(sphere_d * 0.14))
+                            .left(px(sphere_d * 0.16))
+                            .w(px(sphere_d * 0.34))
+                            .h(px(sphere_d * 0.34))
+                            .rounded_full()
+                            .bg(WHITE.opacity(0.28)),
+                    )
+                    // Overlaid number + cost.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .w_full()
+                            .h_full()
+                            .gap_1()
                             .child(
                                 div()
-                                    .absolute()
-                                    .bottom(px(sd * 0.05))
-                                    .right(px(sd * 0.10))
-                                    .w(px(sd * 0.6))
-                                    .h(px(sd * 0.42))
-                                    .rounded_full()
-                                    .bg(BLACK.opacity(0.20)),
+                                    .text_color(WHITE)
+                                    .text_size(fs)
+                                    .font_semibold()
+                                    .child(tokens.clone()),
                             )
-                            // Top-left gloss highlight.
                             .child(
                                 div()
-                                    .absolute()
-                                    .top(px(sd * 0.14))
-                                    .left(px(sd * 0.16))
-                                    .w(px(sd * 0.34))
-                                    .h(px(sd * 0.34))
-                                    .rounded_full()
-                                    .bg(WHITE.opacity(0.28)),
-                            )
-                            // Overlaid number + cost.
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .justify_center()
-                                    .w_full()
-                                    .h_full()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_color(WHITE)
-                                            .text_size(fs)
-                                            .font_semibold()
-                                            .child(tokens.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(WHITE.opacity(0.82))
-                                            .text_size(cost_fs)
-                                            .child(cost.clone()),
-                                    ),
-                            )
-                    }),
+                                    .text_color(WHITE.opacity(0.82))
+                                    .text_size(cost_fs)
+                                    .child(cost.clone()),
+                            ),
+                    ),
             )
     }
 }
