@@ -84,14 +84,23 @@ pub fn show_window(hwnd: isize, visible: bool) {
 }
 
 /// Clip the floating window to a circle of the given `diameter` (logical px,
-/// inside a square window of `window_size` logical px). This removes the square
-/// OS frame and its rectangular shadow, and makes clicks outside the ball pass
-/// through to the desktop — the 360 / Thunder-style floating ball.
+/// centered in a square window of `window_size` logical px). This removes the
+/// square OS frame and its rectangular shadow, and makes clicks outside the
+/// ball pass through to the desktop — the 360 / Thunder-style floating ball.
 ///
 /// The window may live on a monitor with any DPI scale, so the region is built
 /// in device pixels derived from the window's actual client size.
+///
+/// Two things keep the result a true, centered circle:
+/// * The scale is derived from the client rect on **each axis** and the circle
+///   is centered on the client rect itself, so a client area that is not
+///   exactly square can never shift the clip off-center and shave a flat edge
+///   off the ball.
+/// * The diameter is clamped to the client area. A region *larger* than the
+///   window makes `SetWindowRgn` degenerate into "no clip at all", which shows
+///   the square frame — the ball then no longer looks round.
 pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
-    if hwnd == 0 {
+    if hwnd == 0 || window_size <= 0.0 {
         return;
     }
     let mut rc = Rect {
@@ -104,13 +113,16 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
         GetClientRect(hwnd, &mut rc);
     }
     let client_w = (rc.right - rc.left) as f32;
-    if client_w <= 0.0 {
+    let client_h = (rc.bottom - rc.top) as f32;
+    if client_w <= 0.0 || client_h <= 0.0 {
         return;
     }
-    let scale = client_w / window_size;
-    let d = (diameter * scale).round() as c_int;
-    let off = (((window_size - diameter) / 2.0) * scale).round() as c_int;
-    let hrgn = unsafe { CreateEllipticRgn(off, off, off + d, off + d) };
+    let max_d = client_w.min(client_h);
+    let scale = (client_w / window_size).min(client_h / window_size);
+    let d = ((diameter * scale).round() as c_int).clamp(1, max_d.round() as c_int);
+    let left = ((client_w - d as f32) / 2.0).round() as c_int;
+    let top = ((client_h - d as f32) / 2.0).round() as c_int;
+    let hrgn = unsafe { CreateEllipticRgn(left, top, left + d, top + d) };
     if hrgn != 0 {
         unsafe {
             SetWindowRgn(hwnd, hrgn, 1);

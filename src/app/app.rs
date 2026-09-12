@@ -113,8 +113,7 @@ impl TokenMonitorApp {
         // to 1 (latest-wins). This replaces the old scheme where every
         // `refresh_view` spawned a fresh thread + opened a new connection,
         // which could fire 14+ times during one full scan cycle.
-        let (agg_req_tx, agg_req_rx) =
-            async_channel::bounded::<AggRequest>(1);
+        let (agg_req_tx, agg_req_rx) = async_channel::bounded::<AggRequest>(1);
         let agg_db_path = db_path.clone();
         let agg_view_tx = view_tx.clone();
         let _agg_worker = std::thread::Builder::new()
@@ -129,8 +128,13 @@ impl TokenMonitorApp {
                 };
                 while let Ok(req) = agg_req_rx.recv_blocking() {
                     let snapshot = compute_view_snapshot(
-                        &conn, req.seq, req.time_tab, &req.db_path,
-                        req.window, req.charts, req.report,
+                        &conn,
+                        req.seq,
+                        req.time_tab,
+                        &req.db_path,
+                        req.window,
+                        req.charts,
+                        req.report,
                     );
                     // bounded(1): if the UI is busy, the latest snapshot
                     // displaces the stale one in the channel.
@@ -772,6 +776,12 @@ pub fn ensure_floating_window(cx: &mut App) {
                     let hwnd = win.hwnd.get();
                     register_floating_hwnd(hwnd);
                     set_always_on_top(hwnd, true);
+                    // Round the window before the first paint. `render` also
+                    // applies the region every frame, but on the very first
+                    // frame the client rect may not be initialised yet — and
+                    // then the popup would show its square frame (most visible
+                    // at zero usage, where the ball is smallest).
+                    crate::ui::floating::seed_window_region(hwnd);
                 }
             }
             cx.new(|cx| FloatingView::new(window, cx))
