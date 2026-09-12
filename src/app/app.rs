@@ -755,7 +755,7 @@ pub(crate) static APP_WEAK: OnceLock<WeakEntity<TokenMonitorApp>> = OnceLock::ne
 #[cfg(target_os = "windows")]
 pub fn ensure_floating_window(cx: &mut App) {
     let hwnd = get_floating_hwnd();
-    if hwnd != 0 {
+    if hwnd != 0 && crate::platform::is_window_alive(hwnd) {
         let visible = !is_floating_visible();
         show_window(hwnd, visible);
         set_floating_visible(visible);

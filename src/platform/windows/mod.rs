@@ -187,34 +187,46 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
 
 // ── Custom drag ──────────────────────────────────────────────────────────────
 //
-// The floating ball is moved by a Win32 subclass on its own `HWND` instead of
-// GPUI's `WindowControlArea::Drag`. `Drag` lets `DefWindowProc` run the OS
-// caption-move loop; during that loop the app's frame pump is blocked and the
-// OS either draws its hollow drag-outline (a full window-sized **square**, when
-// "show window contents while dragging" is off) or a black frame while the
-// transparent window is not being re-presented — that is the black square the
-// user sees. Driving the move ourselves (capture the pointer, track it with
-// `GetCursorPos`, relocate with `SetWindowPos`) keeps GPUI rendering the live
-// circular ball every frame and never enters the OS move loop, so no black
-// square. Clicks still pass through outside the ball because `SetWindowRgn`
-// makes the OS return `HTTRANSPARENT` for the corners.
+// The floating ball carries GPUI's `WindowControlArea::Drag` on its sphere and
+// overlay elements — *not* so GPUI moves it, but so GPUI's hit test answers
+// `HTCAPTION` over the ball. That is the only thing that makes a transparent
+// popup window hittable: without a window-control area GPUI answers the hit
+// test with `None`, `DefWindowProc` then returns `HTTRANSPARENT` for the whole
+// client area, and the OS never delivers a mouse press to the window at all
+// (so no drag could ever start). `HTCAPTION` makes the OS emit `WM_NCLBUTTONDOWN`
+// instead, which our subclass below intercepts.
+//
+// `HTCAPTION` would normally let `DefWindowProc` run the OS caption-move loop;
+// during that loop the app's frame pump is blocked and the OS either draws its
+// hollow drag-outline (a full window-sized **square**, when "show window
+// contents while dragging" is off) or a black frame while the transparent
+// window is not being re-presented — that is the black square the user saw. We
+// prevent it by returning 0 (handled) from `WM_NCLBUTTONDOWN` so the message is
+// never forwarded to `DefWindowProc`. The move is driven ourselves: capture the
+// pointer, track it with `GetCursorPos`, relocate with `SetWindowPos`. That
+// keeps GPUI rendering the live circular ball every frame and never enters the
+// OS move loop, so no black square. Clicks still pass through outside the ball
+// because `SetWindowRgn` makes the OS return `HTTRANSPARENT` for the corners.
 
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn SetWindowLongPtrW(hwnd: isize, nindex: i32, dwnewlong: isize) -> isize;
-    fn GetWindowLongPtrW(hwnd: isize, nindex: i32) -> isize;
-    fn CallWindowProcW(
-        lp_prev_wnd_func: isize,
-        hwnd: isize,
-        msg: u32,
-        wparam: usize,
-        lparam: isize,
-    ) -> isize;
-    fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn GetCursorPos(lp_point: *mut Point) -> i32;
     fn SetCapture(hwnd: isize) -> isize;
     fn ReleaseCapture() -> i32;
     fn GetWindowRect(hwnd: isize, lprect: *mut Rect) -> i32;
+    fn IsWindow(hwnd: isize) -> i32;
+}
+
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn InitCommonControls();
+    fn SetWindowSubclass(
+        hwnd: isize,
+        pfn: *const (),
+        u_id_subclass: usize,
+        dw_ref_data: usize,
+    ) -> i32;
+    fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
 }
 
 #[repr(C)]
@@ -223,30 +235,45 @@ struct Point {
     y: i32,
 }
 
-const GWLP_WNDPROC: i32 = -4;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONUP: u32 = 0x0202;
+/// Non-client button messages. These arrive (instead of the client ones) when
+/// `WindowControlArea::Drag` makes GPUI's hit test answer `HTCAPTION` over the
+/// ball. We consume them in the subclass and drive the move ourselves so the
+/// OS caption-move loop never runs — that loop is what flashed a black square.
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+const WM_NCLBUTTONUP: u32 = 0x00A2;
 const SWP_NOZORDER: u32 = 0x0002;
 const SWP_NOACTIVATE: u32 = 0x0010;
+/// Unique id for this subclass (arbitrary; just must not collide with GPUI's
+/// own subclass ids, which it allocates separately).
+const DRAG_SUBCLASS_ID: usize = 0xF10A;
 
-/// Original `WndProc` per subclassed floating window (so we can chain every
-/// message back to GPUI after handling the drag ones).
-static ORIG_WNDPROC: OnceLock<Mutex<HashMap<isize, isize>>> = OnceLock::new();
 /// `(offset_x, offset_y)` = cursor minus window origin at drag start, per hwnd.
 static DRAG_OFFSET: OnceLock<Mutex<HashMap<isize, (i32, i32)>>> = OnceLock::new();
 
-unsafe extern "system" fn ball_drag_wndproc(
+/// `InitCommonControls` must run once before `SetWindowSubclass` is usable
+/// (comctl32 subclasses are uninitialised until then on some Windows builds).
+static COMCTL_INIT: OnceLock<()> = OnceLock::new();
+
+unsafe extern "system" fn ball_drag_subclass(
     hwnd: isize,
     msg: u32,
     wparam: usize,
     lparam: isize,
+    _u_id_subclass: usize,
+    _dw_ref_data: usize,
 ) -> isize {
     match msg {
-        WM_LBUTTONDOWN => {
-            // Begin a drag from anywhere inside the clipped ball (clicks in the
-            // transparent corners never reach here — `SetWindowRgn` routes them
-            // to the desktop). Record the grab offset so the ball does not jump.
+        WM_LBUTTONDOWN | WM_NCLBUTTONDOWN => {
+            // Begin a drag from anywhere inside the ball. For a plain client
+            // press (`WM_LBUTTONDOWN`) this runs directly; for the non-client
+            // press the OS emits when `WindowControlArea::Drag` answers
+            // `HTCAPTION` (which is what makes the transparent ball hittable at
+            // all), we consume the message and return 0 so GPUI never forwards
+            // it to `DefWindowProc` — that is what would start the OS caption
+            // move loop and flash the black square. We drive the move ourselves.
             let mut pt = Point { x: 0, y: 0 };
             let mut rc = Rect {
                 left: 0,
@@ -261,6 +288,10 @@ unsafe extern "system" fn ball_drag_wndproc(
                     .unwrap()
                     .insert(hwnd, (pt.x - rc.left, pt.y - rc.top));
                 SetCapture(hwnd);
+            }
+            // Non-client press: handled here, do not let GPUI run the OS loop.
+            if msg == WM_NCLBUTTONDOWN {
+                return 0;
             }
         }
         WM_MOUSEMOVE => {
@@ -288,7 +319,7 @@ unsafe extern "system" fn ball_drag_wndproc(
                 }
             }
         }
-        WM_LBUTTONUP => {
+        WM_LBUTTONUP | WM_NCLBUTTONUP => {
             if DRAG_OFFSET
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
@@ -298,47 +329,48 @@ unsafe extern "system" fn ball_drag_wndproc(
             {
                 ReleaseCapture();
             }
+            // Mirror the non-client press: swallow the up so GPUI does not react.
+            if msg == WM_NCLBUTTONUP {
+                return 0;
+            }
         }
         _ => {}
     }
-    // Chain every message (including the ones we handled) back to GPUI so hover
-    // and click handling keep working.
-    let orig = ORIG_WNDPROC
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .get(&hwnd)
-        .copied()
-        .unwrap_or(0);
-    if orig == 0 {
-        DefWindowProcW(hwnd, msg, wparam, lparam)
-    } else {
-        CallWindowProcW(orig, hwnd, msg, wparam, lparam)
-    }
+    // Chain to GPUI (and any other subclass) through `DefSubclassProc`. This is
+    // the correct forwarder for `SetWindowSubclass`: it preserves GPUI's own
+    // WndProc and any subclass GPUI installed, so hover, click-through and the
+    // OS show/hide messages keep flowing. The raw `SetWindowLongPtrW` swap we
+    // used before clobbered GPUI's WndProc on the first show/hide cycle and
+    // froze the window — that was why the ball could neither be dragged nor
+    // hidden.
+    DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
 /// Subclass the floating window so it can be dragged with the native pointer
 /// (see the module note above). Idempotent per hwnd. Call once at creation,
 /// right after the window handle is known.
+///
+/// Uses `SetWindowSubclass` (not `SetWindowLongPtrW`) on purpose: it composes
+/// with GPUI's own window proc instead of replacing it, so GPUI keeps receiving
+/// every message (including `WM_SHOWWINDOW`) and the window stays responsive.
 pub fn install_ball_drag(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
-    let mut map = ORIG_WNDPROC
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    if map.contains_key(&hwnd) {
-        return; // already subclassed
-    }
+    COMCTL_INIT.get_or_init(|| unsafe { InitCommonControls() });
     unsafe {
-        let prev = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-        if prev == 0 {
-            return;
-        }
-        map.insert(hwnd, prev);
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ball_drag_wndproc as *const () as isize);
+        SetWindowSubclass(hwnd, ball_drag_subclass as *const (), DRAG_SUBCLASS_ID, 0);
     }
+}
+
+/// Whether `hwnd` still refers to a live window. Used by the show/hide toggle so
+/// a window that GPUI has since destroyed is re-created instead of left pointing
+/// at a dead handle (which would make the toggle do nothing).
+pub fn is_window_alive(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe { IsWindow(hwnd) != 0 }
 }
 
 #[link(name = "user32")]

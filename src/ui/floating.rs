@@ -79,7 +79,7 @@
 
 use gpui::{
     div, px, BoxShadow, Context, Font, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window,
+    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window, WindowControlArea,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -589,15 +589,27 @@ impl Render for FloatingView {
             .id("floating-root")
             .size_full()
             .relative()
-            // The whole window is the drag surface. The actual move is driven by
-            // the Win32 subclass installed in `install_ball_drag` (see
-            // `platform::windows::mod`), which captures the pointer and tracks
-            // it with `GetCursorPos` + `SetWindowPos`. That keeps GPUI rendering
-            // the live circular ball every frame and never enters the OS caption
-            // move loop — which is what flashed a black square during a drag.
-            // Because the window is clipped to a circle via `SetWindowRgn`, hits
-            // inside the ball start a drag and hits in the transparent corners
-            // return `HTTRANSPARENT` so clicks pass through to the desktop.
+            // The ball element below carries `WindowControlArea::Drag` so GPUI's
+            // hit test returns `HTCAPTION` for it. That is the *only* thing that
+            // makes the transparent ball hittable: without a window-control area
+            // GPUI answers the hit test with `None`, `DefWindowProc` then returns
+            // `HTTRANSPARENT` for the whole client area, and the OS never delivers
+            // a mouse press to the window at all (so nothing — including our Win32
+            // drag subclass — ever sees it).
+            //
+            // `HTCAPTION` would normally make the OS run its own caption move
+            // loop (the black square we saw before). We do **not** let that
+            // happen: the Win32 subclass in `platform::windows::mod` intercepts
+            // the resulting `WM_NCLBUTTONDOWN`, captures the pointer and tracks it
+            // with `GetCursorPos` + `SetWindowPos` itself, returning 0 (handled)
+            // so the message is never forwarded to `DefWindowProc`. The loop
+            // never starts, and GPUI keeps painting the live circular ball every
+            // frame while it is dragged.
+            //
+            // Clicks outside the ball (the transparent corners) have no window
+            // control area, so they fall through to `DefWindowProc` and the
+            // `SetWindowRgn` clip — both of which return `HTTRANSPARENT` — so they
+            // pass through to the desktop, the 360 / Thunder style.
             .on_hover(move |hovered, _win, app| {
                 me.update(app, |this, cx| {
                     this.hovered = *hovered;
@@ -626,6 +638,10 @@ impl Render for FloatingView {
                 .w(px(sphere_d))
                 .h(px(sphere_d))
                 .rounded_full()
+                // Drag handle: makes GPUI answer `HTCAPTION` over the ball so the
+                // OS delivers the press to the window (see the root comment). The
+                // actual move is driven by the Win32 subclass, not the OS loop.
+                .window_control_area(WindowControlArea::Drag)
         };
         root = root.child(
             ball_disc()
@@ -683,7 +699,8 @@ impl Render for FloatingView {
 
         // --- 2. Overlaid number + cost, centred in the same box as the ball.
         // A flex row would fight the absolute layers, so this is one absolutely
-        // positioned column sized to the ball.
+        // positioned column sized to the ball. It is also a drag handle so the
+        // centre of the ball (under the text) is grabbable, not just the rim.
         root.child(
             div()
                 .absolute()
@@ -696,6 +713,7 @@ impl Render for FloatingView {
                 .items_center()
                 .justify_center()
                 .gap_1()
+                .window_control_area(WindowControlArea::Drag)
                 .child(
                     div()
                         .text_color(WHITE)
