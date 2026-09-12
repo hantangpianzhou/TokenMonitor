@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -180,6 +182,162 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
         unsafe {
             SetWindowRgn(hwnd, hrgn, 1);
         }
+    }
+}
+
+// ── Custom drag ──────────────────────────────────────────────────────────────
+//
+// The floating ball is moved by a Win32 subclass on its own `HWND` instead of
+// GPUI's `WindowControlArea::Drag`. `Drag` lets `DefWindowProc` run the OS
+// caption-move loop; during that loop the app's frame pump is blocked and the
+// OS either draws its hollow drag-outline (a full window-sized **square**, when
+// "show window contents while dragging" is off) or a black frame while the
+// transparent window is not being re-presented — that is the black square the
+// user sees. Driving the move ourselves (capture the pointer, track it with
+// `GetCursorPos`, relocate with `SetWindowPos`) keeps GPUI rendering the live
+// circular ball every frame and never enters the OS move loop, so no black
+// square. Clicks still pass through outside the ball because `SetWindowRgn`
+// makes the OS return `HTTRANSPARENT` for the corners.
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetWindowLongPtrW(hwnd: isize, nindex: i32, dwnewlong: isize) -> isize;
+    fn GetWindowLongPtrW(hwnd: isize, nindex: i32) -> isize;
+    fn CallWindowProcW(
+        lp_prev_wnd_func: isize,
+        hwnd: isize,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize;
+    fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn GetCursorPos(lp_point: *mut Point) -> i32;
+    fn SetCapture(hwnd: isize) -> isize;
+    fn ReleaseCapture() -> i32;
+    fn GetWindowRect(hwnd: isize, lprect: *mut Rect) -> i32;
+}
+
+#[repr(C)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+const GWLP_WNDPROC: i32 = -4;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONUP: u32 = 0x0202;
+const SWP_NOZORDER: u32 = 0x0002;
+const SWP_NOACTIVATE: u32 = 0x0010;
+
+/// Original `WndProc` per subclassed floating window (so we can chain every
+/// message back to GPUI after handling the drag ones).
+static ORIG_WNDPROC: OnceLock<Mutex<HashMap<isize, isize>>> = OnceLock::new();
+/// `(offset_x, offset_y)` = cursor minus window origin at drag start, per hwnd.
+static DRAG_OFFSET: OnceLock<Mutex<HashMap<isize, (i32, i32)>>> = OnceLock::new();
+
+unsafe extern "system" fn ball_drag_wndproc(
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    match msg {
+        WM_LBUTTONDOWN => {
+            // Begin a drag from anywhere inside the clipped ball (clicks in the
+            // transparent corners never reach here — `SetWindowRgn` routes them
+            // to the desktop). Record the grab offset so the ball does not jump.
+            let mut pt = Point { x: 0, y: 0 };
+            let mut rc = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut rc) != 0 {
+                DRAG_OFFSET
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap()
+                    .insert(hwnd, (pt.x - rc.left, pt.y - rc.top));
+                SetCapture(hwnd);
+            }
+        }
+        WM_MOUSEMOVE => {
+            if let Some((ox, oy)) = DRAG_OFFSET
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap()
+                .get(&hwnd)
+                .copied()
+            {
+                let mut pt = Point { x: 0, y: 0 };
+                if GetCursorPos(&mut pt) != 0 {
+                    // Move the whole window so the cursor stays on the same
+                    // point of the ball. `SWP_NOZORDER` keeps the always-on-top
+                    // state; `SWP_NOACTIVATE` avoids stealing focus mid-drag.
+                    SetWindowPos(
+                        hwnd,
+                        0,
+                        pt.x - ox,
+                        pt.y - oy,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+        WM_LBUTTONUP => {
+            if DRAG_OFFSET
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap()
+                .remove(&hwnd)
+                .is_some()
+            {
+                ReleaseCapture();
+            }
+        }
+        _ => {}
+    }
+    // Chain every message (including the ones we handled) back to GPUI so hover
+    // and click handling keep working.
+    let orig = ORIG_WNDPROC
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&hwnd)
+        .copied()
+        .unwrap_or(0);
+    if orig == 0 {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    } else {
+        CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+    }
+}
+
+/// Subclass the floating window so it can be dragged with the native pointer
+/// (see the module note above). Idempotent per hwnd. Call once at creation,
+/// right after the window handle is known.
+pub fn install_ball_drag(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let mut map = ORIG_WNDPROC
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if map.contains_key(&hwnd) {
+        return; // already subclassed
+    }
+    unsafe {
+        let prev = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        if prev == 0 {
+            return;
+        }
+        map.insert(hwnd, prev);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ball_drag_wndproc as *const () as isize);
     }
 }
 

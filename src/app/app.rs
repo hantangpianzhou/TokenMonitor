@@ -20,8 +20,8 @@ use crate::collector::{scheduler, Collector, CollectorEvent};
 use crate::core::aggregation::SumStats;
 use crate::core::model::{Provider, ThemeColor, TimeWindow};
 use crate::platform::{
-    get_floating_hwnd, is_floating_visible, register_floating_hwnd, set_always_on_top,
-    set_floating_visible, show_window,
+    get_floating_hwnd, install_ball_drag, is_floating_visible, register_floating_hwnd,
+    set_always_on_top, set_floating_visible, show_window,
 };
 use crate::storage::default_db_path;
 use crate::storage::repository::UsageRepo;
@@ -784,6 +784,10 @@ pub fn ensure_floating_window(cx: &mut App) {
                     // then the popup would show its square frame (most visible
                     // at zero usage, where the ball is smallest).
                     crate::ui::floating::seed_window_region(hwnd);
+                    // Drag the ball with our own Win32 subclass (not GPUI's
+                    // `WindowControlArea::Drag`, which routes the move through
+                    // the OS caption loop and flashes a black square).
+                    install_ball_drag(hwnd);
                 }
             }
             cx.new(|cx| FloatingView::new(window, cx))

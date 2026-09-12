@@ -79,7 +79,7 @@
 
 use gpui::{
     div, px, BoxShadow, Context, Font, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window, WindowControlArea,
+    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -589,20 +589,15 @@ impl Render for FloatingView {
             .id("floating-root")
             .size_full()
             .relative()
-            // Mark the whole window as a GPUI drag region. GPUI's WndProc
-            // answers `WM_NCHITTEST` with `HTCAPTION` for this region and then
-            // lets `DefWindowProc` start the OS move loop — this is GPUI's
-            // native frameless-drag path (no manual `PostMessageW` needed).
-            // Because the window is clipped to a circle via `SetWindowRgn`,
-            // only hits inside the ball resolve to `HTCAPTION`; outside the
-            // circle the OS returns `HTTRANSPARENT` and clicks pass through to
-            // the desktop.
-            //
-            // IMPORTANT: do NOT attach an `on_mouse_down` handler to this
-            // region. GPUI's `handle_nc_mouse_down_msg` dispatches the
-            // `WM_NCLBUTTONDOWN` to the element; if a handler consumes it the
-            // message is swallowed and `DefWindowProc` never starts the drag.
-            .window_control_area(WindowControlArea::Drag)
+            // The whole window is the drag surface. The actual move is driven by
+            // the Win32 subclass installed in `install_ball_drag` (see
+            // `platform::windows::mod`), which captures the pointer and tracks
+            // it with `GetCursorPos` + `SetWindowPos`. That keeps GPUI rendering
+            // the live circular ball every frame and never enters the OS caption
+            // move loop — which is what flashed a black square during a drag.
+            // Because the window is clipped to a circle via `SetWindowRgn`, hits
+            // inside the ball start a drag and hits in the transparent corners
+            // return `HTTRANSPARENT` so clicks pass through to the desktop.
             .on_hover(move |hovered, _win, app| {
                 me.update(app, |this, cx| {
                     this.hovered = *hovered;
