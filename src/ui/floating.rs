@@ -46,16 +46,26 @@
 //! ## 3. The clip always keeps real empty space beyond the glow
 //!
 //! [`max_sphere_for_window`] caps the ball so that
-//! `glow + 2 * CLIP_PAD <= win - CLIP_MARGIN` holds for *every* window size,
-//! which makes the region's hard, non-anti-aliased edge always land on fully
-//! transparent pixels. A region that touched a drawn edge would jag it, and a
-//! region *larger* than the window makes `SetWindowRgn` degenerate into "no
-//! clip at all".
+//! `2 * glow_visible_radius + 2 * CLIP_PAD <= win - CLIP_MARGIN` holds for
+//! *every* window size, which keeps the region's hard, non-anti-aliased edge on
+//! pixels the gaussian tail has already faded below one 8-bit level. A region
+//! that touched a drawn edge would jag it, and a region *larger* than the window
+//! makes `SetWindowRgn` degenerate into "no clip at all".
 //!
-//! The halo itself is a smooth ladder of many faint rings rather than a few
-//! strong ones: each ring adds only [`HALO_RING_ALPHA`] (~1% alpha), so the
-//! steps between rings are below the eye's threshold and the glow reads as a
-//! continuous radial falloff instead of a set of visible concentric bands.
+//! ## 4. The glow is one blurred disc, never a stack of discs
+//!
+//! GPUI's [`gpui::BoxShadow`] is a real gaussian blur of the element's
+//! rounded-rect coverage, so a single `shadow` on the ball is a *continuous*
+//! radial falloff with no edges anywhere. That is the whole point: every other
+//! way to fake a glow in this revision — stacking a few concentric translucent
+//! discs — is built out of hard edges, because each disc's rim is snapped to
+//! whole device pixels and anti-aliased over exactly one pixel. A handful of
+//! discs therefore rings the ball with stair-stepped concentric bands; a
+//! screenshot of the 4-disc version showed precisely that, four hard rings at
+//! radii 84/88/91/96/101 px. A gaussian has no steps to begin with, at any size.
+//!
+//! The price is geometry: σ spreads the glow to `GLOW_TAIL_SIGMA * σ` beyond the
+//! rim, and that — not the ball — is what the window and the clip must fit.
 //!
 //! # The overlay text always fits
 //!
@@ -68,8 +78,8 @@
 //! whenever shaping is unavailable, so the size is always safe.
 
 use gpui::{
-    div, px, Context, Font, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, TextRun, Window, WindowControlArea,
+    div, px, BoxShadow, Context, Font, FontWeight, Hsla, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window, WindowControlArea,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -97,22 +107,24 @@ const HOVER_SCALE: f32 = 1.06;
 /// Slack (px) between the clip circle and the window edge, so rounding when the
 /// region is built in device pixels can never push it past the window.
 const CLIP_MARGIN: f32 = 4.0;
-/// Clear gap (px) the clip keeps around the outermost drawn pixel. The region is
-/// cut with a hard, non-anti-aliased edge, so this much of it must be empty —
-/// otherwise the cut jags whatever it lands on.
+/// Clear gap (px) the clip keeps around the outermost *visible* glow pixel. The
+/// region is cut with a hard, non-anti-aliased edge, so this much of it must be
+/// empty — otherwise the cut jags whatever it lands on.
 const CLIP_PAD: f32 = 12.0;
-/// Number of rings stacked to fake a radial glow. Many rings × a tiny per-ring
-/// alpha ⇒ the steps between rings are ~1% alpha each, i.e. invisible, so the
-/// glow has no visible banding. (This revision of GPUI has no `box_shadow` and
-/// no radial gradient, and only two-stop linear gradients.)
-const HALO_RINGS: usize = 18;
-/// Diameter of the innermost halo ring, as a multiple of the ball.
-const HALO_INNER_SCALE: f32 = 1.0;
-/// Diameter of the outermost halo ring, as a multiple of the ball.
-const HALO_OUTER_SCALE: f32 = 1.22;
-/// Alpha of each individual halo ring. The rings composite, so the glow's
-/// strength at the rim is `1 - (1 - alpha) ^ (HALO_RINGS - 1)` ≈ 0.17.
-const HALO_RING_ALPHA: f32 = 0.011;
+/// Blur radius of the glow, as a multiple of the ball diameter. This is the
+/// gaussian's σ, so it sets how far the glow reaches and how soft it is: at
+/// 0.085 a ball 232 px across carries a glow that is still worth 2% of its peak
+/// a good 40 px out.
+const GLOW_BLUR_RATIO: f32 = 0.085;
+/// How many σ of the glow tail count as visible. A gaussian has no finite
+/// support, but past ~2σ its alpha is under 2% of the peak, i.e. below one 8-bit
+/// level against a light desktop — so this, and not 3σ, is the radius the clip
+/// and the window have to clear.
+const GLOW_TAIL_SIGMA: f32 = 2.0;
+/// Composited opacity of the glow at the ball's rim, before the blur halves it.
+/// A blurred disc covers its own edge with exactly half the source alpha, so
+/// this is the strength the glow *peaks* at, right where it meets the ball.
+const GLOW_PEAK_ALPHA: f32 = 0.24;
 /// Fraction of the window the *seeded* (first-frame) clip uses. Large on
 /// purpose: a first frame that is too generous merely looks like a bigger
 /// click-through circle for one frame, while a first frame that is too tight
@@ -127,14 +139,24 @@ const MIN_SANE_WINDOW: f32 = 32.0;
 /// a circle *the same diameter as the ball* so it cannot change the silhouette.
 /// A gradient (not a hard-edged highlight disc) is what keeps the sphere read:
 /// an offset opaque circle looks like a second, smaller circle glued on.
-const SHEEN_ALPHA: f32 = 0.20;
-/// Specular dot as `(center_x, center_y, radius)`, all fractions of the ball
-/// diameter (0..1). Small and near-opaque: at this size it reads as a glint
-/// rather than a disc. Kept strictly inside the ball's inscribed circle by
-/// [`dot_is_inside_disc`].
-const SPECULAR: (f32, f32, f32) = (0.36, 0.30, 0.075);
-/// Specular opacity.
-const SPECULAR_ALPHA: f32 = 0.55;
+const SHEEN_ALPHA: f32 = 0.22;
+/// Foot shade: a wash of the ball's own dark tone anchored at the *bottom* edge,
+/// fading to nothing upward. The base gradient alone lights the sphere flatly;
+/// pairing a bright cap with a dark foot is what makes it read as a lit sphere
+/// rather than as a tinted disc.
+const SHADE_ALPHA: f32 = 0.26;
+/// Rim light: a hairline highlight along the ball's own edge. It crisps the
+/// silhouette against the glow instead of letting the two smear into each other.
+/// It is a `border`, so it is drawn *inside* the ball's bounds and cannot alter
+/// the silhouette.
+const RIM_ALPHA: f32 = 0.22;
+/// Specular highlights as `(center_x, center_y, radius, opacity)`, all fractions
+/// of the ball diameter (0..1). The first is the main glint; the second, smaller
+/// and dimmer, is the companion reflection that makes the surface read as glass
+/// rather than as one flat dot glued on. Each is kept strictly inside the ball's
+/// inscribed circle by [`dot_is_inside_disc`].
+const SPECULARS: [(f32, f32, f32, f32); 2] =
+    [(0.36, 0.30, 0.075, 0.58), (0.600, 0.238, 0.030, 0.34)];
 
 /// Fraction of the ball's inscribed square the overlay text may use. The
 /// inscribed square is inside the circle by definition, so anything that fits it
@@ -167,64 +189,72 @@ fn sphere_diameter_for(total_tokens: u64, hovered: bool) -> f32 {
     base * if hovered { HOVER_SCALE } else { 1.0 }
 }
 
-/// Diameter (px) of the outermost halo ring for a ball of `sphere_d` px.
-fn glow_outer_diameter(sphere_d: f32) -> f32 {
-    sphere_d * HALO_OUTER_SCALE
+/// Blur radius (px) — the gaussian's σ — of the glow for a ball of `sphere_d` px.
+///
+/// Proportional to the ball on purpose: a fixed σ would make the glow a tight
+/// collar on a big ball and a diffuse fog around a small one, so the ball would
+/// appear to change material as usage grows.
+fn glow_blur(sphere_d: f32) -> f32 {
+    sphere_d * GLOW_BLUR_RATIO
 }
 
-/// Diameter (px) of halo ring `i` (`0` = innermost) for a ball of `sphere_d` px.
-fn halo_ring_diameter(sphere_d: f32, i: usize) -> f32 {
-    let t = if HALO_RINGS <= 1 {
-        0.0
-    } else {
-        i as f32 / (HALO_RINGS - 1) as f32
-    };
-    sphere_d * (HALO_INNER_SCALE + (HALO_OUTER_SCALE - HALO_INNER_SCALE) * t)
+/// Radius (px) out to which the glow is still visible for a ball of `sphere_d`
+/// px: the ball's own radius plus [`GLOW_TAIL_SIGMA`] σ of blur tail.
+fn glow_visible_radius(sphere_d: f32) -> f32 {
+    sphere_d / 2.0 + GLOW_TAIL_SIGMA * glow_blur(sphere_d)
 }
 
 /// Largest ball (px) that still leaves the clip room to clear the glow inside a
 /// window whose smaller side is `win` px.
 ///
-/// This is what makes "the clip keeps empty space beyond every drawn pixel" hold
-/// for *any* window size instead of only the nominal one: capping the ball is
-/// the only lever that keeps `glow + 2 * CLIP_PAD <= win - CLIP_MARGIN` true when
-/// the window comes out smaller than requested.
+/// This is what makes "the clip keeps empty space beyond every visible glow
+/// pixel" hold for *any* window size instead of only the nominal one: capping
+/// the ball is the only lever that keeps
+/// `2 * glow_visible_radius + 2 * CLIP_PAD <= win - CLIP_MARGIN` true when the
+/// window comes out smaller than requested.
+///
+/// Solving that for the ball means dividing by the radius the ball occupies per
+/// unit of diameter — `0.5` for the ball itself plus the blur tail — which is
+/// why the divisor is not simply `GLOW_BLUR_RATIO`.
 fn max_sphere_for_window(win: f32) -> f32 {
-    ((win - CLIP_MARGIN - 2.0 * CLIP_PAD) / HALO_OUTER_SCALE).max(0.0)
+    let budget = ((win - CLIP_MARGIN - 2.0 * CLIP_PAD) / 2.0).max(0.0);
+    (budget / (0.5 + GLOW_TAIL_SIGMA * GLOW_BLUR_RATIO)).max(0.0)
 }
 
 /// Clip-circle diameter (px) for a ball of `sphere_d` px inside a window whose
 /// smaller side is `win` px.
 ///
-/// Derived *from* the ball so it can never cut it: it covers the outermost halo
-/// ring and keeps [`CLIP_PAD`] of genuinely empty space around *every* drawn
-/// edge, so the region's hard (non-anti-aliased) cut lands on fully transparent
-/// pixels. It is clamped inside the window because a region larger than the
-/// window makes `SetWindowRgn` degenerate into "no clip".
+/// Derived *from* the ball so it can never cut it: it covers the glow out to
+/// where it stops being visible and keeps [`CLIP_PAD`] of effectively empty
+/// space beyond that, so the region's hard (non-anti-aliased) cut lands on
+/// pixels whose alpha is below one 8-bit level. It is clamped inside the window
+/// because a region larger than the window makes `SetWindowRgn` degenerate into
+/// "no clip".
 fn clip_diameter_for(sphere_d: f32, win: f32) -> f32 {
-    (glow_outer_diameter(sphere_d) + 2.0 * CLIP_PAD).min(win - CLIP_MARGIN)
+    (2.0 * glow_visible_radius(sphere_d) + 2.0 * CLIP_PAD).min(win - CLIP_MARGIN)
 }
 
 /// Whether a dot of radius `r` centred at `(cx, cy)` (all fractions of the ball
-/// diameter) fits inside the ball's inscribed circle. Guards the specular dot:
-/// it is the only drawn element smaller than the ball, so it is the only one
-/// that could be placed outside the silhouette by mistake.
+/// diameter) fits inside the ball's inscribed circle. Guards the specular
+/// highlights: they are the only drawn elements smaller than the ball, so they
+/// are the only ones that could be placed outside the silhouette by mistake.
 fn dot_is_inside_disc(cx: f32, cy: f32, r: f32) -> bool {
     let dx = cx - 0.5;
     let dy = cy - 0.5;
     (dx * dx + dy * dy).sqrt() + r <= 0.5
 }
 
-/// Specular dot as `(left, top, diameter)` in px for a ball of `sphere_d` px.
+/// One specular highlight as `(left, top, diameter)` in px for a ball of
+/// `sphere_d` px, from a `(center_x, center_y, radius)` fraction triple.
 ///
-/// The dot is the **only** layer that is not a copy of the ball's own circle, so
-/// it is the only one that could break the silhouette. If [`SPECULAR`] were ever
-/// edited to a fraction that pokes past the rim, the centre is pulled back along
-/// its own offset vector until the dot fits inside the inscribed circle — so a
-/// bad constant degrades into a dot in a different spot, never into a teardrop
-/// ball.
-fn specular_geometry(sphere_d: f32) -> (f32, f32, f32) {
-    let (cx, cy, r) = SPECULAR;
+/// A specular is the **only** layer that is not a copy of the ball's own circle,
+/// so it is the only one that could break the silhouette. If a constant were
+/// ever edited to a fraction that pokes past the rim, the centre is pulled back
+/// along its own offset vector until the highlight fits inside the inscribed
+/// circle — so a bad constant degrades into a highlight in a different spot,
+/// never into a teardrop ball.
+fn specular_geometry(sphere_d: f32, spec: (f32, f32, f32)) -> (f32, f32, f32) {
+    let (cx, cy, r) = spec;
     let (mut dx, mut dy) = (cx - 0.5, cy - 0.5);
     if !dot_is_inside_disc(cx, cy, r) {
         let dist = (dx * dx + dy * dy).sqrt();
@@ -580,68 +610,83 @@ impl Render for FloatingView {
                 });
             });
 
-        // --- 1. Halo (static glow), painted first so the ball sits on top.
-        // Outermost ring first: each smaller ring composites on top of the
-        // larger ones, so alpha accumulates smoothly inward instead of forming
-        // discrete bands. Every ring is centred on the same box as the ball.
-        for i in (0..HALO_RINGS).rev() {
-            let d = halo_ring_diameter(sphere_d, i);
+        // --- 1. The sphere, plus the glow that belongs to it.
+        //
+        // The glow is the ball's own *drop shadow* — a real gaussian blur of the
+        // ball's rounded-rect coverage, painted by GPUI just before the ball's
+        // background, so it is automatically behind every layer below and
+        // concentric with the ball by construction. One blurred disc is a
+        // continuous radial falloff; any stack of discs would be a stack of hard,
+        // snapped, 1px-anti-aliased rims, i.e. the visible concentric bands.
+        //
+        // All the finish layers are circles occupying the *same* box, so their
+        // union is exactly one circle and the silhouette can never become a
+        // teardrop. No `overflow_hidden` anywhere: it clips rectangles, not
+        // rounded corners, so it would not have contained anything anyway.
+        let ball_disc = || {
+            div()
+                .absolute()
+                .top(ball_y)
+                .left(ball_x)
+                .w(px(sphere_d))
+                .h(px(sphere_d))
+                .rounded_full()
+        };
+        root = root.child(
+            ball_disc()
+                .bg(gpui::linear_gradient(
+                    155.0,
+                    gpui::linear_color_stop(lighter, 0.0),
+                    gpui::linear_color_stop(darker, 1.0),
+                ))
+                // The glow. Doubled because a gaussian covers a blurred edge with
+                // exactly half the source alpha, so `2 * GLOW_PEAK_ALPHA` is what
+                // makes the glow peak at `GLOW_PEAK_ALPHA` where it leaves the rim.
+                .shadow(vec![BoxShadow::new(
+                    px(0.),
+                    px(0.),
+                    accent.opacity(GLOW_PEAK_ALPHA * 2.0),
+                )
+                .blur_radius(px(glow_blur(sphere_d)))]),
+        );
+        root = root
+            // Foot shade: the ball's own dark tone, clear at the top and heaviest
+            // at the bottom, so the sphere reads as lit from above.
+            .child(ball_disc().bg(gpui::linear_gradient(
+                180.0,
+                gpui::linear_color_stop(darker.opacity(0.0), 0.0),
+                gpui::linear_color_stop(darker.opacity(SHADE_ALPHA), 1.0),
+            )))
+            // Top sheen: white at the top edge, fading out downward.
+            .child(ball_disc().bg(gpui::linear_gradient(
+                180.0,
+                gpui::linear_color_stop(WHITE.opacity(SHEEN_ALPHA), 0.0),
+                gpui::linear_color_stop(WHITE.opacity(0.0), 1.0),
+            )));
+        for (i, &(cx, cy, r, alpha)) in SPECULARS.iter().enumerate() {
+            let (dot_x, dot_y, dot_d) = specular_geometry(sphere_d, (cx, cy, r));
             root = root.child(
                 div()
-                    .id(("glow", i))
-                    .absolute()
-                    .top(px((win_h - d) / 2.0))
-                    .left(px((win_w - d) / 2.0))
-                    .w(px(d))
-                    .h(px(d))
-                    .rounded_full()
-                    .bg(accent)
-                    .opacity(HALO_RING_ALPHA),
-            );
-        }
-
-        // --- 2. The sphere: base shading + sheen + specular. All three are
-        // circles occupying the *same* box, so their union is exactly one circle
-        // and the silhouette can never become a teardrop. No `overflow_hidden`
-        // anywhere: it clips rectangles, not rounded corners, so it would not
-        // have contained anything anyway.
-        let ball_box = || div().absolute().top(ball_y).left(ball_x);
-        root = root
-            .child(
-                ball_box()
-                    .w(px(sphere_d))
-                    .h(px(sphere_d))
-                    .rounded_full()
-                    .bg(gpui::linear_gradient(
-                        155.0,
-                        gpui::linear_color_stop(lighter, 0.0),
-                        gpui::linear_color_stop(darker, 1.0),
-                    )),
-            )
-            .child(
-                ball_box()
-                    .w(px(sphere_d))
-                    .h(px(sphere_d))
-                    .rounded_full()
-                    .bg(gpui::linear_gradient(
-                        180.0,
-                        gpui::linear_color_stop(WHITE.opacity(SHEEN_ALPHA), 0.0),
-                        gpui::linear_color_stop(WHITE.opacity(0.0), 1.0),
-                    )),
-            )
-            .child({
-                let (dot_x, dot_y, dot_d) = specular_geometry(sphere_d);
-                div()
+                    .id(("specular", i))
                     .absolute()
                     .top(px(dot_y))
                     .left(px(dot_x))
                     .w(px(dot_d))
                     .h(px(dot_d))
                     .rounded_full()
-                    .bg(WHITE.opacity(SPECULAR_ALPHA))
-            });
+                    .bg(WHITE.opacity(alpha)),
+            );
+        }
+        // Rim light last, so no later layer washes it out. A `border` follows the
+        // rounded corner radius — this is a hairline ring, not a disc — and it is
+        // drawn inside the bounds, so it cannot touch the silhouette.
+        root = root.child(
+            ball_disc()
+                .border_1()
+                .border_color(WHITE.opacity(RIM_ALPHA)),
+        );
 
-        // --- 3. Overlaid number + cost, centred in the same box as the ball.
+        // --- 2. Overlaid number + cost, centred in the same box as the ball.
         // A flex row would fight the absolute layers, so this is one absolutely
         // positioned column sized to the ball.
         root.child(
@@ -746,24 +791,25 @@ mod tests {
         }
     }
 
-    /// **The regression that made the ball a teardrop.** The specular dot is the
-    /// only drawn element that does not share the ball's bounding box, so it is
-    /// the only one that can be placed outside the silhouette by a careless
-    /// fraction. Pin it to the inscribed circle.
+    /// **The regression that made the ball a teardrop.** A specular is the only
+    /// drawn element that does not share the ball's bounding box, so it is the
+    /// only one that can be placed outside the silhouette by a careless fraction.
+    /// Pin every highlight to the inscribed circle.
     #[test]
-    fn specular_dot_stays_inside_the_ball_disc() {
-        let (cx, cy, r) = SPECULAR;
-        assert!(
-            dot_is_inside_disc(cx, cy, r),
-            "specular ({cx}, {cy}, r={r}) escapes the ball's inscribed circle"
-        );
+    fn specular_dots_stay_inside_the_ball_disc() {
+        for &(cx, cy, r, _) in SPECULARS.iter() {
+            assert!(
+                dot_is_inside_disc(cx, cy, r),
+                "specular ({cx}, {cy}, r={r}) escapes the ball's inscribed circle"
+            );
+        }
         // ...and the guard actually rejects a protruding dot (the shape of the
         // old inner-shadow bug: offset 0.26, radius 0.30 -> 0.56 > 0.5).
         assert!(!dot_is_inside_disc(0.60, 0.74, 0.30));
     }
 
-    /// The specular helper must never place the dot outside the ball, for any
-    /// ball size.
+    /// The specular helper must never place a highlight outside the ball, for
+    /// any ball size.
     #[test]
     fn specular_geometry_never_escapes_the_ball() {
         for sphere in [
@@ -773,16 +819,19 @@ mod tests {
             MAX_SPHERE,
             MAX_SPHERE * HOVER_SCALE,
         ] {
-            let (left, top, d) = specular_geometry(sphere);
-            let r_px = d / 2.0;
-            let dist =
-                ((left + r_px - sphere / 2.0).powi(2) + (top + r_px - sphere / 2.0).powi(2)).sqrt();
-            assert!(
-                dist + r_px <= sphere / 2.0 + 0.01,
-                "specular escapes: ball {sphere}, dot r {r_px} at dist {dist}"
-            );
-            assert!(left >= 0.0 && top >= 0.0, "dot must stay in the ball's box");
-            assert!(left + d <= sphere && top + d <= sphere);
+            for &(cx, cy, r, _) in SPECULARS.iter() {
+                let (left, top, d) = specular_geometry(sphere, (cx, cy, r));
+                let r_px = d / 2.0;
+                let dist = ((left + r_px - sphere / 2.0).powi(2)
+                    + (top + r_px - sphere / 2.0).powi(2))
+                .sqrt();
+                assert!(
+                    dist + r_px <= sphere / 2.0 + 0.01,
+                    "specular escapes: ball {sphere}, dot r {r_px} at dist {dist}"
+                );
+                assert!(left >= 0.0 && top >= 0.0, "dot must stay in the ball's box");
+                assert!(left + d <= sphere && top + d <= sphere);
+            }
         }
     }
 
@@ -824,7 +873,7 @@ mod tests {
                         .min(max_sphere_for_window(win));
                     assert!(sphere > 0.0, "no ball at all (win={win})");
                     let clip = clip_diameter_for(sphere, win);
-                    let glow = glow_outer_diameter(sphere);
+                    let glow = 2.0 * glow_visible_radius(sphere);
                     assert!(
                         clip >= sphere,
                         "clip {clip} cuts the ball {sphere} (win={win})"
@@ -844,34 +893,49 @@ mod tests {
         }
     }
 
-    /// The halo fades outward in many small steps — the property that makes it
-    /// read as a glow rather than as a set of concentric bands — and never
-    /// shrinks inside the ball.
+    /// **The banding test.** A glow built from a handful of translucent discs is
+    /// invisible-*looking* in code but stair-stepped on screen: every disc rim is
+    /// snapped to whole device pixels and anti-aliased over exactly one pixel, so
+    /// each rim is a hard circle. The glow therefore has to be a single gaussian
+    /// blur, which is smooth at every radius by construction.
+    ///
+    /// Guard the properties that make it a glow rather than a smudge or a ring:
+    /// it starts at the ball's rim (never inside it, where it would be wasted
+    /// behind the opaque ball), it is wide enough to read as light spilling off
+    /// the ball, and it is capped so the clip and the window always have room for
+    /// its tail.
     #[test]
-    fn halo_rings_fade_outward_smoothly() {
-        assert!(HALO_RINGS >= 12, "too few rings to hide the banding");
-        assert!(
-            HALO_RING_ALPHA * HALO_RINGS as f32 <= 0.25,
-            "per-ring alpha must stay tiny"
-        );
-        assert!(HALO_INNER_SCALE >= 1.0 && HALO_OUTER_SCALE > HALO_INNER_SCALE);
-        for sphere in [MIN_SPHERE, 180.0, MAX_SPHERE * HOVER_SCALE] {
-            let mut prev = 0.0;
-            for i in 0..HALO_RINGS {
-                let d = halo_ring_diameter(sphere, i);
-                assert!(d >= sphere - 0.01, "ring {i} ({d}) sits inside {sphere}");
-                assert!(d > prev, "ring {i} ({d}) does not grow outward");
-                prev = d;
-            }
+    fn glow_is_a_gaussian_blur_not_a_stack_of_discs() {
+        // A blur of `GLOW_BLUR_RATIO * d` with a 2σ tail has to clear the ball
+        // and still read as a glow, not as a hairline.
+        assert!((0.05..=0.15).contains(&GLOW_BLUR_RATIO));
+        assert!(GLOW_TAIL_SIGMA >= 2.0, "a 1σ tail would cut a visible edge");
+        assert!((0.05..=0.5).contains(&GLOW_PEAK_ALPHA));
+
+        for sphere in [MIN_SPHERE, 170.0, MAX_SPHERE, MAX_SPHERE * HOVER_SCALE] {
+            let blur = glow_blur(sphere);
+            let visible = glow_visible_radius(sphere);
+            assert!(blur > 0.0 && visible > sphere / 2.0);
+            // Wide enough to be a glow (at least ~10% of the ball's radius), and
+            // the blur grows with the ball so the material does not change with
+            // usage.
             assert!(
-                (halo_ring_diameter(sphere, HALO_RINGS - 1) - glow_outer_diameter(sphere)).abs()
-                    < 0.01
+                visible - sphere / 2.0 >= sphere * 0.05,
+                "glow tail {}px is too thin to read as a glow",
+                visible - sphere / 2.0
             );
-            // Consecutive ring diameters differ by well under a pixel for small
-            // balls — that is the smoothness.
-            let step = (glow_outer_diameter(sphere) - sphere) / (HALO_RINGS - 1) as f32;
-            assert!(step < sphere * 0.03, "ring steps of {step}px are visible");
+            // The blur costs the ball window space, so a glow that reached too
+            // far would quietly shrink the resting ball below its minimum.
+            assert!(
+                max_sphere_for_window(WINDOW_SIZE) >= MIN_SPHERE,
+                "the glow's tail costs the ball too much of the window"
+            );
         }
+        // Blur tracks the ball: the ratio is what stays constant.
+        assert!(
+            (glow_blur(2.0 * MIN_SPHERE) / glow_blur(MIN_SPHERE) - 2.0).abs() < 1e-4,
+            "the glow must scale with the ball"
+        );
     }
 
     /// **The text must never break the circle either.** A 9-digit count is wider
