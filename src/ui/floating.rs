@@ -10,111 +10,118 @@
 //!
 //! The ball is drawn in code (not a PNG) so the color always follows the
 //! theme. A linear gradient + a gradient sheen + a small specular dot give it
-//! a rounded, spherical read. A soft, layered accent **halo** behind the ball
-//! sells the "floating" glow — concentric translucent circles fade outward to
-//! fake a radial glow (GPUI this revision has no `box_shadow` / image blur and
-//! only two-stop gradients, so we stack rings instead). No animation.
+//! a rounded, spherical read. A soft accent **halo** behind the ball sells the
+//! "floating" glow.
 //!
-//! # Every layer is its own circle — nothing sits *inside* the ball
+//! # Three rules, and the bugs that produced them
 //!
-//! The previous version nested the shading as children of the ball and relied
-//! on `overflow_hidden()` + `rounded_full()` to keep them inside the circle.
-//! **That does not work**: GPUI's `overflow_hidden` clips to the element's
-//! *rectangle*, not to its rounded corners, so a child positioned near a corner
-//! stays fully visible and pokes out of the round silhouette — the ball read as
-//! a teardrop instead of a circle.
+//! ## 1. The ball and the clip are laid out from the *same* rectangle
 //!
-//! So the ball is now a **stack of concentric circles that are all exactly the
-//! same size and position**: base gradient, sheen, specular dot. They are
-//! siblings of the halo rings at root level, each centered on the same rect.
-//! Because they share one bounding circle they cannot alter the silhouette, and
-//! no `overflow_hidden` is needed at all. The one element that is *smaller* than
-//! the ball (the specular dot) is kept inside the inscribed circle by
-//! [`SPECULAR`], and a unit test pins that invariant.
+//! Everything is derived from the window's real **client rect**
+//! ([`crate::platform::client_size_logical`]) — the same rectangle
+//! `SetWindowRgn` clips in — converted to logical px with the window's own
+//! scale factor. Both the ball's offset and the region are then centred on that
+//! one rectangle, so they are concentric *by construction*, at any DPI.
 //!
-//! # Geometry: everything is measured against the *real* window
+//! Using GPUI's `viewport_size()` instead was the bug behind "I can only see
+//! part of the circle": the viewport is the size GPUI *believes* the window
+//! has, which can disagree with the real client area. A ball centred on the
+//! viewport inside a clip centred on the client rect ends up off-centre, and
+//! the clip then severs one rim — leaving a hard, aliased, one-sided cut and no
+//! glow on that side, which is exactly what a pixel dump of the broken build
+//! showed.
 //!
-//! [`WINDOW_SIZE`] is only the **nominal design size** passed to
-//! `open_window`. The popup's real logical size is `physical / scale_factor`,
-//! so on a scaled display (or after the OS rounds the requested size) it can
-//! differ from the nominal constant. Positioning the ball with the constant
-//! while clipping to a circle derived from the real window put the ball
-//! *off-centre* relative to the concentric clip — and the clip then shaved the
-//! ball's right/bottom rim, which is exactly the "I can only see part of the
-//! circle" symptom.
+//! ## 2. Every layer is its own circle — nothing sits *inside* the ball
 //!
-//! So every dimension is derived from `Window::viewport_size()` at render time:
+//! The ball is a stack of concentric circles sharing one bounding box (base
+//! gradient, sheen, specular dot), and so are the halo rings; all are siblings
+//! centred on the same rect. Their union is one circle, so the silhouette
+//! cannot deform.
 //!
-//! * [`sphere_diameter_for`] — the **solid ball**, `MIN_SPHERE` px at zero
-//!   usage growing to `MAX_SPHERE` px, hard-capped to
-//!   [`MAX_BALL_FRACTION`] of the real window.
-//! * [`clip_diameter_for`] — the **window region**, derived *from* the ball so
-//!   it always encloses it (glow + [`CLIP_PAD`] of slack), then clamped inside
-//!   the real window. Two properties matter:
-//!   - a clip that merely *equals* the ball would shave its anti-aliased rim;
-//!   - a region *larger* than the window makes `SetWindowRgn` degenerate into
-//!     "no clip at all", and the square frame shows through.
+//! Nesting shading *inside* the ball and relying on `overflow_hidden()` does
+//! not work: GPUI clips it to the element's **rectangle**, not its rounded
+//! corners, so a child near a corner stays fully visible and pokes out — the
+//! ball read as a teardrop. `overflow_hidden` is not used here at all.
 //!
-//! Ball and clip are then centred on the same rect — per axis, so a non-square
-//! viewport cannot shift them apart — which makes it geometrically impossible
-//! for the clip to cut the ball, at any DPI and any window size.
+//! ## 3. The clip always keeps real empty space beyond the glow
+//!
+//! [`max_sphere_for_window`] caps the ball so that
+//! `glow + 2 * CLIP_PAD <= win - CLIP_MARGIN` holds for *every* window size,
+//! which makes the region's hard, non-anti-aliased edge always land on fully
+//! transparent pixels. A region that touched a drawn edge would jag it, and a
+//! region *larger* than the window makes `SetWindowRgn` degenerate into "no
+//! clip at all".
+//!
+//! The halo itself is a smooth ladder of many faint rings rather than a few
+//! strong ones: each ring adds only [`HALO_RING_ALPHA`] (~1% alpha), so the
+//! steps between rings are below the eye's threshold and the glow reads as a
+//! continuous radial falloff instead of a set of visible concentric bands.
+//!
+//! # The overlay text always fits
+//!
+//! The number grows with usage — from `0` to `999,999,999` and beyond — and a
+//! number wider than the ball would break the circular read just as badly as a
+//! clipped rim. So the font size is **fitted to the ball**: the string is shaped
+//! with the window's own text system ([`fit_font_size`]) and scaled down until
+//! it fits the ball's **inscribed square** ([`text_budget_side`]), which is
+//! inside the circle by definition. A conservative per-glyph estimate is used
+//! whenever shaping is unavailable, so the size is always safe.
 
 use gpui::{
-    div, px, Context, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, WindowControlArea,
+    div, px, Context, Font, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, Styled, TextRun, Window, WindowControlArea,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::format::{format_cost_usd, format_int_grouped};
-use crate::platform::set_window_circle_region;
+use crate::platform::{client_size_logical, set_window_circle_region};
 
 /// Nominal edge length of the square transparent window that hosts the ball.
-/// Must stay in sync with `FLOAT_WIN` in `app::app`. Only used as the *design*
-/// reference and to seed the first frame's clip — placement always follows the
-/// window's real size.
+/// Must stay in sync with `FLOAT_WIN` in `app::app`. Only the *design*
+/// reference and the fallback when the client rect is not available yet —
+/// placement always follows the measured client rect.
 const WINDOW_SIZE: f32 = 360.0;
 /// **Solid-ball** diameter at zero usage (px). Deliberately an explicit
 /// minimum: the ball stays a large, legible circle at zero usage instead of
-/// shrinking until the glow and the overlay text dominate its silhouette.
+/// shrinking until the halo and the overlay text dominate its silhouette.
 const MIN_SPHERE: f32 = 144.0;
 /// **Solid-ball** diameter at / above the reference usage (px).
 const MAX_SPHERE: f32 = 232.0;
-/// Hard ceiling on the ball, as a fraction of the window's smaller side. Leaves
-/// room for the glow *and* the clip inside the window even if the window came
-/// out smaller than requested.
+/// Ceiling on the ball as a fraction of the window's smaller side.
 const MAX_BALL_FRACTION: f32 = 0.70;
 /// Usage (tokens) at which the ball reaches its maximum diameter.
 const REF_TOKENS: f64 = 200_000_000.0;
 /// Hover pop scale — the ball lifts / grows a touch when the mouse is over it.
 const HOVER_SCALE: f32 = 1.06;
-/// Slack (px) kept between the clip circle and the window edge, so integer
-/// rounding when the region is built in device pixels can never push the
-/// region past the window.
+/// Slack (px) between the clip circle and the window edge, so rounding when the
+/// region is built in device pixels can never push it past the window.
 const CLIP_MARGIN: f32 = 4.0;
-/// Clear gap (px) the clip keeps around every *drawn* edge: ≥ this much of the
-/// region is guaranteed empty beyond the glow. `SetWindowRgn` cuts with a hard,
-/// non-anti-aliased edge, so if the region boundary landed on a drawn edge that
-/// edge would look jagged instead of round.
-const CLIP_PAD: f32 = 14.0;
+/// Clear gap (px) the clip keeps around the outermost drawn pixel. The region is
+/// cut with a hard, non-anti-aliased edge, so this much of it must be empty —
+/// otherwise the cut jags whatever it lands on.
+const CLIP_PAD: f32 = 12.0;
+/// Number of rings stacked to fake a radial glow. Many rings × a tiny per-ring
+/// alpha ⇒ the steps between rings are ~1% alpha each, i.e. invisible, so the
+/// glow has no visible banding. (This revision of GPUI has no `box_shadow` and
+/// no radial gradient, and only two-stop linear gradients.)
+const HALO_RINGS: usize = 18;
+/// Diameter of the innermost halo ring, as a multiple of the ball.
+const HALO_INNER_SCALE: f32 = 1.0;
+/// Diameter of the outermost halo ring, as a multiple of the ball.
+const HALO_OUTER_SCALE: f32 = 1.22;
+/// Alpha of each individual halo ring. The rings composite, so the glow's
+/// strength at the rim is `1 - (1 - alpha) ^ (HALO_RINGS - 1)` ≈ 0.17.
+const HALO_RING_ALPHA: f32 = 0.011;
 /// Fraction of the window the *seeded* (first-frame) clip uses. Large on
 /// purpose: a first frame that is too generous merely looks like a bigger
 /// click-through circle for one frame, while a first frame that is too tight
-/// would visibly shave the ball. A pure fraction, so it is correct whatever the
-/// window's real size turns out to be.
+/// would visibly shave the ball.
 const SEED_CLIP_FRACTION: f32 = 0.98;
-/// Below this, the measured viewport is not believable (it can read as 0 before
-/// the first layout) and we fall back to the nominal design size rather than
-/// drawing a sub-pixel ball into a degenerate region.
+/// Below this, a measured size is not believable (the client rect can read 0
+/// before the first layout) and we fall back to the nominal design size rather
+/// than drawing a sub-pixel ball into a degenerate region.
 const MIN_SANE_WINDOW: f32 = 32.0;
-
-/// Glow rings behind the ball, as `(diameter×sphere, opacity)`. Every ring is
-/// strictly larger than the ball (`> 1.0`), so the ball's own edge stays crisp
-/// and the glow only ever adds around it. Outer rings are larger and fainter,
-/// inner rings tighter and stronger, so the stack reads as a soft radial glow.
-/// Kept tight (≤1.20×) so the solid ball stays the dominant element instead of
-/// dissolving into a wide washed-out disc. Static — no breathing / pulsing.
-const HALO_LAYERS: [(f32, f32); 4] = [(1.20, 0.05), (1.14, 0.08), (1.08, 0.12), (1.03, 0.18)];
 
 /// Top sheen: a white wash anchored at the top edge fading to nothing, drawn as
 /// a circle *the same diameter as the ball* so it cannot change the silhouette.
@@ -124,10 +131,26 @@ const SHEEN_ALPHA: f32 = 0.20;
 /// Specular dot as `(center_x, center_y, radius)`, all fractions of the ball
 /// diameter (0..1). Small and near-opaque: at this size it reads as a glint
 /// rather than a disc. Kept strictly inside the ball's inscribed circle by
-/// [`dot_is_inside_disc`], which [`tests`] verify.
+/// [`dot_is_inside_disc`].
 const SPECULAR: (f32, f32, f32) = (0.36, 0.30, 0.075);
 /// Specular opacity.
 const SPECULAR_ALPHA: f32 = 0.55;
+
+/// Fraction of the ball's inscribed square the overlay text may use. The
+/// inscribed square is inside the circle by definition, so anything that fits it
+/// cannot break the circular silhouette.
+const TEXT_BOX_FRACTION: f32 = 0.92;
+/// Ceiling on the number's font size, as a fraction of the ball diameter.
+const NUM_CAP_RATIO: f32 = 0.26;
+/// Ceiling on the cost line's font size, as a fraction of the ball diameter.
+const COST_CAP_RATIO: f32 = 0.13;
+/// Font size used to *probe* a string's width before scaling it to fit. Any
+/// value works (width is proportional to size); 20px keeps rounding small.
+const FIT_PROBE_PX: f32 = 20.0;
+/// Conservative advance of one glyph, as a fraction of the font size, used when
+/// the text system cannot be asked. Upper bounds for a semibold sans face.
+const EM_DIGIT: f32 = 0.64;
+const EM_OTHER: f32 = 0.36;
 
 /// Solid-ball diameter (px) for a given usage, hover pop included.
 ///
@@ -144,37 +167,42 @@ fn sphere_diameter_for(total_tokens: u64, hovered: bool) -> f32 {
     base * if hovered { HOVER_SCALE } else { 1.0 }
 }
 
-/// Diameter (px) of the outermost glow ring for a ball of `sphere_d` px.
+/// Diameter (px) of the outermost halo ring for a ball of `sphere_d` px.
 fn glow_outer_diameter(sphere_d: f32) -> f32 {
-    sphere_d * HALO_LAYERS[0].0
+    sphere_d * HALO_OUTER_SCALE
+}
+
+/// Diameter (px) of halo ring `i` (`0` = innermost) for a ball of `sphere_d` px.
+fn halo_ring_diameter(sphere_d: f32, i: usize) -> f32 {
+    let t = if HALO_RINGS <= 1 {
+        0.0
+    } else {
+        i as f32 / (HALO_RINGS - 1) as f32
+    };
+    sphere_d * (HALO_INNER_SCALE + (HALO_OUTER_SCALE - HALO_INNER_SCALE) * t)
+}
+
+/// Largest ball (px) that still leaves the clip room to clear the glow inside a
+/// window whose smaller side is `win` px.
+///
+/// This is what makes "the clip keeps empty space beyond every drawn pixel" hold
+/// for *any* window size instead of only the nominal one: capping the ball is
+/// the only lever that keeps `glow + 2 * CLIP_PAD <= win - CLIP_MARGIN` true when
+/// the window comes out smaller than requested.
+fn max_sphere_for_window(win: f32) -> f32 {
+    ((win - CLIP_MARGIN - 2.0 * CLIP_PAD) / HALO_OUTER_SCALE).max(0.0)
 }
 
 /// Clip-circle diameter (px) for a ball of `sphere_d` px inside a window whose
-/// smaller side is `window` px.
+/// smaller side is `win` px.
 ///
-/// Derived *from* the ball so it can never cut it: it covers the outermost glow
+/// Derived *from* the ball so it can never cut it: it covers the outermost halo
 /// ring and keeps [`CLIP_PAD`] of genuinely empty space around *every* drawn
-/// edge, so the region's hard (non-anti-aliased) cut always lands on fully
-/// transparent pixels and can never jag the ball or the glow. It is then
-/// clamped inside the window (a region larger than the window makes
-/// `SetWindowRgn` degenerate into "no clip", which shows the square frame),
-/// with the ball itself as the final floor — a ball that is visible-but-tight
-/// beats a clip that severs it.
-fn clip_diameter_for(sphere_d: f32, window: f32) -> f32 {
-    let want = glow_outer_diameter(sphere_d).max(sphere_d) + 2.0 * CLIP_PAD;
-    want.min(window - CLIP_MARGIN).max(sphere_d)
-}
-
-/// Cap (px) on the halo-ring diameters, for a ball of `sphere_d` px under a
-/// clip of `clip_d` px.
-///
-/// Rings are shrunk to leave [`CLIP_PAD`] between the outermost ring and the
-/// region boundary, so the region's hard edge never slices a visible ring into
-/// a jagged arc. Never shrunk below the ball itself (a ring inside the ball
-/// would be pointless, and if the window is pathologically small a ring flush
-/// with the ball is still invisible under it).
-fn ring_diameter_cap(sphere_d: f32, clip_d: f32) -> f32 {
-    (clip_d - 2.0 * CLIP_PAD).max(sphere_d)
+/// edge, so the region's hard (non-anti-aliased) cut lands on fully transparent
+/// pixels. It is clamped inside the window because a region larger than the
+/// window makes `SetWindowRgn` degenerate into "no clip".
+fn clip_diameter_for(sphere_d: f32, win: f32) -> f32 {
+    (glow_outer_diameter(sphere_d) + 2.0 * CLIP_PAD).min(win - CLIP_MARGIN)
 }
 
 /// Whether a dot of radius `r` centred at `(cx, cy)` (all fractions of the ball
@@ -194,7 +222,7 @@ fn dot_is_inside_disc(cx: f32, cy: f32, r: f32) -> bool {
 /// edited to a fraction that pokes past the rim, the centre is pulled back along
 /// its own offset vector until the dot fits inside the inscribed circle — so a
 /// bad constant degrades into a dot in a different spot, never into a teardrop
-/// ball. [`tests::specular_geometry_never_escapes_the_ball`] pins this.
+/// ball.
 fn specular_geometry(sphere_d: f32) -> (f32, f32, f32) {
     let (cx, cy, r) = SPECULAR;
     let (mut dx, mut dy) = (cx - 0.5, cy - 0.5);
@@ -215,26 +243,168 @@ fn specular_geometry(sphere_d: f32) -> (f32, f32, f32) {
     )
 }
 
-/// The `(left, top, diameter)` box shared by the ball and every full-size
-/// shading layer.
+/// The `(left, top, diameter)` box shared by the ball, every full-size shading
+/// layer and every halo ring.
 ///
-/// All of them must use *this* box: identical geometry is what makes their
-/// union a single circle instead of a composite blob. Centred per axis, so a
-/// viewport that is not exactly square still keeps every layer concentric.
+/// All of them must use *this* box: identical geometry is what makes their union
+/// a single circle instead of a composite blob. Centred per axis, so a client
+/// area that is not exactly square still keeps every layer concentric.
 fn ball_box(win_w: f32, win_h: f32, sphere_d: f32) -> (f32, f32, f32) {
     ((win_w - sphere_d) / 2.0, (win_h - sphere_d) / 2.0, sphere_d)
 }
 
+/// Width (px) the overlay text may occupy inside a ball of `sphere_d` px: the
+/// ball's **inscribed square**, minus [`TEXT_BOX_FRACTION`]'s worth of slack.
+///
+/// Using the inscribed square (rather than the diameter) is what makes the text
+/// safe at *any* string length: a box inscribed in the circle stays inside it,
+/// so text that fits the box cannot touch the rim and break the circular
+/// silhouette.
+fn text_budget_side(sphere_d: f32) -> f32 {
+    sphere_d / std::f32::consts::SQRT_2 * TEXT_BOX_FRACTION
+}
+
+/// Conservative width estimate for `text` in font-size units (em), used when the
+/// text system cannot be asked for a real measurement.
+fn estimated_em(text: &str) -> f32 {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_digit() {
+                EM_DIGIT
+            } else {
+                EM_OTHER
+            }
+        })
+        .sum()
+}
+
+/// Width (px) of `text` at `size` px and `weight`, as measured by the window's
+/// own text system. Returns 0 if it could not be measured.
+fn measure_text(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32 {
+    if text.is_empty() || !(size > 0.0) {
+        return 0.0;
+    }
+    let style = window.text_style();
+    let run = TextRun {
+        len: text.len(),
+        font: Font {
+            family: style.font_family.clone(),
+            weight,
+            ..Default::default()
+        },
+        color: WHITE,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let width = window
+        .text_system()
+        .shape_line(text.to_string().into(), px(size), &[run], None)
+        .width()
+        .as_f32();
+    if width.is_finite() && width > 0.0 {
+        width
+    } else {
+        0.0
+    }
+}
+
+/// Width (px) of `text` at `size` px, from the text system when it can be asked
+/// and from the conservative [`estimated_em`] otherwise.
+fn width_at(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32 {
+    let measured = measure_text(window, text, size, weight);
+    if measured > 0.0 {
+        measured
+    } else {
+        estimated_em(text) * size
+    }
+}
+
+/// Largest font size whose width fits, from a single probe measurement.
+///
+/// `probe_w` is the string's width at `probe` px. Width is proportional to size,
+/// so `probe * max_w / probe_w` is exactly the size at which the string is
+/// `max_w` wide. Pure arithmetic, so the "never overflows" property can be tested
+/// without a window.
+fn fit_size_from_probe(probe_w: f32, probe: f32, max_w: f32, cap: f32) -> f32 {
+    if !(probe_w > 0.0) || !(max_w > 0.0) || !(cap > 0.0) {
+        return 0.0;
+    }
+    (probe * max_w / probe_w).min(cap)
+}
+
+/// Largest font size (px) at which `text` fits `max_w`, never above `cap`.
+///
+/// Fitting wins over legibility: a size that overflows would let the number
+/// touch the rim and break the circular silhouette, so there is deliberately no
+/// minimum size — if a window were ever too small for the count to be readable,
+/// the count shrinks rather than the circle breaking.
+///
+/// A second measurement corrects for shaping not being perfectly linear across
+/// sizes (hinting, rounding), so the returned size never overflows the budget.
+fn fit_font_size(window: &Window, text: &str, max_w: f32, cap: f32, weight: FontWeight) -> f32 {
+    if text.is_empty() || !(max_w > 0.0) || !(cap > 0.0) {
+        return 0.0;
+    }
+    let probe = FIT_PROBE_PX.min(cap);
+    let probe_w = width_at(window, text, probe, weight);
+    let mut size = fit_size_from_probe(probe_w, probe, max_w, cap);
+    if !(size > 0.0) {
+        return 0.0;
+    }
+    let actual = width_at(window, text, size, weight);
+    if actual > max_w {
+        size = (size * max_w / actual).min(size).max(1.0);
+    }
+    size
+}
+
+/// Cached result of [`fit_font_size`] for one string + budget, so the text is
+/// shaped once per geometry change rather than on every render.
+#[derive(Debug, Clone, PartialEq)]
+struct TextFit {
+    text: String,
+    max_w: i32,
+    cap: i32,
+    size: f32,
+}
+
+impl TextFit {
+    fn new(text: &str, max_w: f32, cap: f32, size: f32) -> Self {
+        Self {
+            text: text.to_string(),
+            max_w: quantize(max_w),
+            cap: quantize(cap),
+            size,
+        }
+    }
+
+    fn matches(&self, text: &str, max_w: f32, cap: f32) -> bool {
+        self.text == text && self.max_w == quantize(max_w) && self.cap == quantize(cap)
+    }
+}
+
+/// Quantize a px value to 1/100 px so tiny float noise does not invalidate the
+/// fit cache.
+fn quantize(v: f32) -> i32 {
+    (v * 100.0).round() as i32
+}
+
 /// Seed the window's circular clip from Win32, before the first `render` runs.
 ///
-/// `render` re-applies the region every frame that actually changes, but the
-/// very first frame can see an uninitialised client rect (and the region would
-/// then be skipped), leaving the popup square until the next `notify`. Seeding
-/// it here makes the window round from the first paint. The seeded circle is
-/// deliberately generous ([`SEED_CLIP_FRACTION`]) so it can never clip the ball
-/// on the frame before the real geometry is known.
+/// `render` re-applies the region, but the very first frame can see an
+/// uninitialised client rect (and the region would then be skipped), leaving the
+/// popup square until the next `notify`. Seeding it here makes the window round
+/// from the first paint. The seeded circle is deliberately generous
+/// ([`SEED_CLIP_FRACTION`]) so it can never clip the ball on the frame before the
+/// real geometry is known.
 pub fn seed_window_region(hwnd: isize) {
     set_window_circle_region(hwnd, WINDOW_SIZE * SEED_CLIP_FRACTION, WINDOW_SIZE);
+}
+
+/// Whether a region of `next` differs from `prev` enough to be worth re-cutting.
+fn region_moved(prev: (f32, f32), next: (f32, f32)) -> bool {
+    (prev.0 - next.0).abs() > 0.5 || (prev.1 - next.1).abs() > 0.5
 }
 
 pub struct FloatingView {
@@ -244,9 +414,12 @@ pub struct FloatingView {
     hovered: bool,
     /// Last `(clip_diameter, window_size)` handed to `SetWindowRgn`. Re-applying
     /// an identical region forces the OS to recompute and repaint the whole
-    /// window for nothing — and a needless re-cut of the rim can flicker — so
-    /// the region is only pushed when the geometry actually moved.
+    /// window for nothing — and a needless re-cut of the rim can flicker — so the
+    /// region is only pushed when the geometry actually moved.
     last_region: (f32, f32),
+    /// Cached fit of the token count / cost strings.
+    num_fit: Option<TextFit>,
+    cost_fit: Option<TextFit>,
 }
 
 impl FloatingView {
@@ -257,10 +430,12 @@ impl FloatingView {
             cost_micros: 0,
             hovered: false,
             last_region: (0.0, 0.0),
+            num_fit: None,
+            cost_fit: None,
         }
     }
 
-    /// Current solid-ball diameter (px) before the window cap is applied.
+    /// Current solid-ball diameter (px) before the window caps are applied.
     fn sphere_diameter(&self) -> f32 {
         sphere_diameter_for(self.total_tokens, self.hovered)
     }
@@ -270,11 +445,26 @@ impl FloatingView {
         self.total_tokens = total_tokens;
         self.cost_micros = cost_micros;
     }
-}
 
-/// Whether a region of `next` differs from `prev` enough to be worth re-cutting.
-fn region_moved(prev: (f32, f32), next: (f32, f32)) -> bool {
-    (prev.0 - next.0).abs() > 0.5 || (prev.1 - next.1).abs() > 0.5
+    /// Font size (px) that keeps `text` inside the ball, cached per string and
+    /// budget.
+    fn fitted_size(
+        cache: &mut Option<TextFit>,
+        window: &Window,
+        text: &str,
+        max_w: f32,
+        cap: f32,
+        weight: FontWeight,
+    ) -> f32 {
+        if let Some(hit) = cache.as_ref() {
+            if hit.matches(text, max_w, cap) {
+                return hit.size;
+            }
+        }
+        let size = fit_font_size(window, text, max_w, cap, weight);
+        *cache = Some(TextFit::new(text, max_w, cap, size));
+        size
+    }
 }
 
 impl Render for FloatingView {
@@ -293,42 +483,49 @@ impl Render for FloatingView {
             ..accent
         };
 
-        // The *real* logical size of the content area. Never trust the nominal
-        // `WINDOW_SIZE`: the popup's logical size is `physical / scale_factor`,
-        // so on a scaled display it differs from what we asked for — and a ball
-        // placed with the nominal constant ends up off-centre under a clip that
-        // *is* centred, which severs its rim.
-        let viewport = window.viewport_size();
-        let (win_w, win_h, win) = {
-            let w = viewport.width.as_f32();
-            let h = viewport.height.as_f32();
-            if w.min(h) >= MIN_SANE_WINDOW {
-                (w, h, w.min(h))
-            } else {
-                // Not laid out yet — design against the nominal size for this
-                // frame; the next render measures the real one.
-                (WINDOW_SIZE, WINDOW_SIZE, WINDOW_SIZE)
+        // The **client rect** is the one rectangle both this code and
+        // `SetWindowRgn` can agree on, so every dimension below comes from it.
+        // `viewport_size()` is only a fallback for the frames before the client
+        // rect exists: it is GPUI's belief about the window, which can differ
+        // from the real client area — and laying the ball out on one rectangle
+        // while clipping it on another is what severs a rim.
+        let scale = window.scale_factor();
+        let (win_w, win_h) = match client_size_logical(hwnd, scale) {
+            Some((w, h)) if w.min(h) >= MIN_SANE_WINDOW => (w, h),
+            _ => {
+                let v = window.viewport_size();
+                let (w, h) = (v.width.as_f32(), v.height.as_f32());
+                if w.min(h) >= MIN_SANE_WINDOW {
+                    (w, h)
+                } else {
+                    (WINDOW_SIZE, WINDOW_SIZE)
+                }
             }
         };
+        let win = win_w.min(win_h);
 
-        let sphere_d = self.sphere_diameter().min(win * MAX_BALL_FRACTION);
+        // Cap the ball three ways: usage ramp, the window, and — the one that
+        // makes the clip's guaranteed padding true at every window size — what
+        // still leaves room for the glow plus the pad.
+        let sphere_d = self
+            .sphere_diameter()
+            .min(win * MAX_BALL_FRACTION)
+            .min(max_sphere_for_window(win));
         let clip_d = clip_diameter_for(sphere_d, win);
-        let ring_cap = ring_diameter_cap(sphere_d, clip_d);
 
-        // Centre on each axis independently, so a viewport that is not exactly
-        // square still keeps every layer concentric.
+        // Centre on each axis independently, so a client area that is not
+        // exactly square still keeps every layer concentric.
         let (ball_x, ball_y, _) = ball_box(win_w, win_h, sphere_d);
         let ball_x = px(ball_x);
         let ball_y = px(ball_y);
 
-        // Clip the whole window to a circle concentric with the ball: kills the
-        // square frame / shadow and lets desktop clicks pass through outside the
-        // ball. `clip_d` encloses every drawn element with `CLIP_PAD` of empty
-        // space to spare (so its hard, aliased edge never lands on a drawn
-        // edge) and never exceeds the window (so `SetWindowRgn` cannot
-        // degenerate). The reference passed alongside it is the measured window
-        // size, so the region comes out as exactly this circle in the window's
-        // own pixels.
+        // Clip the window to a circle concentric with the ball: kills the square
+        // frame / shadow and lets desktop clicks pass through outside the ball.
+        // `clip_d` encloses the glow with `CLIP_PAD` of empty space to spare (so
+        // its hard, aliased edge never lands on a drawn pixel) and never exceeds
+        // the window (so `SetWindowRgn` cannot degenerate). The reference size is
+        // the measured client size, so the region comes out as exactly this
+        // circle in the window's own pixels.
         let region = (clip_d, win);
         if region_moved(self.last_region, region) {
             set_window_circle_region(hwnd, clip_d, win);
@@ -337,10 +534,26 @@ impl Render for FloatingView {
 
         let tokens = format_int_grouped(self.total_tokens);
         let cost = format_cost_usd(self.cost_micros);
-        // Keep the longest realistic count ("12,977,833" = 10 glyphs) inside the
-        // ball rather than letting it run to the rim.
-        let fs = px((sphere_d * 0.145).clamp(12.0, 30.0));
-        let cost_fs = px((sphere_d * 0.082).clamp(9.0, 18.0));
+        // Fit both strings to the ball's inscribed square, so an ever-growing
+        // count (0 → 999,999,999 and past it) can never run into the rim and
+        // stop the whole thing reading as a circle.
+        let budget = text_budget_side(sphere_d);
+        let fs = Self::fitted_size(
+            &mut self.num_fit,
+            window,
+            &tokens,
+            budget,
+            sphere_d * NUM_CAP_RATIO,
+            FontWeight::SEMIBOLD,
+        );
+        let cost_fs = Self::fitted_size(
+            &mut self.cost_fit,
+            window,
+            &cost,
+            budget,
+            sphere_d * COST_CAP_RATIO,
+            FontWeight::NORMAL,
+        );
 
         let mut root = div()
             .id("floating-root")
@@ -367,12 +580,12 @@ impl Render for FloatingView {
                 });
             });
 
-        // --- 1. Soft, layered accent halo (static glow), painted first so the
-        // ball sits on top. Every ring is larger than the ball and capped to
-        // `ring_cap`, so a ring never covers the ball's rim and never reaches
-        // the region's hard edge.
-        for (i, &(scale, op)) in HALO_LAYERS.iter().enumerate() {
-            let d = (sphere_d * scale).min(ring_cap);
+        // --- 1. Halo (static glow), painted first so the ball sits on top.
+        // Outermost ring first: each smaller ring composites on top of the
+        // larger ones, so alpha accumulates smoothly inward instead of forming
+        // discrete bands. Every ring is centred on the same box as the ball.
+        for i in (0..HALO_RINGS).rev() {
+            let d = halo_ring_diameter(sphere_d, i);
             root = root.child(
                 div()
                     .id(("glow", i))
@@ -383,15 +596,15 @@ impl Render for FloatingView {
                     .h(px(d))
                     .rounded_full()
                     .bg(accent)
-                    .opacity(op),
+                    .opacity(HALO_RING_ALPHA),
             );
         }
 
         // --- 2. The sphere: base shading + sheen + specular. All three are
-        // circles occupying the *same* box, so their union is exactly one
-        // circle and the silhouette can never become a teardrop. No
-        // `overflow_hidden` anywhere: it clips rectangles, not rounded corners,
-        // so it would not have contained anything anyway.
+        // circles occupying the *same* box, so their union is exactly one circle
+        // and the silhouette can never become a teardrop. No `overflow_hidden`
+        // anywhere: it clips rectangles, not rounded corners, so it would not
+        // have contained anything anyway.
         let ball_box = || div().absolute().top(ball_y).left(ball_x);
         root = root
             .child(
@@ -446,14 +659,14 @@ impl Render for FloatingView {
                 .child(
                     div()
                         .text_color(WHITE)
-                        .text_size(fs)
+                        .text_size(px(fs))
                         .font_semibold()
                         .child(tokens),
                 )
                 .child(
                     div()
                         .text_color(WHITE.opacity(0.82))
-                        .text_size(cost_fs)
+                        .text_size(px(cost_fs))
                         .child(cost),
                 ),
         )
@@ -481,17 +694,31 @@ const WHITE: Hsla = Hsla {
 mod tests {
     use super::*;
 
-    /// The zero-usage ball must be the full minimum sphere — not a fraction of
-    /// a glow-inclusive constant, which is what made it stop looking round.
+    /// Windows the popup might really come out as — including ones much smaller
+    /// than the nominal design size, where the caps have to do the work.
+    const WINDOWS: [f32; 7] = [120.0, 150.0, 200.0, 240.0, 300.0, WINDOW_SIZE, 480.0];
+    /// Usage levels spanning the whole documented range: nothing, sub-thousand,
+    /// 7, 8 and 9 digits, and past the saturation point.
+    const USAGES: [u64; 8] = [
+        0,
+        1,
+        999,
+        1_000_000,
+        16_777_343,
+        100_000_000,
+        999_999_999,
+        u64::MAX / 2,
+    ];
+
+    /// The zero-usage ball must be the full minimum sphere — not a fraction of a
+    /// glow-inclusive constant, which is what made it stop looking round.
     #[test]
     fn zero_usage_ball_is_the_minimum_diameter() {
         assert_eq!(sphere_diameter_for(0, false), MIN_SPHERE);
-        assert!(MIN_SPHERE > 0.0);
     }
 
-    /// The ball has to be big enough to actually read as a circle — the whole
-    /// point of the size bump. Guards against a future tweak quietly shrinking
-    /// it back to a dot.
+    /// The ball has to be big enough to actually read as a circle at any usage
+    /// the nominal window can host.
     #[test]
     fn ball_is_large_at_every_usage() {
         assert!(
@@ -499,21 +726,29 @@ mod tests {
             "the resting ball must stay comfortably large (got {MIN_SPHERE})"
         );
         assert!(MAX_SPHERE > MIN_SPHERE);
+        for tokens in USAGES {
+            for hovered in [false, true] {
+                let d = sphere_diameter_for(tokens, hovered)
+                    .min(WINDOW_SIZE * MAX_BALL_FRACTION)
+                    .min(max_sphere_for_window(WINDOW_SIZE));
+                assert!(d >= MIN_SPHERE, "ball shrank to {d} at {tokens} tokens");
+            }
+        }
     }
 
-    /// Hover only ever grows the ball, and never past the window.
+    /// Hover only ever grows the ball.
     #[test]
     fn hover_grows_the_ball() {
-        for tokens in [0u64, 1_000_000, 100_000_000, 5_000_000_000] {
+        for tokens in USAGES {
             let rest = sphere_diameter_for(tokens, false);
             let popped = sphere_diameter_for(tokens, true);
             assert!(popped > rest, "hover must grow the ball at {tokens} tokens");
         }
     }
 
-    /// **The regression that made the ball a teardrop.** The specular dot is
-    /// the only drawn element that does not share the ball's bounding box, so it
-    /// is the only one that can be placed outside the silhouette by a careless
+    /// **The regression that made the ball a teardrop.** The specular dot is the
+    /// only drawn element that does not share the ball's bounding box, so it is
+    /// the only one that can be placed outside the silhouette by a careless
     /// fraction. Pin it to the inscribed circle.
     #[test]
     fn specular_dot_stays_inside_the_ball_disc() {
@@ -528,15 +763,9 @@ mod tests {
     }
 
     /// The specular helper must never place the dot outside the ball, for any
-    /// ball size — and the *shipped* constants must already be inside, so the
-    /// correction path (which would move the dot) never triggers in practice.
+    /// ball size.
     #[test]
     fn specular_geometry_never_escapes_the_ball() {
-        let (cx, cy, r) = SPECULAR;
-        assert!(
-            dot_is_inside_disc(cx, cy, r),
-            "shipped SPECULAR ({cx}, {cy}, r={r}) already needs correcting"
-        );
         for sphere in [
             MIN_SPHERE,
             150.0,
@@ -546,38 +775,33 @@ mod tests {
         ] {
             let (left, top, d) = specular_geometry(sphere);
             let r_px = d / 2.0;
-            let cx_px = left + r_px;
-            let cy_px = top + r_px;
-            let ball_c = sphere / 2.0;
-            let dist = ((cx_px - ball_c).powi(2) + (cy_px - ball_c).powi(2)).sqrt();
+            let dist =
+                ((left + r_px - sphere / 2.0).powi(2) + (top + r_px - sphere / 2.0).powi(2)).sqrt();
             assert!(
-                dist + r_px <= ball_c + 0.01,
-                "specular escapes: ball {sphere}, dot r {r_px} at dist {dist} > {}",
-                ball_c
+                dist + r_px <= sphere / 2.0 + 0.01,
+                "specular escapes: ball {sphere}, dot r {r_px} at dist {dist}"
             );
             assert!(left >= 0.0 && top >= 0.0, "dot must stay in the ball's box");
             assert!(left + d <= sphere && top + d <= sphere);
         }
     }
 
-    /// Every shading layer must be exactly the ball's size and position — that
-    /// is what makes the union a circle rather than a composite blob. The ball
-    /// box is the single source of that geometry, so this pins the two
-    /// properties the silhouette depends on: the box fits the window, and a
-    /// non-square viewport keeps it inside on both axes.
+    /// Every shading layer shares the ball's box, so their union is one circle.
+    /// Also pins per-axis centring, so a non-square client area cannot shift a
+    /// layer off the ball.
     #[test]
     fn shading_layers_share_the_ball_box() {
-        for win_h in [150.0f32, 240.0, 288.0, 300.0, WINDOW_SIZE, 480.0] {
-            // Deliberately non-square: the box must be centred per axis.
+        for win_h in WINDOWS {
             for win_w in [win_h, win_h * 1.25] {
                 let win = win_w.min(win_h);
-                for tokens in [0u64, 1_000_000, 200_000_000] {
-                    let sphere = sphere_diameter_for(tokens, false).min(win * MAX_BALL_FRACTION);
+                for tokens in USAGES {
+                    let sphere = sphere_diameter_for(tokens, false)
+                        .min(win * MAX_BALL_FRACTION)
+                        .min(max_sphere_for_window(win));
                     let (left, top, d) = ball_box(win_w, win_h, sphere);
                     assert_eq!(d, sphere, "the shared box must be the ball's size");
                     assert!(left >= 0.0 && top >= 0.0);
                     assert!(left + d <= win_w && top + d <= win_h);
-                    // Concentric on both axes, not just the smaller one.
                     assert!((left - (win_w - sphere) / 2.0).abs() < 0.01);
                     assert!((top - (win_h - sphere) / 2.0).abs() < 0.01);
                 }
@@ -585,134 +809,177 @@ mod tests {
         }
     }
 
-    /// The whole point of the fix: the clip must enclose the ball *with room to
-    /// spare* — a clip that merely equals the ball would shave its rim.
+    /// **The whole point of the fix.** For every usage × every window, the clip
+    /// must enclose the ball *and* the glow with [`CLIP_PAD`] of empty space to
+    /// spare, and still fit inside the window. A clip that merely equals the ball
+    /// shaves its anti-aliased rim; a clip that lands on the glow slices it into
+    /// a jagged arc; a clip larger than the window stops clipping at all.
     #[test]
-    fn clip_always_encloses_the_ball_with_margin() {
-        let usages = [
-            0u64,
-            1,
-            10_000,
-            1_000_000,
-            100_000_000,
-            200_000_000,
-            u64::MAX / 2,
-        ];
-        // Windows the popup might actually come out as, including ones much
-        // smaller than the nominal design size.
-        for win in [150.0f32, 240.0, 300.0, WINDOW_SIZE, 480.0] {
-            for tokens in usages {
+    fn clip_encloses_ball_and_glow_with_pad_at_every_size() {
+        for win in WINDOWS {
+            for tokens in USAGES {
                 for hovered in [false, true] {
-                    let sphere = sphere_diameter_for(tokens, hovered).min(win * MAX_BALL_FRACTION);
+                    let sphere = sphere_diameter_for(tokens, hovered)
+                        .min(win * MAX_BALL_FRACTION)
+                        .min(max_sphere_for_window(win));
+                    assert!(sphere > 0.0, "no ball at all (win={win})");
                     let clip = clip_diameter_for(sphere, win);
+                    let glow = glow_outer_diameter(sphere);
                     assert!(
                         clip >= sphere,
-                        "clip {clip} must never be smaller than ball {sphere} (win={win})"
+                        "clip {clip} cuts the ball {sphere} (win={win})"
                     );
                     assert!(
-                        clip <= win,
-                        "clip {clip} must never exceed window {win} (win={win})"
+                        clip <= win - CLIP_MARGIN + 0.01,
+                        "clip {clip} exceeds window {win}"
                     );
-                    if sphere + 2.0 * CLIP_PAD <= win - CLIP_MARGIN {
-                        assert!(
-                            clip >= sphere + 2.0 * CLIP_PAD,
-                            "clip {clip} must keep {CLIP_PAD}px clear of ball {sphere} \
-                             (win={win}, tokens={tokens}, hovered={hovered})"
-                        );
-                    }
                     assert!(
-                        sphere <= MAX_SPHERE * HOVER_SCALE,
-                        "ball {sphere} exceeds the maximum (tokens={tokens})"
-                    );
-                }
-            }
-        }
-    }
-
-    /// **The other half of "not round":** `SetWindowRgn` cuts with a hard,
-    /// non-anti-aliased edge. Wherever that edge lands must be fully
-    /// transparent, so the clip must always keep a real gap beyond the
-    /// outermost thing we draw — the glow. A region that merely touched the
-    /// glow would slice it into a jagged arc, which reads as a polygon, not a
-    /// circle.
-    #[test]
-    fn clip_keeps_clear_space_beyond_the_glow() {
-        for win in [150.0f32, 240.0, 300.0, WINDOW_SIZE, 480.0] {
-            for tokens in [0u64, 1_000_000, 200_000_000, u64::MAX / 2] {
-                for hovered in [false, true] {
-                    let sphere = sphere_diameter_for(tokens, hovered).min(win * MAX_BALL_FRACTION);
-                    let clip = clip_diameter_for(sphere, win);
-                    let ring = (glow_outer_diameter(sphere)).min(ring_diameter_cap(sphere, clip));
-                    assert!(
-                        clip - ring >= 2.0 * CLIP_PAD - 0.01 || ring <= sphere + 0.01,
-                        "clip {clip} leaves only {}px beyond the glow {ring} \
+                        clip + 0.01 >= glow + 2.0 * CLIP_PAD,
+                        "clip {clip} leaves only {}px beyond the glow {glow} \
                          (win={win}, tokens={tokens}, hovered={hovered})",
-                        clip - ring
+                        clip - glow
                     );
                 }
             }
         }
     }
 
-    /// Halo rings only ever add *around* the ball, and never reach the region
-    /// boundary.
+    /// The halo fades outward in many small steps — the property that makes it
+    /// read as a glow rather than as a set of concentric bands — and never
+    /// shrinks inside the ball.
     #[test]
-    fn halo_rings_sit_between_the_ball_and_the_clip() {
-        for win in [150.0f32, 240.0, 300.0, WINDOW_SIZE, 480.0] {
-            let sphere = sphere_diameter_for(200_000_000, false).min(win * MAX_BALL_FRACTION);
-            let clip = clip_diameter_for(sphere, win);
-            let cap = ring_diameter_cap(sphere, clip);
-            for &(scale, op) in HALO_LAYERS.iter() {
-                assert!(scale > 1.0, "ring {scale}x must be larger than the ball");
-                assert!(op > 0.0 && op < 1.0);
-                let d = (sphere * scale).min(cap);
-                assert!(
-                    d >= sphere,
-                    "ring {d} must not shrink inside the ball {sphere}"
-                );
-                assert!(d <= clip, "ring {d} must stay inside the clip {clip}");
+    fn halo_rings_fade_outward_smoothly() {
+        assert!(HALO_RINGS >= 12, "too few rings to hide the banding");
+        assert!(
+            HALO_RING_ALPHA * HALO_RINGS as f32 <= 0.25,
+            "per-ring alpha must stay tiny"
+        );
+        assert!(HALO_INNER_SCALE >= 1.0 && HALO_OUTER_SCALE > HALO_INNER_SCALE);
+        for sphere in [MIN_SPHERE, 180.0, MAX_SPHERE * HOVER_SCALE] {
+            let mut prev = 0.0;
+            for i in 0..HALO_RINGS {
+                let d = halo_ring_diameter(sphere, i);
+                assert!(d >= sphere - 0.01, "ring {i} ({d}) sits inside {sphere}");
+                assert!(d > prev, "ring {i} ({d}) does not grow outward");
+                prev = d;
             }
-            // The cap itself leaves pad room unless the window is too small.
-            assert!(cap <= clip);
+            assert!(
+                (halo_ring_diameter(sphere, HALO_RINGS - 1) - glow_outer_diameter(sphere)).abs()
+                    < 0.01
+            );
+            // Consecutive ring diameters differ by well under a pixel for small
+            // balls — that is the smoothness.
+            let step = (glow_outer_diameter(sphere) - sphere) / (HALO_RINGS - 1) as f32;
+            assert!(step < sphere * 0.03, "ring steps of {step}px are visible");
         }
     }
 
-    /// The ball plus its glow must fit inside the nominal window at every usage
-    /// — otherwise the clip would have to shrink to the ball and the glow would
-    /// be sliced.
+    /// **The text must never break the circle either.** A 9-digit count is wider
+    /// than the ball; the fit has to keep it inside the ball's inscribed square —
+    /// and the estimate path (used when shaping is unavailable) must be just as
+    /// safe, since that is what runs before the text system is ready.
     #[test]
-    fn ball_plus_glow_fits_the_window() {
-        let sphere = sphere_diameter_for(u64::MAX / 2, true).min(WINDOW_SIZE * MAX_BALL_FRACTION);
-        let glow = glow_outer_diameter(sphere);
-        assert!(
-            glow + 2.0 * CLIP_PAD <= WINDOW_SIZE - CLIP_MARGIN,
-            "glow {glow} + pad must fit the {WINDOW_SIZE} px window"
-        );
+    fn nine_digit_count_fits_the_text_budget() {
+        let text = "999,999,999";
+        assert_eq!(text.chars().filter(char::is_ascii_digit).count(), 9);
+        for win in WINDOWS {
+            for tokens in USAGES {
+                let sphere = sphere_diameter_for(tokens, false)
+                    .min(win * MAX_BALL_FRACTION)
+                    .min(max_sphere_for_window(win));
+                let budget = text_budget_side(sphere);
+                let cap = sphere * NUM_CAP_RATIO;
+                let probe = FIT_PROBE_PX.min(cap);
+                // The estimate path: the probe width is the conservative bound,
+                // so this is exactly what `fit_font_size` computes when the text
+                // system gives nothing back.
+                let probe_w = estimated_em(text) * probe;
+                let size = fit_size_from_probe(probe_w, probe, budget, cap);
+                let drawn_w = estimated_em(text) * size;
+                assert!(
+                    drawn_w <= budget + 0.01,
+                    "{text} would be {drawn_w}px wide in a {sphere}px ball \
+                     (budget {budget}, size {size}, win={win})"
+                );
+                // ...and the budget is inside the circle: it is the inscribed
+                // square, scaled down by TEXT_BOX_FRACTION.
+                assert!(budget * std::f32::consts::SQRT_2 <= sphere + 0.01);
+            }
+        }
     }
 
-    /// Even on the smallest plausible window the ball stays large, and the cap
-    /// only ever shrinks it (never grows it past `MAX_SPHERE`).
+    /// The estimate must be an upper bound for the strings we actually format,
+    /// otherwise the fallback path could overflow.
+    #[test]
+    fn glyph_estimate_is_conservative() {
+        assert!(EM_DIGIT > EM_OTHER, "digits are the wide glyphs");
+        // A comma is the only separator: "0" and "1,000,000,000" both estimate.
+        for text in ["0", "16,777,343", "999,999,999", "1,000,000,000"] {
+            let digits = text.chars().filter(char::is_ascii_digit).count() as f32;
+            let separators = text.chars().filter(|c| *c == ',').count() as f32;
+            assert_eq!(
+                (digits + separators) as usize,
+                text.chars().count(),
+                "{text} has a glyph the estimate does not account for"
+            );
+            assert!(
+                estimated_em(text) >= digits * 0.55,
+                "under-estimates {text}"
+            );
+        }
+    }
+
+    /// Number + cost must also fit *vertically* inside the ball, or the two-line
+    /// stack would bulge past the rim even with each line narrow enough.
+    #[test]
+    fn two_line_stack_fits_vertically() {
+        for win in WINDOWS {
+            let sphere = sphere_diameter_for(999_999_999, false)
+                .min(win * MAX_BALL_FRACTION)
+                .min(max_sphere_for_window(win));
+            let num = sphere * NUM_CAP_RATIO;
+            let cost = sphere * COST_CAP_RATIO;
+            // Line boxes at ~1.3x the font size, plus the 4px gap of `gap_1`.
+            let height = num * 1.3 + cost * 1.3 + 4.0;
+            let budget = text_budget_side(sphere) * std::f32::consts::SQRT_2;
+            assert!(
+                height <= budget + 0.01,
+                "two lines are {height}px tall in a {sphere}px ball (budget {budget})"
+            );
+        }
+    }
+
+    /// Even on the smallest plausible window the ball stays positive and inside
+    /// it, and the caps only ever shrink it.
     #[test]
     fn ball_is_capped_by_the_real_window() {
         let huge = sphere_diameter_for(u64::MAX / 2, true);
-        for win in [150.0f32, 240.0, 300.0, WINDOW_SIZE] {
-            let capped = huge.min(win * MAX_BALL_FRACTION);
+        for win in WINDOWS {
+            let capped = huge
+                .min(win * MAX_BALL_FRACTION)
+                .min(max_sphere_for_window(win));
             assert!(capped <= huge);
             assert!(capped <= win);
+            assert!(capped > 0.0);
         }
-        // At the nominal size nothing is capped away.
-        assert_eq!(huge.min(WINDOW_SIZE * MAX_BALL_FRACTION), huge);
+        // At the nominal size nothing is capped away below MAX_SPHERE.
+        assert_eq!(
+            huge.min(WINDOW_SIZE * MAX_BALL_FRACTION)
+                .min(max_sphere_for_window(WINDOW_SIZE)),
+            huge
+        );
     }
 
     /// The first frame must be clipped to a circle that comfortably encloses a
-    /// full ball, whatever the window's real size is — the seed is a pure
-    /// fraction, so this holds for any window.
+    /// full ball, whatever the window's real size is.
     #[test]
     fn seeded_clip_is_generous_enough_for_any_window() {
         assert!(SEED_CLIP_FRACTION > 0.0 && SEED_CLIP_FRACTION <= 1.0);
-        for win in [150.0f32, 240.0, 300.0, WINDOW_SIZE, 480.0] {
+        for win in WINDOWS {
             let seeded = win * SEED_CLIP_FRACTION;
-            let sphere = sphere_diameter_for(0, false).min(win * MAX_BALL_FRACTION);
+            let sphere = sphere_diameter_for(0, false)
+                .min(win * MAX_BALL_FRACTION)
+                .min(max_sphere_for_window(win));
             assert!(
                 seeded > sphere,
                 "seeded clip {seeded} must enclose the first-frame ball {sphere} (win={win})"
@@ -721,12 +988,23 @@ mod tests {
     }
 
     /// Re-cutting an identical region forces a full window repaint for nothing,
-    /// and a needless re-cut can flicker the rim. Only real movement counts.
+    /// and a needless re-cut can flicker the rim.
     #[test]
     fn identical_regions_are_not_reapplied() {
         let a = (300.0, 360.0);
         assert!(!region_moved(a, (300.2, 359.8)));
         assert!(region_moved(a, (320.0, 360.0)));
         assert!(region_moved(a, (300.0, 380.0)));
+    }
+
+    /// The fit cache must only be reused for the same string *and* budget, so a
+    /// stale size can never be applied to a longer number.
+    #[test]
+    fn fit_cache_is_keyed_by_text_and_budget() {
+        let f = TextFit::new("999,999,999", 100.0, 30.0, 12.0);
+        assert!(f.matches("999,999,999", 100.0, 30.0));
+        assert!(!f.matches("999,999,999", 100.0, 31.0));
+        assert!(!f.matches("1,999,999,999", 100.0, 30.0));
+        assert!(!f.matches("999,999,999", 101.0, 30.0));
     }
 }

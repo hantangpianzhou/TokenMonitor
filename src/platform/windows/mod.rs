@@ -84,6 +84,43 @@ pub fn show_window(hwnd: isize, visible: bool) {
     }
 }
 
+/// Logical-px size of a window's client area, or `None` if it is not laid out
+/// yet.
+///
+/// [`set_window_circle_region`] clips in *client* pixels, so anything drawn
+/// inside that window must be laid out against this same rectangle — otherwise
+/// the ball and the circle it is clipped to are centred on two different
+/// rectangles. That mismatch is invisible in the arithmetic but very visible on
+/// screen: the clip then shaves one side of the ball (a hard, aliased rim) and
+/// eats the glow on exactly that side.
+///
+/// GPUI's `Window::viewport_size()` is *not* a safe substitute. It reports the
+/// size GPUI believes the window has, which can disagree with the real client
+/// area (DPI rounding, a popup the OS sized differently). Deriving the ball from
+/// the viewport while clipping from the client rect is what produced the
+/// one-sided cut.
+pub fn client_size_logical(hwnd: isize, scale: f32) -> Option<(f32, f32)> {
+    if hwnd == 0 || !(scale > 0.0) {
+        return None;
+    }
+    let mut rc = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        GetClientRect(hwnd, &mut rc);
+    }
+    let w = (rc.right - rc.left) as f32;
+    let h = (rc.bottom - rc.top) as f32;
+    if w <= 0.0 || h <= 0.0 {
+        None
+    } else {
+        Some((w / scale, h / scale))
+    }
+}
+
 /// Clip the floating window to a circle of the given `diameter` (logical px,
 /// concentric with a square window of `window_size` logical px). This removes
 /// the square OS frame and its rectangular shadow, and makes clicks outside
