@@ -133,7 +133,10 @@ impl ContributionHeatmap {
             let week_start = start + Duration::days(w as i64 * ROWS);
             v_flex().gap(px(GAP)).children((0..ROWS).map(|row| {
                 let date = week_start + Duration::days(row);
-                let stats = cells.get(w as usize * ROWS as usize + row as usize).copied().unwrap_or_default();
+                let stats = cells
+                    .get(w as usize * ROWS as usize + row as usize)
+                    .copied()
+                    .unwrap_or_default();
                 let level = level_for(stats.total_tokens(), max);
                 let color = if level == 0 {
                     p.muted
