@@ -17,21 +17,25 @@
 //!
 //! # Size model
 //!
-//! Three different diameters used to be conflated into one "drawn diameter",
-//! which made the zero-usage ball only `SPHERE_FRACTION` (65%) of a 64 px
-//! constant — a ~42 px ball wrapped in a 1.5× glow and carrying two
-//! fixed-minimum text lines. That no longer reads as a circle. The model is
-//! now explicit:
+//! Two diameters drive everything, and they are deliberately explicit:
 //!
 //! * [`sphere_diameter_for`] — the **solid ball**, `MIN_SPHERE` px at zero
-//!   usage growing to `MAX_SPHERE` px. This is the circle the user sees.
+//!   usage growing to `MAX_SPHERE` px. This is the circle the user sees. It is
+//!   the *whole* ball, not a fraction of some glow-inclusive constant; earlier
+//!   versions conflated the two, which shrank the zero-usage ball to ~42 px and
+//!   made it stop reading as a circle.
 //! * [`clip_diameter_for`] — the **window region**, a circle concentric with
-//!   the ball that encloses the glow and the hover pop but never exceeds the
-//!   window.
+//!   the ball that encloses the glow and the hover pop, but never exceeds the
+//!   window. Keeping the clip strictly inside the window matters: `SetWindowRgn`
+//!   with a region *larger* than the window degenerates into "no clip at all",
+//!   and the square frame shows through — the other way this ball stops looking
+//!   round.
 //!
-//! Keeping the clip strictly inside the window matters: `SetWindowRgn` with a
-//! region larger than the window degenerates into "no clip at all", and the
-//! square frame shows through — the other way this ball stops looking round.
+//! The clip is always derived *from* the ball (`clip = max(ball, glow) + small
+//! margin`), never the reverse, so the ball can never be sliced. The Win32 side
+//! then applies it as a **fraction of the window**, so a client rect that does
+//! not match our logical assumption (DPI, rounding, a window that came out
+//! larger than requested) can never shrink the circle below the ball.
 
 use gpui::{
     div, px, Context, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
@@ -44,13 +48,15 @@ use crate::format::{format_cost_usd, format_int_grouped};
 use crate::platform::set_window_circle_region;
 
 /// Edge length of the square transparent window that hosts the ball (px).
-const WINDOW_SIZE: f32 = 240.0;
+///
+/// Must stay in sync with `FLOAT_WIN` in `app::app`, which sizes the window.
+const WINDOW_SIZE: f32 = 360.0;
 /// **Solid-ball** diameter at zero usage (px). Deliberately an explicit
-/// minimum: the ball stays a legible circle at zero usage instead of shrinking
-/// until the glow and the overlay text dominate its silhouette.
-const MIN_SPHERE: f32 = 96.0;
+/// minimum: the ball stays a large, legible circle at zero usage instead of
+/// shrinking until the glow and the overlay text dominate its silhouette.
+const MIN_SPHERE: f32 = 144.0;
 /// **Solid-ball** diameter at / above the reference usage (px).
-const MAX_SPHERE: f32 = 168.0;
+const MAX_SPHERE: f32 = 232.0;
 /// Usage (tokens) at which the ball reaches its maximum diameter.
 const REF_TOKENS: f64 = 200_000_000.0;
 /// Hover pop scale — the ball lifts / grows a touch when the mouse is over it.
@@ -58,14 +64,21 @@ const HOVER_SCALE: f32 = 1.06;
 /// Slack (px) kept between the clip circle and the window edge, so integer
 /// rounding when the region is built in device pixels can never push the
 /// region past the window.
-const CLIP_MARGIN: f32 = 2.0;
+const CLIP_MARGIN: f32 = 4.0;
+/// Breathing room (px) the clip keeps around the solid ball itself, so the
+/// ball's anti-aliased rim is never touched even if the glow is disabled.
+const CLIP_PAD: f32 = 12.0;
+/// How much bigger than the outermost glow ring the clip is. Small — the glow
+/// should reach close to the edge so the ball+glow read as one glowing object.
+const CLIP_GLOW_SLACK: f32 = 1.05;
 
 /// Glow rings behind the ball, as `(diameter×sphere, opacity)`. Every ring is
 /// strictly larger than the ball (`> 1.0`), so the ball's own edge stays crisp
 /// and the glow only ever adds around it. Outer rings are larger and fainter,
 /// inner rings tighter and stronger, so the stack reads as a soft radial glow.
-/// Static — no breathing / pulsing.
-const HALO_LAYERS: [(f32, f32); 4] = [(1.30, 0.05), (1.22, 0.08), (1.13, 0.12), (1.06, 0.18)];
+/// Kept tight (≤1.20×) so the solid ball stays the dominant element instead of
+/// dissolving into a wide washed-out disc. Static — no breathing / pulsing.
+const HALO_LAYERS: [(f32, f32); 4] = [(1.20, 0.06), (1.14, 0.09), (1.08, 0.13), (1.03, 0.20)];
 
 /// Solid-ball diameter (px) for a given usage, hover pop included.
 ///
@@ -84,13 +97,16 @@ fn sphere_diameter_for(total_tokens: u64, hovered: bool) -> f32 {
 
 /// Clip-circle diameter (px) for a ball of `sphere_d` px.
 ///
-/// The clip must (a) be concentric with the ball, (b) enclose the whole glow
-/// and the hover pop so nothing gets cut, and (c) stay inside the window —
-/// a region larger than the window makes `SetWindowRgn` degenerate into "no
-/// clip", which shows the square frame.
+/// Derived *from* the ball so it can never cut it: it covers the outermost
+/// glow ring with a little slack, keeps at least [`CLIP_PAD`] around the solid
+/// ball, and is clamped inside the window (a region larger than the window
+/// makes `SetWindowRgn` degenerate into "no clip", which shows the square
+/// frame).
 fn clip_diameter_for(sphere_d: f32) -> f32 {
-    let glow_d = sphere_d * HALO_LAYERS[0].0;
-    (glow_d * 1.04).max(sphere_d).min(WINDOW_SIZE - CLIP_MARGIN)
+    let glow_d = sphere_d * HALO_LAYERS[0].0 * CLIP_GLOW_SLACK;
+    glow_d
+        .max(sphere_d + CLIP_PAD)
+        .min(WINDOW_SIZE - CLIP_MARGIN)
 }
 
 /// Clip diameter of the zero-usage (minimum) ball.
@@ -165,8 +181,8 @@ impl Render for FloatingView {
 
         let tokens = format_int_grouped(self.total_tokens);
         let cost = format_cost_usd(self.cost_micros);
-        let fs = px((sphere_d * 0.16).clamp(11.0, 30.0));
-        let cost_fs = px((sphere_d * 0.08).clamp(8.0, 16.0));
+        let fs = px((sphere_d * 0.16).clamp(12.0, 34.0));
+        let cost_fs = px((sphere_d * 0.085).clamp(9.0, 18.0));
 
         let mut root = div()
             .id("floating-root")
@@ -318,6 +334,18 @@ mod tests {
         assert!(MIN_SPHERE > 0.0);
     }
 
+    /// The ball has to be big enough to actually read as a circle — the whole
+    /// point of the size bump. Guards against a future tweak quietly shrinking
+    /// it back to a dot.
+    #[test]
+    fn ball_is_large_at_every_usage() {
+        assert!(
+            MIN_SPHERE >= 128.0,
+            "the resting ball must stay comfortably large (got {MIN_SPHERE})"
+        );
+        assert!(MAX_SPHERE > MIN_SPHERE);
+    }
+
     /// Hover only ever grows the ball, and never past the window.
     #[test]
     fn hover_grows_the_ball() {
@@ -328,11 +356,10 @@ mod tests {
         }
     }
 
-    /// The clip must always enclose the ball (so it is never cut) and stay
-    /// inside the window (so `SetWindowRgn` cannot degenerate to "no clip",
-    /// which would show the square frame).
+    /// The whole point of the fix: the clip must enclose the ball *with room
+    /// to spare* — a clip that merely equals the ball would shave its rim.
     #[test]
-    fn clip_always_encloses_the_ball_and_fits_the_window() {
+    fn clip_always_encloses_the_ball_with_margin() {
         let usages = [
             0u64,
             1,
@@ -347,8 +374,13 @@ mod tests {
                 let sphere = sphere_diameter_for(tokens, hovered);
                 let clip = clip_diameter_for(sphere);
                 assert!(
-                    clip >= sphere,
-                    "clip {clip} must cover ball {sphere} (tokens={tokens}, hovered={hovered})"
+                    clip >= sphere + CLIP_PAD,
+                    "clip {clip} must leave {CLIP_PAD}px around ball {sphere} \
+                     (tokens={tokens}, hovered={hovered})"
+                );
+                assert!(
+                    clip >= sphere * HALO_LAYERS[0].0,
+                    "clip {clip} must cover the glow of ball {sphere} (tokens={tokens})"
                 );
                 assert!(
                     clip <= WINDOW_SIZE - CLIP_MARGIN,
@@ -362,8 +394,8 @@ mod tests {
         }
     }
 
-    /// The ball must be small enough to leave room for its glow inside the
-    /// window at every usage — otherwise part of the ball would be clipped.
+    /// The ball plus its glow must fit inside the window at every usage —
+    /// otherwise part of it would be clipped away.
     #[test]
     fn ball_plus_glow_fits_the_window() {
         let sphere = sphere_diameter_for(u64::MAX / 2, true);
@@ -372,5 +404,15 @@ mod tests {
             glow <= WINDOW_SIZE - CLIP_MARGIN,
             "glow {glow} must fit the {WINDOW_SIZE} px window"
         );
+    }
+
+    /// The first frame (zero usage, not hovered) must already be clipped to a
+    /// circle that encloses a full ball.
+    #[test]
+    fn seeded_clip_encloses_the_first_ball() {
+        let sphere = sphere_diameter_for(0, false);
+        let clip = initial_clip_diameter();
+        assert!(clip >= sphere + CLIP_PAD);
+        assert!(clip <= WINDOW_SIZE - CLIP_MARGIN);
     }
 }

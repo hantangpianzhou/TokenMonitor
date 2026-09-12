@@ -738,8 +738,10 @@ impl Render for TokenMonitorApp {
 }
 
 /// Edge length of the floating window (px), matching `WINDOW_SIZE` in
-/// `ui::floating`.
-const FLOAT_WIN: f32 = 240.0;
+/// `ui::floating`. Must be ≥ the largest clip circle that module can ask for,
+/// plus its margin — otherwise the clip would fill the window and `SetWindowRgn`
+/// would degenerate into "no clip" (a square frame).
+const FLOAT_WIN: f32 = 360.0;
 
 /// Shared so the floating ball can persist its visibility preference on close
 /// without holding its own `Collector` reference.

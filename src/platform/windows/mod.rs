@@ -33,6 +33,7 @@ unsafe extern "system" {
     fn ShowWindow(hwnd: isize, n_cmd_show: c_int) -> i32;
     fn GetClientRect(hwnd: isize, lprect: *mut Rect) -> i32;
     fn SetWindowRgn(hwnd: isize, hrgn: isize, bredraw: i32) -> i32;
+    fn GetDpiForWindow(hwnd: isize) -> u32;
 }
 
 #[link(name = "gdi32")]
@@ -84,23 +85,29 @@ pub fn show_window(hwnd: isize, visible: bool) {
 }
 
 /// Clip the floating window to a circle of the given `diameter` (logical px,
-/// centered in a square window of `window_size` logical px). This removes the
-/// square OS frame and its rectangular shadow, and makes clicks outside the
-/// ball pass through to the desktop — the 360 / Thunder-style floating ball.
+/// concentric with a square window of `window_size` logical px). This removes
+/// the square OS frame and its rectangular shadow, and makes clicks outside
+/// the ball pass through to the desktop — the 360 / Thunder-style floating
+/// ball.
 ///
-/// The window may live on a monitor with any DPI scale, so the region is built
-/// in device pixels derived from the window's actual client size.
+/// The region is computed as a **fraction of the client rect**
+/// (`diameter / window_size`), not by converting logical px to device px
+/// through an assumed scale. That is what the layout actually guarantees: the
+/// ball is laid out at `diameter / window_size` of the window whatever the DPI,
+/// whichever monitor the ball is dragged onto, and whatever rounding the OS
+/// applied to the window size. Scaling *both* sides by the same unknown factor
+/// cancels out, so the clip can never come out smaller than the ball and shave
+/// its rim — the failure mode that made the ball look cut off.
 ///
-/// Two things keep the result a true, centered circle:
-/// * The scale is derived from the client rect on **each axis** and the circle
-///   is centered on the client rect itself, so a client area that is not
-///   exactly square can never shift the clip off-center and shave a flat edge
-///   off the ball.
-/// * The diameter is clamped to the client area. A region *larger* than the
-///   window makes `SetWindowRgn` degenerate into "no clip at all", which shows
-///   the square frame — the ball then no longer looks round.
+/// Two more things keep the result a true, centered circle:
+/// * The circle is centered on the client rect on **each axis**, so a client
+///   area that is not exactly square cannot shift the clip off-center.
+/// * The diameter is clamped to `min(client_w, client_h)`. A region *larger*
+///   than the window makes `SetWindowRgn` degenerate into "no clip at all",
+///   which shows the square frame. (The caller already keeps `diameter` inside
+///   `window_size`, so this is belt-and-braces.)
 pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
-    if hwnd == 0 || window_size <= 0.0 {
+    if hwnd == 0 || window_size <= 0.0 || diameter <= 0.0 {
         return;
     }
     let mut rc = Rect {
@@ -114,14 +121,23 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
     }
     let client_w = (rc.right - rc.left) as f32;
     let client_h = (rc.bottom - rc.top) as f32;
-    if client_w <= 0.0 || client_h <= 0.0 {
-        return;
-    }
-    let max_d = client_w.min(client_h);
-    let scale = (client_w / window_size).min(client_h / window_size);
-    let d = ((diameter * scale).round() as c_int).clamp(1, max_d.round() as c_int);
-    let left = ((client_w - d as f32) / 2.0).round() as c_int;
-    let top = ((client_h - d as f32) / 2.0).round() as c_int;
+    let (cw, ch) = if client_w > 0.0 && client_h > 0.0 {
+        (client_w, client_h)
+    } else {
+        // Not laid out yet: the very first frame can run before the client
+        // rect is valid. Fall back to the monitor DPI so the window is still
+        // round on frame one, instead of staying square until the next render
+        // (which, with a static ball, may never come).
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+        let side = window_size * scale;
+        (side, side)
+    };
+    let max_d = cw.min(ch);
+    let frac = (diameter / window_size).clamp(0.0, 1.0);
+    let d = (max_d * frac).round().clamp(1.0, max_d.round()) as c_int;
+    let left = ((cw - d as f32) / 2.0).round() as c_int;
+    let top = ((ch - d as f32) / 2.0).round() as c_int;
     let hrgn = unsafe { CreateEllipticRgn(left, top, left + d, top + d) };
     if hrgn != 0 {
         unsafe {
