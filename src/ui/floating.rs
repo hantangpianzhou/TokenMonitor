@@ -79,7 +79,7 @@
 
 use gpui::{
     div, px, BoxShadow, Context, Font, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window, WindowControlArea,
+    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -589,20 +589,25 @@ impl Render for FloatingView {
             .id("floating-root")
             .size_full()
             .relative()
-            // Make the whole circular window a drag handle. `WindowControlArea::Drag`
-            // makes GPUI's hit test return `HTCAPTION` over the ball (our window
-            // uses the default `is_movable == true`, so `Drag` does yield
-            // `HTCAPTION` — confirmed in `crates/gpui_windows/src/events.rs:955`).
-            // `HTCAPTION` is what makes the OS deliver `WM_NCLBUTTONDOWN` to the
-            // window at all; without it the transparent window would be click-
-            // through. The actual move is then driven ourselves by the Win32
-            // subclass in `platform::windows::mod`, which intercepts that
-            // `WM_NCLBUTTONDOWN`, captures the pointer and tracks it with
-            // `SetWindowPos`, returning 0 so `DefWindowProc` never runs the OS
-            // caption-move loop (the black square we saw earlier). Clicks outside
-            // the circle have no control area, so they fall through to the
-            // desktop (the 360 / Thunder style).
-            .window_control_area(WindowControlArea::Drag)
+            // The ball is dragged with the native pointer by the Win32 subclass in
+            // `platform::windows::mod`. We deliberately do **not** use GPUI's
+            // `WindowControlArea::Drag`: it makes GPUI's hit test answer `HTCAPTION`
+            // over the ball (`crates/gpui_windows/src/events.rs:955`), which routes
+            // the press through `WM_NCLBUTTONDOWN` and the OS *non-client* drag loop.
+            // That loop is what flashed the black square earlier (a transparent
+            // frameless window has no visible caption to drag, so the OS paints the
+            // square drag outline), and — worse — while it is active the OS delivers
+            // `WM_NCMOUSEMOVE` (0x00A0), not `WM_MOUSEMOVE`, during the drag. A custom
+            // `SetCapture` + `SetWindowPos` tracker keyed only on `WM_MOUSEMOVE`
+            // therefore never sees a move and the ball will not budge.
+            //
+            // Without `Drag` the ball hit-tests as a normal client area (`HTCLIENT`),
+            // so a press arrives as `WM_LBUTTONDOWN` and the standard
+            // `SetCapture` → `WM_MOUSEMOVE` → `SetWindowPos` tracker runs on its
+            // reliable, well-supported code path. Clicks outside the circular region
+            // still pass through to the desktop because of `SetWindowRgn` + the
+            // transparent window style (the 360 / Thunder look); `HTCLIENT` only
+            // governs hits *inside* the region, which is exactly the ball.
             .on_hover(move |hovered, _win, app| {
                 me.update(app, |this, cx| {
                     this.hovered = *hovered;

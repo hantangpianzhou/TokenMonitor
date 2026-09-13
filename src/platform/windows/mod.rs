@@ -186,26 +186,37 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
 
 // ── Custom drag via Win32 subclass ───────────────────────────────────────────
 //
-// The ball is made draggable by pairing GPUI's `WindowControlArea::Drag` (set on
-// the root div in `ui::floating`) with a Win32 subclass on the ball HWND:
+// The ball is dragged by a Win32 subclass on the ball HWND, paired with the
+// root div in `ui::floating` *not* using GPUI's `WindowControlArea::Drag`. The
+// reason is the message path:
 //
-// 1. `Drag` makes GPUI's hit test return `HTCAPTION` over the ball. Our window
-//    uses the default `is_movable == true`, so `Drag` *does* yield `HTCAPTION`
-//    (`crates/gpui_windows/src/events.rs:955`) — that is what makes the OS
-//    deliver `WM_NCLBUTTONDOWN` to the window at all. (Without it the transparent
-//    window would be click-through and nothing could start a drag.)
-// 2. The subclass intercepts that `WM_NCLBUTTONDOWN`, calls `SetCapture`, and
-//    records the cursor→window offset. From then on `WM_MOUSEMOVE` (routed to
-//    the captured window even when the cursor leaves the ball) relocates the
-//    window with `SetWindowPos`; `WM_LBUTTONUP` releases the capture. The press
-//    is swallowed (return 0) so `DefWindowProc` never runs the OS caption-move
-//    loop — that loop is what flashed the black square earlier.
+// * With `WindowControlArea::Drag`, GPUI's hit test answers `HTCAPTION` over the
+//   ball (`crates/gpui_windows/src/events.rs:955`). That routes the press through
+//   `WM_NCLBUTTONDOWN` and the OS *non-client* drag loop — which both flashes the
+//   black square (a transparent frameless window has no visible caption to drag)
+//   and, while active, delivers `WM_NCMOUSEMOVE` (0x00A0) instead of `WM_MOUSEMOVE`
+//   during the drag. A `SetCapture` + `SetWindowPos` tracker keyed only on
+//   `WM_MOUSEMOVE` then sees no move and the ball never moves.
+// * Without `Drag`, the ball hit-tests as a normal client area (`HTCLIENT`), so a
+//   press arrives as `WM_LBUTTONDOWN` and the standard `SetCapture` →
+//   `WM_MOUSEMOVE` → `SetWindowPos` tracker runs on its reliable, well-supported
+//   path. This is the primary path the subclass is written for.
+//
+// The subclass still also accepts the non-client variants (`WM_NCLBUTTONDOWN`,
+// `WM_NCMOUSEMOVE`, `WM_NCLBUTTONUP`) as a belt-and-suspenders fallback, so the
+// drag works even if GPUI ever answers `HTCAPTION` again.
+//
+// On press it calls `SetCapture` and records the cursor→window offset. From then
+// on every `WM_MOUSEMOVE` (or `WM_NCMOUSEMOVE`, routed to the captured window even
+// after the cursor leaves the ball) relocates the window with `SetWindowPos`;
+// `WM_LBUTTONUP` releases the capture. The press is swallowed (return 0) so the OS
+// caption-move loop never runs — no black square.
 //
 // `SetWindowSubclass` (not `SetWindowLongPtrW`) composes with GPUI's own window
 // proc instead of replacing it, so the window keeps receiving every other
 // message (hover, show/hide, paint) and stays responsive. Clicks outside the
-// ball's circle have no `Drag` control area, so they pass through to the desktop
-// via `HTTRANSPARENT` / `SetWindowRgn`.
+// ball's circle pass through to the desktop via `SetWindowRgn` + the transparent
+// window style (the 360 / Thunder look).
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -239,6 +250,7 @@ const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 const WM_NCLBUTTONUP: u32 = 0x00A2;
+const WM_NCMOUSEMOVE: u32 = 0x00A0;
 const SWP_NOZORDER: u32 = 0x0002;
 const SWP_NOACTIVATE: u32 = 0x0010;
 /// Unique id for this subclass (arbitrary; just must not collide with GPUI's
@@ -266,12 +278,13 @@ unsafe extern "system" fn ball_drag_subclass(
 ) -> isize {
     match msg {
         WM_NCLBUTTONDOWN | WM_LBUTTONDOWN => {
-            // Begin a drag. `WM_NCLBUTTONDOWN` arrives because GPUI's hit test
-            // answered `HTCAPTION` over the ball (from `WindowControlArea::Drag`);
-            // `WM_LBUTTONDOWN` is the client-space form, kept for symmetry. We
-            // capture the pointer so every later `WM_MOUSEMOVE` is routed to this
-            // window even after the cursor leaves the ball, and record the grab
-            // offset so the ball does not jump under the cursor.
+            // Begin a drag. The client-space form `WM_LBUTTONDOWN` is the primary
+            // path (the ball hit-tests as `HTCLIENT` since `ui::floating` no longer
+            // uses `WindowControlArea::Drag`); `WM_NCLBUTTONDOWN` is the non-client
+            // form kept as a fallback. We capture the pointer so every later move
+            // message (`WM_MOUSEMOVE` or the non-client `WM_NCMOUSEMOVE`) is routed
+            // to this window even after the cursor leaves the ball, and record the
+            // grab offset so the ball does not jump under the cursor.
             let mut pt = Point { x: 0, y: 0 };
             let mut rc = Rect {
                 left: 0,
@@ -291,7 +304,7 @@ unsafe extern "system" fn ball_drag_subclass(
             // move loop (the black square). Clients never see it either.
             return 0;
         }
-        WM_MOUSEMOVE => {
+        WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
             if *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() {
                 let mut pt = Point { x: 0, y: 0 };
                 if GetCursorPos(&mut pt) != 0 {
