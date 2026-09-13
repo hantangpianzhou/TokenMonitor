@@ -36,7 +36,6 @@ unsafe extern "system" {
     fn GetClientRect(hwnd: isize, lprect: *mut Rect) -> i32;
     fn SetWindowRgn(hwnd: isize, hrgn: isize, bredraw: i32) -> i32;
     fn GetDpiForWindow(hwnd: isize) -> u32;
-    fn ScreenToClient(hwnd: isize, lp_point: *mut Point) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -195,53 +194,40 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
     }
 }
 
-// ── Custom drag ──────────────────────────────────────────────────────────────
+// ── Custom drag via low-level mouse hook ─────────────────────────────────────
 //
-// The floating ball is moved by a Win32 subclass on its own `HWND`. The subclass
-// answers `WM_NCHITTEST` itself: inside the clipped circle it returns
-// `HTCAPTION`, outside it returns `HTTRANSPARENT` (click-through to the desktop).
+// The floating ball is moved by a system-wide low-level mouse hook
+// (`WH_MOUSE_LL`). This is the only reliable way to make a transparent,
+// click-through floating widget draggable on Windows, because every earlier
+// approach failed for the same structural reason:
 //
-// Why we don't use GPUI's `WindowControlArea::Drag`: in this GPUI revision
-// `handle_hit_test_msg` only returns `HTCAPTION` for `WindowControlArea::Drag`
-// *when `is_movable` is true* (`crates/gpui_windows/src/events.rs:955`). Our
-// window is a transparent borderless `WindowKind::PopUp` with no decorations, so
-// GPUI sets `is_movable == false`; `Drag` then returns `None`, `DefWindowProc`
-// answers `HTTRANSPARENT` for the whole client area, and the OS never delivers a
-// mouse press to the window — i.e. the ball cannot be dragged at all. Answering
-// `WM_NCHITTEST` directly sidesteps that flag entirely and works for any window.
+// Our window is created with `window_background: Transparent`, and GPUI sets
+// `WS_EX_NOREDIRECTIONBITMAP` on it (`crates/gpui_windows/src/window.rs:493`).
+// That style tells the OS there is no per-pixel bitmap to sample, so Windows
+// cannot do alpha hit-testing and treats the **entire window** as
+// `HTTRANSPARENT` — every mouse press falls through to the desktop and is never
+// delivered to the window at all. Neither `WindowControlArea::Drag` (GPUI only
+// returns `HTCAPTION` when `is_movable` is true, and a transparent borderless
+// popup has `is_movable == false`, `events.rs:955`) nor a `WM_NCHITTEST`
+// subclass (the message is never dispatched to the window) can receive the
+// press, so the ball could not be dragged by any in-window technique.
 //
-// `HTCAPTION` would normally let `DefWindowProc` run the OS caption-move loop;
-// during that loop the app's frame pump is blocked and the OS either draws its
-// hollow drag-outline (a full window-sized **square**, when "show window
-// contents while dragging" is off) or a black frame while the transparent
-// window is not being re-presented — that is the black square the user saw. We
-// prevent it by returning 0 (handled) from `WM_NCLBUTTONDOWN` so the message is
-// never forwarded to `DefWindowProc`. The move is driven ourselves: capture the
-// pointer, track it with `GetCursorPos`, relocate with `SetWindowPos`. That
-// keeps GPUI rendering the live circular ball every frame and never enters the
-// OS move loop, so no black square. Clicks still pass through outside the ball
-// because the `WM_NCHITTEST` handler returns `HTTRANSPARENT` there (and
-// `SetWindowRgn` clips the visual to the same circle).
+// A low-level mouse hook receives *every* mouse event system-wide — including
+// events over a click-through / transparent window — so it does not depend on
+// hit testing, `is_movable`, `WS_EX_*` styles, or subclass ordering. When the
+// cursor is inside the ball's circle we `SetWindowPos` the window to follow the
+// cursor and swallow the event (return 1) so the desktop behind does not react;
+// clicks outside the ball fall through to `CallNextHookEx` unchanged, and the
+// circular `SetWindowRgn` clip still makes the corners click-through to the
+// desktop. The hook is installed on the GUI thread (the one that pumps
+// messages), so its callback fires normally.
 
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn GetCursorPos(lp_point: *mut Point) -> i32;
-    fn SetCapture(hwnd: isize) -> isize;
-    fn ReleaseCapture() -> i32;
     fn GetWindowRect(hwnd: isize, lprect: *mut Rect) -> i32;
     fn IsWindow(hwnd: isize) -> i32;
-}
-
-#[link(name = "comctl32")]
-unsafe extern "system" {
-    fn InitCommonControls();
-    fn SetWindowSubclass(
-        hwnd: isize,
-        pfn: *const (),
-        u_id_subclass: usize,
-        dw_ref_data: usize,
-    ) -> i32;
-    fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn SetWindowsHookExW(id_hook: i32, lpfn: *const (), hmod: isize, dw_thread_id: u32) -> isize;
+    fn CallNextHookEx(hhk: isize, n_code: i32, w_param: usize, l_param: isize) -> isize;
 }
 
 #[repr(C)]
@@ -253,187 +239,159 @@ struct Point {
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONUP: u32 = 0x0202;
-/// Non-client button messages. These arrive (instead of the client ones) when
-/// our `WM_NCHITTEST` handler answers `HTCAPTION` over the ball. We consume them
-/// in the subclass and drive the move ourselves so the OS caption-move loop
-/// never runs — that loop is what flashed a black square in earlier builds.
-const WM_NCLBUTTONDOWN: u32 = 0x00A1;
-const WM_NCLBUTTONUP: u32 = 0x00A2;
-/// Non-client mouse-move and double-click. With `SetCapture` during a drag the
-/// OS delivers moves as `WM_MOUSEMOVE`, but we also accept the non-client form
-/// so a move is never missed; the double-click is swallowed so the (non-existent)
-/// caption does not trigger a maximise/minimise.
-const WM_NCMOUSEMOVE: u32 = 0x00A0;
-const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
-/// Hit test. We answer this ourselves so the whole ball is a drag handle
-/// regardless of GPUI's `is_movable` flag (a transparent borderless popup has
-/// `is_movable == false`, so GPUI's `WindowControlArea::Drag` returns `None` and
-/// the OS never delivers a press — that was why the ball could not be dragged).
-const WM_NCHITTEST: u32 = 0x0084;
-const HTCAPTION: isize = 2;
-const HTTRANSPARENT: isize = -1;
+const WH_MOUSE_LL: i32 = 14;
+const HC_ACTION: i32 = 0;
 const SWP_NOZORDER: u32 = 0x0002;
 const SWP_NOACTIVATE: u32 = 0x0010;
-/// Unique id for this subclass (arbitrary; just must not collide with GPUI's
-/// own subclass ids, which it allocates separately).
-const DRAG_SUBCLASS_ID: usize = 0xF10A;
 
-/// `(offset_x, offset_y)` = cursor minus window origin at drag start, per hwnd.
-static DRAG_OFFSET: OnceLock<Mutex<HashMap<isize, (i32, i32)>>> = OnceLock::new();
+/// The `HWND` of the floating ball, read by the hook each event so it can move
+/// the right window. Set at creation; the hook ignores events while this is 0.
+static FLOAT_HWND: OnceLock<Mutex<isize>> = OnceLock::new();
+
+/// `(offset_x, offset_y)` = cursor minus window origin captured at drag start.
+static DRAG_OFFSET: OnceLock<Mutex<(i32, i32)>> = OnceLock::new();
+
+/// Whether a drag is in progress (left button is down on the ball).
+static DRAGGING: OnceLock<Mutex<bool>> = OnceLock::new();
+
+/// Installed low-level mouse hook handle, kept so it is never dropped and could
+/// be uninstalled on shutdown.
+static MOUSE_HOOK: OnceLock<Mutex<isize>> = OnceLock::new();
 
 /// Circular clip region (device px) for each floating hwnd, as computed in
-/// [`set_window_circle_region`]: `(left, top, diameter)`. The `WM_NCHITTEST`
-/// handler uses it to decide whether a point is inside the ball (draggable) or
-/// outside it (click-through to the desktop) — exactly the same circle the
-/// window is visually clipped to, so the drag surface matches what is drawn.
+/// [`set_window_circle_region`]: `(left, top, diameter)`. The hook uses it to
+/// decide whether the cursor is inside the ball (start a drag) or outside it
+/// (click-through to the desktop) — the same circle the window is visually
+/// clipped to, so the drag surface matches what is drawn.
 static CLIP_REGION: OnceLock<Mutex<HashMap<isize, (c_int, c_int, c_int)>>> = OnceLock::new();
 
-/// `InitCommonControls` must run once before `SetWindowSubclass` is usable
-/// (comctl32 subclasses are uninitialised until then on some Windows builds).
-static COMCTL_INIT: OnceLock<()> = OnceLock::new();
-
-unsafe extern "system" fn ball_drag_subclass(
+#[repr(C)]
+struct MouseHookStruct {
+    pt: Point,
     hwnd: isize,
-    msg: u32,
-    wparam: usize,
-    lparam: isize,
-    _u_id_subclass: usize,
-    _dw_ref_data: usize,
-) -> isize {
-    match msg {
-        WM_NCHITTEST => {
-            // Answer hit testing ourselves so the ball is a drag handle no
-            // matter what GPUI thinks. GPUI's `WindowControlArea::Drag` only
-            // yields `HTCAPTION` when its `is_movable` flag is set, and a
-            // transparent borderless popup has `is_movable == false` — so GPUI
-            // returns `None` and the OS answers `HTTRANSPARENT`, never sending a
-            // mouse press (that was the "cannot drag" bug). We bypass GPUI
-            // entirely: inside the clipped circle -> `HTCAPTION` (the OS then
-            // emits `WM_NCLBUTTONDOWN`, which we self-drive below); outside ->
-            // `HTTRANSPARENT` so clicks fall through to the desktop.
-            let mut pt = Point {
-                x: (lparam & 0xFFFF) as i16 as i32,
-                y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
-            };
-            if ScreenToClient(hwnd, &mut pt) != 0 {
-                if let Some(guard) = CLIP_REGION.get() {
-                    if let Some(&(rl, rt, rd)) = guard.lock().unwrap().get(&hwnd) {
-                        let cx = rl as f32 + rd as f32 / 2.0;
-                        let cy = rt as f32 + rd as f32 / 2.0;
-                        let r = rd as f32 / 2.0;
-                        if r > 0.0 {
-                            let dx = pt.x as f32 - cx;
-                            let dy = pt.y as f32 - cy;
-                            // Ellipse test in client (device) px; matching the
-                            // region gives the drag surface the same shape as the
-                            // drawn ball, glow included.
-                            if (dx * dx + dy * dy) <= r * r {
-                                return HTCAPTION;
-                            }
-                        }
+    w_hit_test_code: u32,
+    dw_extra_info: usize,
+}
+
+/// Is the screen point `(sx, sy)` inside the ball's circular clip? Uses the
+/// same ellipse [`set_window_circle_region`] applied (`CLIP_REGION`), offset by
+/// the window's current screen origin.
+unsafe fn cursor_inside_ball(sx: i32, sy: i32) -> bool {
+    let hwnd = *FLOAT_HWND.get_or_init(|| Mutex::new(0)).lock().unwrap();
+    if hwnd == 0 || IsWindow(hwnd) == 0 {
+        return false;
+    }
+    let Some((rl, rt, rd)) = CLIP_REGION
+        .get()
+        .and_then(|m| m.lock().unwrap().get(&hwnd).copied())
+    else {
+        return false;
+    };
+    let mut rc = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if GetWindowRect(hwnd, &mut rc) == 0 {
+        return false;
+    }
+    let r = rd as f64 / 2.0;
+    if r <= 0.0 {
+        return false;
+    }
+    let cx = rc.left as f64 + (rl as f64 + r);
+    let cy = rc.top as f64 + (rt as f64 + r);
+    let dx = sx as f64 - cx;
+    let dy = sy as f64 - cy;
+    dx * dx + dy * dy <= r * r
+}
+
+unsafe extern "system" fn mouse_proc(n_code: i32, w_param: usize, l_param: isize) -> isize {
+    if n_code == HC_ACTION {
+        let info = &*(l_param as *const MouseHookStruct);
+        match w_param as u32 {
+            WM_LBUTTONDOWN => {
+                if cursor_inside_ball(info.pt.x, info.pt.y) {
+                    let hwnd = *FLOAT_HWND.get_or_init(|| Mutex::new(0)).lock().unwrap();
+                    let mut rc = Rect {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
+                    if hwnd != 0 && GetWindowRect(hwnd, &mut rc) != 0 {
+                        *DRAG_OFFSET
+                            .get_or_init(|| Mutex::new((0, 0)))
+                            .lock()
+                            .unwrap() = (info.pt.x - rc.left, info.pt.y - rc.top);
+                        *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() = true;
+                        // Swallow the press so the window behind the ball does
+                        // not start its own interaction (text selection, etc.).
+                        return 1;
                     }
                 }
             }
-            return HTTRANSPARENT;
-        }
-        WM_LBUTTONDOWN | WM_NCLBUTTONDOWN => {
-            // Begin a drag from anywhere inside the ball. The press arrives as
-            // `WM_NCLBUTTONDOWN` after our `WM_NCHITTEST` returns `HTCAPTION`.
-            // For the non-client press we consume the message and return 0 so
-            // GPUI never forwards it to `DefWindowProc` — that is what would
-            // start the OS caption-move loop and flash the black square. We
-            // drive the move ourselves instead.
-            let mut pt = Point { x: 0, y: 0 };
-            let mut rc = Rect {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            if GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut rc) != 0 {
-                DRAG_OFFSET
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .unwrap()
-                    .insert(hwnd, (pt.x - rc.left, pt.y - rc.top));
-                SetCapture(hwnd);
-            }
-            // Non-client press: handled here, do not let GPUI run the OS loop.
-            if msg == WM_NCLBUTTONDOWN {
-                return 0;
-            }
-        }
-        WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
-            if let Some((ox, oy)) = DRAG_OFFSET
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap()
-                .get(&hwnd)
-                .copied()
-            {
-                let mut pt = Point { x: 0, y: 0 };
-                if GetCursorPos(&mut pt) != 0 {
-                    // Move the whole window so the cursor stays on the same
-                    // point of the ball. `SWP_NOZORDER` keeps the always-on-top
-                    // state; `SWP_NOACTIVATE` avoids stealing focus mid-drag.
-                    SetWindowPos(
-                        hwnd,
-                        0,
-                        pt.x - ox,
-                        pt.y - oy,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
+            WM_MOUSEMOVE => {
+                if *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() {
+                    let hwnd = *FLOAT_HWND.get_or_init(|| Mutex::new(0)).lock().unwrap();
+                    if hwnd != 0 {
+                        let (ox, oy) = *DRAG_OFFSET
+                            .get_or_init(|| Mutex::new((0, 0)))
+                            .lock()
+                            .unwrap();
+                        // Move the window so the cursor stays on the same point
+                        // of the ball. `SWP_NOZORDER` keeps always-on-top;
+                        // `SWP_NOACTIVATE` avoids stealing focus mid-drag.
+                        SetWindowPos(
+                            hwnd,
+                            0,
+                            info.pt.x - ox,
+                            info.pt.y - oy,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        return 1;
+                    }
                 }
             }
-        }
-        WM_LBUTTONUP | WM_NCLBUTTONUP => {
-            if DRAG_OFFSET
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap()
-                .remove(&hwnd)
-                .is_some()
-            {
-                ReleaseCapture();
+            WM_LBUTTONUP => {
+                if *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() {
+                    *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() = false;
+                    return 1;
+                }
             }
-            // Mirror the non-client press: swallow the up so GPUI does not react.
-            if msg == WM_NCLBUTTONUP {
-                return 0;
-            }
+            _ => {}
         }
-        WM_NCLBUTTONDBLCLK => {
-            // The OS would treat a title-bar double-click as maximise/minimise.
-            // Swallow it so a quick double-click on the ball does nothing.
-            return 0;
-        }
-        _ => {}
     }
-    // Chain to GPUI (and any other subclass) through `DefSubclassProc`. This is
-    // the correct forwarder for `SetWindowSubclass`: it preserves GPUI's own
-    // WndProc and any subclass GPUI installed, so hover, click-through and the
-    // OS show/hide messages keep flowing. The raw `SetWindowLongPtrW` swap we
-    // used before clobbered GPUI's WndProc on the first show/hide cycle and
-    // froze the window — that was why the ball could neither be dragged nor
-    // hidden.
-    DefSubclassProc(hwnd, msg, wparam, lparam)
+    CallNextHookEx(0, n_code, w_param, l_param)
 }
 
-/// Subclass the floating window so it can be dragged with the native pointer
-/// (see the module note above). Idempotent per hwnd. Call once at creation,
-/// right after the window handle is known.
-///
-/// Uses `SetWindowSubclass` (not `SetWindowLongPtrW`) on purpose: it composes
-/// with GPUI's own window proc instead of replacing it, so GPUI keeps receiving
-/// every message (including `WM_SHOWWINDOW`) and the window stays responsive.
+/// Install the low-level mouse hook that drives ball dragging. Idempotent: the
+/// hook is installed once for the whole process and simply reads the current
+/// ball `HWND` (updated here on every (re)creation) each event, so it survives
+/// window hide/show and re-creation without being re-installed.
 pub fn install_ball_drag(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
-    COMCTL_INIT.get_or_init(|| unsafe { InitCommonControls() });
+    *FLOAT_HWND.get_or_init(|| Mutex::new(0)).lock().unwrap() = hwnd;
+    let already = MOUSE_HOOK
+        .get()
+        .map(|m| *m.lock().unwrap() != 0)
+        .unwrap_or(false);
+    if already {
+        return;
+    }
     unsafe {
-        SetWindowSubclass(hwnd, ball_drag_subclass as *const (), DRAG_SUBCLASS_ID, 0);
+        // `WH_MOUSE_LL` requires `hmod == NULL` (the hook lives in this
+        // process) and `dw_thread_id == 0` (the calling / GUI thread, which is
+        // the one pumping messages so the callback fires).
+        let hhk = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc as *const (), 0, 0);
+        if hhk != 0 {
+            *MOUSE_HOOK.get_or_init(|| Mutex::new(0)).lock().unwrap() = hhk;
+        }
     }
 }
 

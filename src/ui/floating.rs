@@ -589,23 +589,18 @@ impl Render for FloatingView {
             .id("floating-root")
             .size_full()
             .relative()
-            // The ball is made draggable entirely by the Win32 subclass in
-            // `platform::windows::mod`, which answers `WM_NCHITTEST` itself
-            // (returning `HTCAPTION` inside the clipped circle, `HTTRANSPARENT`
-            // outside). We do **not** use GPUI's `WindowControlArea::Drag`: in
-            // this GPUI revision it only yields `HTCAPTION` when `is_movable` is
-            // true, and a transparent borderless popup has `is_movable == false`,
-            // so `Drag` returns `None` and the OS never delivers a press at all.
-            //
-            // `HTCAPTION` would normally make the OS run its own caption move
-            // loop (the black square we saw before). We do **not** let that
-            // happen: the subclass intercepts the resulting `WM_NCLBUTTONDOWN`,
-            // captures the pointer and tracks it with `GetCursorPos` +
-            // `SetWindowPos` itself, returning 0 (handled) so the message is
-            // never forwarded to `DefWindowProc`. The loop never starts, and GPUI
-            // keeps painting the live circular ball every frame while it is
-            // dragged. Clicks outside the ball pass through to the desktop (the
-            // 360 / Thunder style).
+            // The ball is dragged by a system-wide low-level mouse hook
+            // (`WH_MOUSE_LL`) installed in `platform::windows::mod`. This is
+            // necessary because the transparent popup has `WS_EX_NOREDIRECTIONBITMAP`
+            // set by GPUI, so the OS treats the whole window as `HTTRANSPARENT`
+            // and never delivers a mouse press to it — neither GPUI's
+            // `WindowControlArea::Drag` (it only yields `HTCAPTION` when
+            // `is_movable` is true, and this popup has `is_movable == false`) nor
+            // an in-window `WM_NCHITTEST` subclass can receive the click. The
+            // hook sees every mouse event globally, so it works regardless. It
+            // moves the window with `SetWindowPos` while the cursor is over the
+            // ball and swallows the event; clicks outside the ball pass through
+            // to the desktop (the 360 / Thunder style).
             .on_hover(move |hovered, _win, app| {
                 me.update(app, |this, cx| {
                     this.hovered = *hovered;
