@@ -5,15 +5,23 @@
 //! via `SetWindowRgn` — so there is no square OS frame or rectangular shadow,
 //! and clicks outside the ball pass through to the desktop (the 360 / Thunder
 //! style). Its diameter grows with total token usage (area ∝ usage) and it
-//! pops slightly on hover for a floating feel. The total token count is
-//! overlaid on the sphere; data is pushed from `TokenMonitorApp`.
+//! pops slightly on hover for a floating feel. The total token count and the
+//! period it was aggregated over ("今日" / "本周" / …) are overlaid on the
+//! sphere; data is pushed from `TokenMonitorApp`.
 //!
 //! The ball is drawn in code (not a PNG) so the color always follows the
 //! theme. A linear gradient + a gradient sheen + a small specular dot give it
 //! a rounded, spherical read. A soft accent **halo** behind the ball sells the
 //! "floating" glow.
 //!
-//! # Three rules, and the bugs that produced them
+//! # The number always says what it measures
+//!
+//! The pushed total is the dashboard's **active time-tab** aggregate, so the
+//! same ball would mean "today" or "this year" depending on a tab living in
+//! another window. A bare number therefore cannot be read on its own — so the
+//! ball carries its period as a small label above the count.
+//!
+//! # The rules, and the bugs that produced them
 //!
 //! ## 1. The ball and the clip are laid out from the *same* rectangle
 //!
@@ -84,6 +92,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+use crate::app::state::TimeTab;
 use crate::format::format_int_grouped;
 use crate::platform::{client_size_logical, set_window_circle_region};
 
@@ -173,6 +182,16 @@ const SPECULARS: [(f32, f32, f32, f32); 2] =
 const TEXT_BOX_FRACTION: f32 = 0.92;
 /// Ceiling on the number's font size, as a fraction of the ball diameter.
 const NUM_CAP_RATIO: f32 = 0.26;
+/// Ceiling on the period label's font size, as a fraction of the ball diameter.
+/// Always held below [`NUM_CAP_RATIO`]: the count is what the ball is for, the
+/// label only qualifies it.
+const LABEL_CAP_RATIO: f32 = 0.15;
+/// The period label is also capped at this fraction of the number's **fitted**
+/// size — not of the ball. The number is scaled down to fit the ball, while two
+/// CJK glyphs are far narrower than an 8-digit grouped count, so a label capped
+/// only against the ball would keep its full (larger) size and end up towering
+/// over the count it is supposed to qualify.
+const LABEL_OF_NUM: f32 = 0.62;
 /// Font size used to *probe* a string's width before scaling it to fit. Any
 /// value works (width is proportional to size); 20px keeps rounding small.
 const FIT_PROBE_PX: f32 = 20.0;
@@ -180,6 +199,11 @@ const FIT_PROBE_PX: f32 = 20.0;
 /// the text system cannot be asked. Upper bounds for a semibold sans face.
 const EM_DIGIT: f32 = 0.64;
 const EM_OTHER: f32 = 0.36;
+/// Advance of one **wide** (non-ASCII) glyph, in the same units. CJK glyphs are
+/// near-square, i.e. about one em — roughly 3x the narrow ASCII glyphs above.
+/// Estimating them as narrow would under-state the label's width on the
+/// estimate path, which is exactly the path that has to be safe.
+const EM_WIDE: f32 = 1.0;
 
 /// Solid-ball diameter (px) for a given usage, hover pop included.
 ///
@@ -324,8 +348,10 @@ fn estimated_em(text: &str) -> f32 {
         .map(|c| {
             if c.is_ascii_digit() {
                 EM_DIGIT
-            } else {
+            } else if c.is_ascii() {
                 EM_OTHER
+            } else {
+                EM_WIDE
             }
         })
         .sum()
@@ -463,6 +489,11 @@ fn region_moved(prev: (f32, f32), next: (f32, f32)) -> bool {
 pub struct FloatingView {
     hwnd: isize,
     total_tokens: u64,
+    /// The dashboard time tab the pushed total was aggregated over — shown as
+    /// the ball's label ("今日" / "本周" / …). Carried as part of the value, not
+    /// read from app state, so the label can never describe a different period
+    /// than the number it sits on.
+    time_tab: TimeTab,
     hovered: bool,
     /// Last `(clip_diameter, window_size)` handed to `SetWindowRgn`. Re-applying
     /// an identical region forces the OS to recompute and repaint the whole
@@ -471,6 +502,8 @@ pub struct FloatingView {
     last_region: (f32, f32),
     /// Cached fit of the token-count string.
     num_fit: Option<TextFit>,
+    /// Cached fit of the period label.
+    label_fit: Option<TextFit>,
 }
 
 impl FloatingView {
@@ -478,9 +511,11 @@ impl FloatingView {
         Self {
             hwnd: hwnd_of(window),
             total_tokens: 0,
+            time_tab: TimeTab::default(),
             hovered: false,
             last_region: (0.0, 0.0),
             num_fit: None,
+            label_fit: None,
         }
     }
 
@@ -490,8 +525,11 @@ impl FloatingView {
     }
 
     /// Push the latest usage (called from `TokenMonitorApp` on every scan).
-    pub fn set_total_tokens(&mut self, total_tokens: u64) {
+    /// `time_tab` is the period the total was aggregated over; both travel
+    /// together so the ball can label the number with its own scope.
+    pub fn set_usage(&mut self, total_tokens: u64, time_tab: TimeTab) {
         self.total_tokens = total_tokens;
+        self.time_tab = time_tab;
     }
 
     /// Font size (px) that keeps `text` inside the ball, cached per string and
@@ -581,9 +619,10 @@ impl Render for FloatingView {
         }
 
         let tokens = format_int_grouped(self.total_tokens);
-        // Fit the count to the ball's inscribed square, so an ever-growing number
-        // (0 → 999,999,999 and past it) can never run into the rim and stop the
-        // whole thing reading as a circle.
+        let period = self.time_tab.label().to_string();
+        // Fit both lines to the ball's inscribed square, so an ever-growing
+        // number (0 → 999,999,999 and past it) can never run into the rim and
+        // stop the whole thing reading as a circle.
         let budget = text_budget_side(sphere_d);
         let fs = Self::fitted_size(
             &mut self.num_fit,
@@ -592,6 +631,17 @@ impl Render for FloatingView {
             budget,
             sphere_d * NUM_CAP_RATIO,
             FontWeight::SEMIBOLD,
+        );
+        // The label is capped against the *fitted* number (see `LABEL_OF_NUM`),
+        // so the count stays the dominant line however long it grows.
+        let label_cap = (fs * LABEL_OF_NUM).min(sphere_d * LABEL_CAP_RATIO);
+        let label_fs = Self::fitted_size(
+            &mut self.label_fit,
+            window,
+            &period,
+            budget,
+            label_cap,
+            FontWeight::NORMAL,
         );
 
         let mut root = div()
@@ -697,10 +747,11 @@ impl Render for FloatingView {
                 .border_color(WHITE.opacity(RIM_ALPHA)),
         );
 
-        // --- 2. The overlaid token count, centred in the same box as the ball.
-        // A flex row would fight the absolute layers, so this is one absolutely
-        // positioned box sized to the ball. It is also a drag handle so the
-        // centre of the ball (under the text) is grabbable, not just the rim.
+        // --- 2. The overlaid period label + token count, centred in the same box
+        // as the ball. A flex row would fight the absolute layers, so this is one
+        // absolutely positioned column sized to the ball. It is also a drag
+        // handle so the centre of the ball (under the text) is grabbable, not
+        // just the rim.
         root.child(
             div()
                 .absolute()
@@ -712,6 +763,17 @@ impl Render for FloatingView {
                 .flex_col()
                 .items_center()
                 .justify_center()
+                .gap_1()
+                .child(
+                    // The scope the number was aggregated over. Dimmer and
+                    // smaller than the count, but always present: the ball is
+                    // driven by the dashboard's active tab, so the same digits
+                    // can mean "today" or "this year".
+                    div()
+                        .text_color(WHITE.opacity(0.72))
+                        .text_size(px(label_fs))
+                        .child(period),
+                )
                 .child(
                     div()
                         .text_color(WHITE)
@@ -1018,24 +1080,71 @@ mod tests {
     }
 
     /// The text must also fit *vertically* inside the ball: the ball only
-    /// guarantees an inscribed square, so a `NUM_CAP_RATIO` big enough to make
-    /// the line box taller than that square would bulge past the rim even though
-    /// the string is narrow enough. (A second, cost line used to share this
-    /// budget; the ball now shows the token count only.)
+    /// guarantees an inscribed square, so a font big enough to make the line
+    /// boxes taller than that square would bulge past the rim even though each
+    /// string is narrow enough. Guards the label + count stack and the gap
+    /// between them. (Both sizes are taken at their *caps*, which bounds the
+    /// real, width-fitted sizes from above.)
     #[test]
-    fn count_line_fits_vertically() {
+    fn two_line_stack_fits_vertically() {
         for win in WINDOWS {
             let sphere = sphere_diameter_for(999_999_999, false)
                 .min(win * MAX_BALL_FRACTION)
                 .min(max_sphere_for_window(win));
-            let line = sphere * NUM_CAP_RATIO;
-            // The line box is ~1.3x the font size.
-            let height = line * 1.3;
+            let num = sphere * NUM_CAP_RATIO;
+            let label = (num * LABEL_OF_NUM).min(sphere * LABEL_CAP_RATIO);
+            // Line boxes at ~1.3x the font size, plus the 4px gap of `gap_1`.
+            let height = num * 1.3 + label * 1.3 + 4.0;
             let budget = text_budget_side(sphere) * std::f32::consts::SQRT_2;
             assert!(
                 height <= budget + 0.01,
-                "the count line is {height}px tall in a {sphere}px ball (budget {budget})"
+                "the label+count stack is {height}px tall in a {sphere}px ball (budget {budget})"
             );
+        }
+    }
+
+    /// **The period label.** The ball shows the tab its number came from, so the
+    /// digits can no longer silently change meaning with the dashboard tab. Two
+    /// properties matter: the label must fit the ball's inscribed square like
+    /// everything else, and it must never come out larger than the count it
+    /// qualifies.
+    ///
+    /// Runs on the estimate path, which is what `fit_font_size` falls back to
+    /// before the text system is ready — and which is only conservative if a CJK
+    /// glyph counts as a full em, so gauge that too.
+    #[test]
+    fn period_label_fits_and_stays_under_the_count() {
+        let tokens = format_int_grouped(999_999_999);
+        for win in WINDOWS {
+            let sphere = sphere_diameter_for(999_999_999, false)
+                .min(win * MAX_BALL_FRACTION)
+                .min(max_sphere_for_window(win));
+            let budget = text_budget_side(sphere);
+            let cap = sphere * NUM_CAP_RATIO;
+            let probe = FIT_PROBE_PX.min(cap);
+            let fs = fit_size_from_probe(estimated_em(&tokens) * probe, probe, budget, cap);
+            assert!(fs > 0.0, "the count vanished in a {sphere}px ball");
+            let label_cap = (fs * LABEL_OF_NUM).min(sphere * LABEL_CAP_RATIO);
+            for tab in TimeTab::ALL {
+                let label = tab.label();
+                // Near-square: an estimate below one em per glyph is unsafe.
+                assert!(
+                    estimated_em(label) >= label.chars().count() as f32 * 0.9,
+                    "{label} is estimated too narrow to be safe"
+                );
+                let lp = FIT_PROBE_PX.min(label_cap);
+                let lfs = fit_size_from_probe(estimated_em(label) * lp, lp, budget, label_cap);
+                assert!(lfs > 0.0, "{label} vanished in a {sphere}px ball");
+                assert!(
+                    estimated_em(label) * lfs <= budget + 0.01,
+                    "{label} would be {}px wide (budget {budget})",
+                    estimated_em(label) * lfs
+                );
+                assert!(
+                    lfs <= fs + 0.01,
+                    "{label} ({lfs}px) outgrew the count ({fs}px) in a {sphere}px ball"
+                );
+            }
         }
     }
 

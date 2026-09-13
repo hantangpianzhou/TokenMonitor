@@ -547,6 +547,11 @@ impl TokenMonitorApp {
             self.state.last_error = Some(error);
         }
         // Keep the floating usage ball in sync with the dashboard summary.
+        // The ball is labelled with the period the total was aggregated over —
+        // taken from `snap.time_tab`, the tab this snapshot was *computed* for,
+        // not the live `state.time_tab`, which may already have changed while
+        // the request was in flight. Pairing them in one call is what keeps the
+        // label from ever describing a different period than the number.
         #[cfg(target_os = "windows")]
         if let Some(f) = &self.floating {
             if let Some(f) = f.upgrade() {
@@ -555,8 +560,9 @@ impl TokenMonitorApp {
                         + s.output_tokens
                         + s.cache_read_tokens
                         + s.cache_write_tokens;
+                    let time_tab = snap.time_tab;
                     f.update(cx, |view, cx| {
-                        view.set_total_tokens(total);
+                        view.set_usage(total, time_tab);
                         cx.notify();
                     });
                 }
