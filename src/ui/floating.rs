@@ -589,25 +589,21 @@ impl Render for FloatingView {
             .id("floating-root")
             .size_full()
             .relative()
-            // The ball is dragged with the native pointer by the Win32 subclass in
-            // `platform::windows::mod`. We deliberately do **not** use GPUI's
-            // `WindowControlArea::Drag`: it makes GPUI's hit test answer `HTCAPTION`
-            // over the ball (`crates/gpui_windows/src/events.rs:955`), which routes
-            // the press through `WM_NCLBUTTONDOWN` and the OS *non-client* drag loop.
-            // That loop is what flashed the black square earlier (a transparent
-            // frameless window has no visible caption to drag, so the OS paints the
-            // square drag outline), and — worse — while it is active the OS delivers
-            // `WM_NCMOUSEMOVE` (0x00A0), not `WM_MOUSEMOVE`, during the drag. A custom
-            // `SetCapture` + `SetWindowPos` tracker keyed only on `WM_MOUSEMOVE`
-            // therefore never sees a move and the ball will not budge.
+            // The ball is dragged with the native pointer entirely by the Win32
+            // subclass in `platform::windows::mod`, which answers `WM_NCHITTEST`
+            // with `HTCAPTION` itself. So we deliberately use **no**
+            // `WindowControlArea::Drag` here: relying on GPUI's control area made
+            // the press go through the OS *non-client* caption loop (black square
+            // on this transparent frameless window) and left the drag broken,
+            // because during that loop the OS sends `WM_NCMOUSEMOVE`, not
+            // `WM_MOUSEMOVE`, which the tracker did not handle. Owning the hit test
+            // in the subclass keeps the whole interaction in one place and off
+            // GPUI's message plumbing.
             //
-            // Without `Drag` the ball hit-tests as a normal client area (`HTCLIENT`),
-            // so a press arrives as `WM_LBUTTONDOWN` and the standard
-            // `SetCapture` → `WM_MOUSEMOVE` → `SetWindowPos` tracker runs on its
-            // reliable, well-supported code path. Clicks outside the circular region
-            // still pass through to the desktop because of `SetWindowRgn` + the
-            // transparent window style (the 360 / Thunder look); `HTCLIENT` only
-            // governs hits *inside* the region, which is exactly the ball.
+            // Clicks outside the circular region still pass through to the desktop
+            // because of `SetWindowRgn` + the transparent window style (the 360 /
+            // Thunder look); only hits *inside* the region reach the window, and
+            // those are exactly the ball.
             .on_hover(move |hovered, _win, app| {
                 me.update(app, |this, cx| {
                     this.hovered = *hovered;

@@ -1,5 +1,6 @@
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -186,31 +187,30 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
 
 // ── Custom drag via Win32 subclass ───────────────────────────────────────────
 //
-// The ball is dragged by a Win32 subclass on the ball HWND, paired with the
-// root div in `ui::floating` *not* using GPUI's `WindowControlArea::Drag`. The
-// reason is the message path:
+// The ball is dragged by a Win32 subclass on the ball HWND. The subclass owns the
+// whole interaction, so it does not depend on GPUI's `WindowControlArea::Drag` or
+// on the ball's client area being hit-testable:
 //
-// * With `WindowControlArea::Drag`, GPUI's hit test answers `HTCAPTION` over the
-//   ball (`crates/gpui_windows/src/events.rs:955`). That routes the press through
-//   `WM_NCLBUTTONDOWN` and the OS *non-client* drag loop — which both flashes the
-//   black square (a transparent frameless window has no visible caption to drag)
-//   and, while active, delivers `WM_NCMOUSEMOVE` (0x00A0) instead of `WM_MOUSEMOVE`
-//   during the drag. A `SetCapture` + `SetWindowPos` tracker keyed only on
-//   `WM_MOUSEMOVE` then sees no move and the ball never moves.
-// * Without `Drag`, the ball hit-tests as a normal client area (`HTCLIENT`), so a
-//   press arrives as `WM_LBUTTONDOWN` and the standard `SetCapture` →
-//   `WM_MOUSEMOVE` → `SetWindowPos` tracker runs on its reliable, well-supported
-//   path. This is the primary path the subclass is written for.
-//
-// The subclass still also accepts the non-client variants (`WM_NCLBUTTONDOWN`,
-// `WM_NCMOUSEMOVE`, `WM_NCLBUTTONUP`) as a belt-and-suspenders fallback, so the
-// drag works even if GPUI ever answers `HTCAPTION` again.
-//
-// On press it calls `SetCapture` and records the cursor→window offset. From then
-// on every `WM_MOUSEMOVE` (or `WM_NCMOUSEMOVE`, routed to the captured window even
-// after the cursor leaves the ball) relocates the window with `SetWindowPos`;
-// `WM_LBUTTONUP` releases the capture. The press is swallowed (return 0) so the OS
-// caption-move loop never runs — no black square.
+// 1. `WM_NCHITTEST` → the subclass answers `HTCAPTION` for every point. Every
+//    point the OS can hit is inside the circular window region (see
+//    `set_window_circle_region`), i.e. the ball, so an unconditional `HTCAPTION`
+//    is correct — clicks outside the circle never reach this window at all. This
+//    forces the OS to route a press as a **non-client** `WM_NCLBUTTONDOWN`
+//    instead of a client `WM_LBUTTONDOWN`. That non-client path is the one we
+//    could prove reaches the window on this transparent popup; the client path
+//    is not relied on.
+// 2. On `WM_NCLBUTTONDOWN` (or the client `WM_LBUTTONDOWN` fallback) the subclass
+//    calls `SetCapture`, records the cursor→window offset, and **swallows** the
+//    message (`return 0`). Swallowing is what stops `DefWindowProc` from starting
+//    the OS caption-move loop — that loop, on a transparent frameless window with
+//    no visible caption, is what flashed the black square.
+// 3. From then on the OS delivers move messages to the captured window — as
+//    `WM_NCMOUSEMOVE` while it stays in non-client mode, or `WM_MOUSEMOVE` once it
+//    crosses into the client area. The subclass handles **both** and relocates the
+//    window with `SetWindowPos`, so the ball follows the cursor. (Handling only one
+//    of the two is what made earlier attempts look "stuck": the drag began on the
+//    non-client path, so every move arrived as `WM_NCMOUSEMOVE`.)
+// 4. `WM_NCLBUTTONUP` / `WM_LBUTTONUP` release the capture.
 //
 // `SetWindowSubclass` (not `SetWindowLongPtrW`) composes with GPUI's own window
 // proc instead of replacing it, so the window keeps receiving every other
@@ -245,12 +245,16 @@ struct Point {
     y: i32,
 }
 
+const WM_NCHITTEST: u32 = 0x0084;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 const WM_NCLBUTTONUP: u32 = 0x00A2;
 const WM_NCMOUSEMOVE: u32 = 0x00A0;
+/// `HTCAPTION` (2): the hit-test answer that makes the OS treat a press as a
+/// non-client caption press, delivering `WM_NCLBUTTONDOWN`.
+const HTCAPTION: isize = 2;
 const SWP_NOZORDER: u32 = 0x0002;
 const SWP_NOACTIVATE: u32 = 0x0010;
 /// Unique id for this subclass (arbitrary; just must not collide with GPUI's
@@ -268,6 +272,34 @@ static DRAGGING: OnceLock<Mutex<bool>> = OnceLock::new();
 /// (comctl32 subclasses are uninitialised until then on some Windows builds).
 static COMCTL_INIT: OnceLock<()> = OnceLock::new();
 
+/// Diagnostics: the drag is easy to get subtly wrong on this transparent popup,
+/// so the subclass records — once per process, to
+/// `%APPDATA%\TokenMonitor\ball-drag.log` — which message types it actually saw
+/// and the result of `SetWindowSubclass`. That turns a future "still can't
+/// drag" into a one-line fact instead of another guess. Bounded: at most one
+/// line per distinct message type. Truncated on each install.
+static SEEN_MSGS: AtomicU32 = AtomicU32::new(0);
+
+fn drag_log_path() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("TokenMonitor").join("ball-drag.log"))
+}
+
+/// Append `line`, but only the first time `bit` is observed this run.
+fn note_msg(bit: u32, line: &str) {
+    if SEEN_MSGS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        if let Some(path) = drag_log_path() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn ball_drag_subclass(
     hwnd: isize,
     msg: u32,
@@ -277,14 +309,34 @@ unsafe extern "system" fn ball_drag_subclass(
     _dw_ref_data: usize,
 ) -> isize {
     match msg {
+        WM_NCHITTEST => {
+            // Answer `HTCAPTION` so the OS routes a press here as a non-client
+            // `WM_NCLBUTTONDOWN`. Every hit-testable point of this window is
+            // inside the circular region (the ball), so this is unconditional.
+            // This is the reliable way to make the press reach the window on
+            // this transparent popup; it does not depend on GPUI's control areas.
+            note_msg(1 << 0, "seen: WM_NCHITTEST -> HTCAPTION");
+            return HTCAPTION;
+        }
         WM_NCLBUTTONDOWN | WM_LBUTTONDOWN => {
-            // Begin a drag. The client-space form `WM_LBUTTONDOWN` is the primary
-            // path (the ball hit-tests as `HTCLIENT` since `ui::floating` no longer
-            // uses `WindowControlArea::Drag`); `WM_NCLBUTTONDOWN` is the non-client
-            // form kept as a fallback. We capture the pointer so every later move
-            // message (`WM_MOUSEMOVE` or the non-client `WM_NCMOUSEMOVE`) is routed
-            // to this window even after the cursor leaves the ball, and record the
-            // grab offset so the ball does not jump under the cursor.
+            // Begin a drag. `WM_NCLBUTTONDOWN` is the normal path (we answered
+            // `HTCAPTION` above); the client `WM_LBUTTONDOWN` is kept as a
+            // fallback. Capture the pointer so every later move message
+            // (`WM_NCMOUSEMOVE` or `WM_MOUSEMOVE`) is routed to this window even
+            // after the cursor leaves the ball, and record the grab offset so the
+            // ball does not jump under the cursor.
+            note_msg(
+                if msg == WM_NCLBUTTONDOWN {
+                    1 << 1
+                } else {
+                    1 << 2
+                },
+                if msg == WM_NCLBUTTONDOWN {
+                    "seen: WM_NCLBUTTONDOWN"
+                } else {
+                    "seen: WM_LBUTTONDOWN"
+                },
+            );
             let mut pt = Point { x: 0, y: 0 };
             let mut rc = Rect {
                 left: 0,
@@ -305,6 +357,18 @@ unsafe extern "system" fn ball_drag_subclass(
             return 0;
         }
         WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
+            note_msg(
+                if msg == WM_NCMOUSEMOVE {
+                    1 << 3
+                } else {
+                    1 << 4
+                },
+                if msg == WM_NCMOUSEMOVE {
+                    "seen: WM_NCMOUSEMOVE"
+                } else {
+                    "seen: WM_MOUSEMOVE"
+                },
+            );
             if *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() {
                 let mut pt = Point { x: 0, y: 0 };
                 if GetCursorPos(&mut pt) != 0 {
@@ -328,6 +392,18 @@ unsafe extern "system" fn ball_drag_subclass(
             }
         }
         WM_LBUTTONUP | WM_NCLBUTTONUP => {
+            note_msg(
+                if msg == WM_NCLBUTTONUP {
+                    1 << 5
+                } else {
+                    1 << 6
+                },
+                if msg == WM_NCLBUTTONUP {
+                    "seen: WM_NCLBUTTONUP"
+                } else {
+                    "seen: WM_LBUTTONUP"
+                },
+            );
             if *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() {
                 *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() = false;
                 ReleaseCapture();
@@ -358,9 +434,16 @@ pub fn install_ball_drag(hwnd: isize) {
         return;
     }
     COMCTL_INIT.get_or_init(|| unsafe { InitCommonControls() });
-    unsafe {
-        SetWindowSubclass(hwnd, ball_drag_subclass as *const (), DRAG_SUBCLASS_ID, 0);
+    let ok =
+        unsafe { SetWindowSubclass(hwnd, ball_drag_subclass as *const (), DRAG_SUBCLASS_ID, 0) };
+    // Fresh log per install: makes a later failure diagnosable at a glance.
+    if let Some(path) = drag_log_path() {
+        let _ = std::fs::write(
+            path,
+            format!("install: hwnd={hwnd:#x} SetWindowSubclass returned {ok}\n"),
+        );
     }
+    SEEN_MSGS.store(0, Ordering::Relaxed);
 }
 
 /// Whether `hwnd` still refers to a live window. Used by the show/hide toggle so
