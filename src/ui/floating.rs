@@ -5,8 +5,8 @@
 //! via `SetWindowRgn` — so there is no square OS frame or rectangular shadow,
 //! and clicks outside the ball pass through to the desktop (the 360 / Thunder
 //! style). Its diameter grows with total token usage (area ∝ usage) and it
-//! pops slightly on hover for a floating feel. The full token count and cost
-//! are overlaid on the sphere; data is pushed from `TokenMonitorApp`.
+//! pops slightly on hover for a floating feel. The total token count is
+//! overlaid on the sphere; data is pushed from `TokenMonitorApp`.
 //!
 //! The ball is drawn in code (not a PNG) so the color always follows the
 //! theme. A linear gradient + a gradient sheen + a small specular dot give it
@@ -84,7 +84,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::format::{format_cost_usd, format_int_grouped};
+use crate::format::format_int_grouped;
 use crate::platform::{client_size_logical, set_window_circle_region};
 
 /// Nominal edge length of the square transparent window that hosts the ball.
@@ -173,8 +173,6 @@ const SPECULARS: [(f32, f32, f32, f32); 2] =
 const TEXT_BOX_FRACTION: f32 = 0.92;
 /// Ceiling on the number's font size, as a fraction of the ball diameter.
 const NUM_CAP_RATIO: f32 = 0.26;
-/// Ceiling on the cost line's font size, as a fraction of the ball diameter.
-const COST_CAP_RATIO: f32 = 0.13;
 /// Font size used to *probe* a string's width before scaling it to fit. Any
 /// value works (width is proportional to size); 20px keeps rounding small.
 const FIT_PROBE_PX: f32 = 20.0;
@@ -465,16 +463,14 @@ fn region_moved(prev: (f32, f32), next: (f32, f32)) -> bool {
 pub struct FloatingView {
     hwnd: isize,
     total_tokens: u64,
-    cost_micros: u64,
     hovered: bool,
     /// Last `(clip_diameter, window_size)` handed to `SetWindowRgn`. Re-applying
     /// an identical region forces the OS to recompute and repaint the whole
     /// window for nothing — and a needless re-cut of the rim can flicker — so the
     /// region is only pushed when the geometry actually moved.
     last_region: (f32, f32),
-    /// Cached fit of the token count / cost strings.
+    /// Cached fit of the token-count string.
     num_fit: Option<TextFit>,
-    cost_fit: Option<TextFit>,
 }
 
 impl FloatingView {
@@ -482,11 +478,9 @@ impl FloatingView {
         Self {
             hwnd: hwnd_of(window),
             total_tokens: 0,
-            cost_micros: 0,
             hovered: false,
             last_region: (0.0, 0.0),
             num_fit: None,
-            cost_fit: None,
         }
     }
 
@@ -495,10 +489,9 @@ impl FloatingView {
         sphere_diameter_for(self.total_tokens, self.hovered)
     }
 
-    /// Push the latest totals (called from `TokenMonitorApp` on every scan).
-    pub fn set_totals(&mut self, total_tokens: u64, cost_micros: u64) {
+    /// Push the latest usage (called from `TokenMonitorApp` on every scan).
+    pub fn set_total_tokens(&mut self, total_tokens: u64) {
         self.total_tokens = total_tokens;
-        self.cost_micros = cost_micros;
     }
 
     /// Font size (px) that keeps `text` inside the ball, cached per string and
@@ -588,10 +581,9 @@ impl Render for FloatingView {
         }
 
         let tokens = format_int_grouped(self.total_tokens);
-        let cost = format_cost_usd(self.cost_micros);
-        // Fit both strings to the ball's inscribed square, so an ever-growing
-        // count (0 → 999,999,999 and past it) can never run into the rim and
-        // stop the whole thing reading as a circle.
+        // Fit the count to the ball's inscribed square, so an ever-growing number
+        // (0 → 999,999,999 and past it) can never run into the rim and stop the
+        // whole thing reading as a circle.
         let budget = text_budget_side(sphere_d);
         let fs = Self::fitted_size(
             &mut self.num_fit,
@@ -600,14 +592,6 @@ impl Render for FloatingView {
             budget,
             sphere_d * NUM_CAP_RATIO,
             FontWeight::SEMIBOLD,
-        );
-        let cost_fs = Self::fitted_size(
-            &mut self.cost_fit,
-            window,
-            &cost,
-            budget,
-            sphere_d * COST_CAP_RATIO,
-            FontWeight::NORMAL,
         );
 
         let mut root = div()
@@ -713,9 +697,9 @@ impl Render for FloatingView {
                 .border_color(WHITE.opacity(RIM_ALPHA)),
         );
 
-        // --- 2. Overlaid number + cost, centred in the same box as the ball.
+        // --- 2. The overlaid token count, centred in the same box as the ball.
         // A flex row would fight the absolute layers, so this is one absolutely
-        // positioned column sized to the ball. It is also a drag handle so the
+        // positioned box sized to the ball. It is also a drag handle so the
         // centre of the ball (under the text) is grabbable, not just the rim.
         root.child(
             div()
@@ -728,19 +712,12 @@ impl Render for FloatingView {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap_1()
                 .child(
                     div()
                         .text_color(WHITE)
                         .text_size(px(fs))
                         .font_semibold()
                         .child(tokens),
-                )
-                .child(
-                    div()
-                        .text_color(WHITE.opacity(0.82))
-                        .text_size(px(cost_fs))
-                        .child(cost),
                 ),
         )
     }
@@ -1040,22 +1017,24 @@ mod tests {
         }
     }
 
-    /// Number + cost must also fit *vertically* inside the ball, or the two-line
-    /// stack would bulge past the rim even with each line narrow enough.
+    /// The text must also fit *vertically* inside the ball: the ball only
+    /// guarantees an inscribed square, so a `NUM_CAP_RATIO` big enough to make
+    /// the line box taller than that square would bulge past the rim even though
+    /// the string is narrow enough. (A second, cost line used to share this
+    /// budget; the ball now shows the token count only.)
     #[test]
-    fn two_line_stack_fits_vertically() {
+    fn count_line_fits_vertically() {
         for win in WINDOWS {
             let sphere = sphere_diameter_for(999_999_999, false)
                 .min(win * MAX_BALL_FRACTION)
                 .min(max_sphere_for_window(win));
-            let num = sphere * NUM_CAP_RATIO;
-            let cost = sphere * COST_CAP_RATIO;
-            // Line boxes at ~1.3x the font size, plus the 4px gap of `gap_1`.
-            let height = num * 1.3 + cost * 1.3 + 4.0;
+            let line = sphere * NUM_CAP_RATIO;
+            // The line box is ~1.3x the font size.
+            let height = line * 1.3;
             let budget = text_budget_side(sphere) * std::f32::consts::SQRT_2;
             assert!(
                 height <= budget + 0.01,
-                "two lines are {height}px tall in a {sphere}px ball (budget {budget})"
+                "the count line is {height}px tall in a {sphere}px ball (budget {budget})"
             );
         }
     }

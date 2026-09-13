@@ -556,7 +556,7 @@ impl TokenMonitorApp {
                         + s.cache_read_tokens
                         + s.cache_write_tokens;
                     f.update(cx, |view, cx| {
-                        view.set_totals(total, s.cost_micros);
+                        view.set_total_tokens(total);
                         cx.notify();
                     });
                 }
