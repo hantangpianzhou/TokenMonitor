@@ -244,8 +244,19 @@ fn dot_is_inside_disc(cx: f32, cy: f32, r: f32) -> bool {
     (dx * dx + dy * dy).sqrt() + r <= 0.5
 }
 
-/// One specular highlight as `(left, top, diameter)` in px for a ball of
-/// `sphere_d` px, from a `(center_x, center_y, radius)` fraction triple.
+/// One specular highlight as `(left, top, diameter)` in **window** px, for a ball
+/// of `sphere_d` px whose box starts at `(ball_x, ball_y)`, from a
+/// `(center_x, center_y, radius)` fraction triple.
+///
+/// The ball box offset is added **here**, and the result is an absolute window
+/// position. That is deliberate: a specular is positioned from the ball's own
+/// fractions, which are relative to the ball's box — not to the window. Returning
+/// ball-relative numbers and placing them with `left`/`top` (as this used to)
+/// draws the highlights wherever the ball box *starts*, i.e. in the window's
+/// top-left corner, off the ball entirely. The two stray white discs the user saw
+/// in that corner were exactly these two highlights (their composited alphas were
+/// measurable as 0.582 / 0.342, matching `SPECULARS`' 0.58 / 0.34). Folding the
+/// offset into the geometry makes forgetting it impossible.
 ///
 /// A specular is the **only** layer that is not a copy of the ball's own circle,
 /// so it is the only one that could break the silhouette. If a constant were
@@ -253,7 +264,12 @@ fn dot_is_inside_disc(cx: f32, cy: f32, r: f32) -> bool {
 /// along its own offset vector until the highlight fits inside the inscribed
 /// circle — so a bad constant degrades into a highlight in a different spot,
 /// never into a teardrop ball.
-fn specular_geometry(sphere_d: f32, spec: (f32, f32, f32)) -> (f32, f32, f32) {
+fn specular_geometry(
+    ball_x: f32,
+    ball_y: f32,
+    sphere_d: f32,
+    spec: (f32, f32, f32),
+) -> (f32, f32, f32) {
     let (cx, cy, r) = spec;
     let (mut dx, mut dy) = (cx - 0.5, cy - 0.5);
     if !dot_is_inside_disc(cx, cy, r) {
@@ -267,8 +283,8 @@ fn specular_geometry(sphere_d: f32, spec: (f32, f32, f32)) -> (f32, f32, f32) {
     }
     let d = sphere_d * r * 2.0;
     (
-        sphere_d * (0.5 + dx) - d / 2.0,
-        sphere_d * (0.5 + dy) - d / 2.0,
+        ball_x + sphere_d * (0.5 + dx) - d / 2.0,
+        ball_y + sphere_d * (0.5 + dy) - d / 2.0,
         d,
     )
 }
@@ -545,9 +561,9 @@ impl Render for FloatingView {
 
         // Centre on each axis independently, so a client area that is not
         // exactly square still keeps every layer concentric.
-        let (ball_x, ball_y, _) = ball_box(win_w, win_h, sphere_d);
-        let ball_x = px(ball_x);
-        let ball_y = px(ball_y);
+        let (ball_left, ball_top, _) = ball_box(win_w, win_h, sphere_d);
+        let ball_x = px(ball_left);
+        let ball_y = px(ball_top);
 
         // Clip the window to a circle concentric with the ball: kills the square
         // frame / shadow and lets desktop clicks pass through outside the ball.
@@ -665,7 +681,8 @@ impl Render for FloatingView {
                 gpui::linear_color_stop(WHITE.opacity(0.0), 1.0),
             )));
         for (i, &(cx, cy, r, alpha)) in SPECULARS.iter().enumerate() {
-            let (dot_x, dot_y, dot_d) = specular_geometry(sphere_d, (cx, cy, r));
+            let (dot_x, dot_y, dot_d) =
+                specular_geometry(ball_left, ball_top, sphere_d, (cx, cy, r));
             root = root.child(
                 div()
                     .id(("specular", i))
@@ -810,29 +827,46 @@ mod tests {
         assert!(!dot_is_inside_disc(0.60, 0.74, 0.30));
     }
 
-    /// The specular helper must never place a highlight outside the ball, for
-    /// any ball size.
+    /// **The stray-white-disc regression.** A specular is positioned from the
+    /// ball's own fractions, so its box has to be offset by the ball box origin.
+    /// Using those ball-relative numbers directly as window positions drew both
+    /// highlights in the window's top-left corner, off the ball — the two grey
+    /// discs the user saw there. For every window × ball size the result must
+    /// therefore be a box *on the ball*, inside the inscribed circle, and inside
+    /// the window.
     #[test]
     fn specular_geometry_never_escapes_the_ball() {
-        for sphere in [
-            MIN_SPHERE,
-            150.0,
-            200.0,
-            MAX_SPHERE,
-            MAX_SPHERE * HOVER_SCALE,
-        ] {
-            for &(cx, cy, r, _) in SPECULARS.iter() {
-                let (left, top, d) = specular_geometry(sphere, (cx, cy, r));
-                let r_px = d / 2.0;
-                let dist = ((left + r_px - sphere / 2.0).powi(2)
-                    + (top + r_px - sphere / 2.0).powi(2))
-                .sqrt();
-                assert!(
-                    dist + r_px <= sphere / 2.0 + 0.01,
-                    "specular escapes: ball {sphere}, dot r {r_px} at dist {dist}"
-                );
-                assert!(left >= 0.0 && top >= 0.0, "dot must stay in the ball's box");
-                assert!(left + d <= sphere && top + d <= sphere);
+        for win in WINDOWS {
+            for raw in [
+                MIN_SPHERE,
+                150.0,
+                200.0,
+                MAX_SPHERE,
+                MAX_SPHERE * HOVER_SCALE,
+            ] {
+                let sphere = raw
+                    .min(win * MAX_BALL_FRACTION)
+                    .min(max_sphere_for_window(win));
+                let (bx, by, _) = ball_box(win, win, sphere);
+                for &(cx, cy, r, _) in SPECULARS.iter() {
+                    let (left, top, d) = specular_geometry(bx, by, sphere, (cx, cy, r));
+                    let r_px = d / 2.0;
+                    let dist = ((left + r_px - (bx + sphere / 2.0)).powi(2)
+                        + (top + r_px - (by + sphere / 2.0)).powi(2))
+                    .sqrt();
+                    assert!(
+                        dist + r_px <= sphere / 2.0 + 0.01,
+                        "specular escapes: ball {sphere} at ({bx},{by}), \
+                         dot r {r_px} at dist {dist}"
+                    );
+                    // Drawn *over the ball*, never at the window's origin.
+                    assert!(
+                        left >= bx && top >= by,
+                        "specular ({left},{top}) is off the ball box ({bx},{by}, d={sphere})"
+                    );
+                    assert!(left + d <= bx + sphere && top + d <= by + sphere);
+                    assert!(left + d <= win && top + d <= win);
+                }
             }
         }
     }
