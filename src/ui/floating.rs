@@ -93,19 +93,20 @@ use crate::platform::{client_size_logical, set_window_circle_region};
 /// placement always follows the measured client rect.
 const WINDOW_SIZE: f32 = 360.0;
 /// **Solid-ball** diameter at zero usage (px). Deliberately an explicit
-/// minimum: the ball stays a large, legible circle at zero usage instead of
-/// shrinking until the halo and the overlay text dominate its silhouette.
-const MIN_SPHERE: f32 = 128.0;
+/// minimum: the resting ball keeps a legible, unmistakably-round silhouette
+/// instead of shrinking until the halo and the overlay text dominate it.
+/// `ball_is_large_at_every_usage` guards the floor, so it only moves when the
+/// ball is deliberately resized — never as a side effect of another tweak.
+const MIN_SPHERE: f32 = 112.0;
 /// **Solid-ball** diameter at / above the reference usage (px).
 ///
-/// Both ends of the ramp were scaled down together (144→128, 232→200, ~0.86×)
-/// after the ball read as oversized on the desktop: at a mid-range usage it was
-/// a ~180 px disc of always-on-top glass carrying two short lines of text, i.e.
-/// mostly empty. Scaling both constants by one factor keeps `sphere_diameter_
-/// for`'s shape — the sqrt ramp, the hover pop and the ball's proportions — so
-/// only its size on screen changed, and the whole widget's clip circle shrank
-/// with it (`clip_diameter_for` is derived from the ball).
-const MAX_SPHERE: f32 = 200.0;
+/// A matched pair with `MIN_SPHERE`: whenever the ball's size is reviewed, *both*
+/// ends are scaled by one factor — 144/232 → 128/200 → 112/175 so far. Scaling
+/// both keeps `sphere_diameter_for`'s shape (the sqrt ramp, the hover pop, the
+/// ball's proportions), so a size tweak only changes how big the ball is, never
+/// how it grows with usage. `clip_diameter_for` is derived from the ball, so the
+/// whole widget's footprint follows the ball down.
+const MAX_SPHERE: f32 = 175.0;
 /// Ceiling on the ball as a fraction of the window's smaller side.
 const MAX_BALL_FRACTION: f32 = 0.70;
 /// Usage (tokens) at which the ball reaches its maximum diameter.
@@ -121,8 +122,8 @@ const CLIP_MARGIN: f32 = 4.0;
 const CLIP_PAD: f32 = 12.0;
 /// Blur radius of the glow, as a multiple of the ball diameter. This is the
 /// gaussian's σ, so it sets how far the glow reaches and how soft it is: at
-/// 0.085 a ball 200 px across carries a glow that is still worth 2% of its peak
-/// a good 34 px out.
+/// 0.085 a ball 175 px across carries a glow that is still worth 2% of its peak
+/// a good 30 px out.
 const GLOW_BLUR_RATIO: f32 = 0.085;
 /// How many σ of the glow tail count as visible. A gaussian has no finite
 /// support, but past ~2σ its alpha is under 2% of the peak, i.e. below one 8-bit
@@ -793,9 +794,11 @@ mod tests {
     /// the nominal window can host.
     #[test]
     fn ball_is_large_at_every_usage() {
+        // The resting ball's floor, as a named bound: a deliberate resize has to
+        // lower it on purpose rather than let the size drift past it.
         assert!(
-            MIN_SPHERE >= 128.0,
-            "the resting ball must stay comfortably large (got {MIN_SPHERE})"
+            MIN_SPHERE >= 110.0,
+            "the resting ball must stay big enough to read as a circle (got {MIN_SPHERE})"
         );
         assert!(MAX_SPHERE > MIN_SPHERE);
         for tokens in USAGES {
