@@ -79,7 +79,7 @@
 
 use gpui::{
     div, px, BoxShadow, Context, Font, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window,
+    ParentElement, Render, StatefulInteractiveElement, Styled, TextRun, Window, WindowControlArea,
 };
 use gpui_component::{ActiveTheme, StyledExt};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -589,18 +589,20 @@ impl Render for FloatingView {
             .id("floating-root")
             .size_full()
             .relative()
-            // The ball is dragged by a system-wide low-level mouse hook
-            // (`WH_MOUSE_LL`) installed in `platform::windows::mod`. This is
-            // necessary because the transparent popup has `WS_EX_NOREDIRECTIONBITMAP`
-            // set by GPUI, so the OS treats the whole window as `HTTRANSPARENT`
-            // and never delivers a mouse press to it — neither GPUI's
-            // `WindowControlArea::Drag` (it only yields `HTCAPTION` when
-            // `is_movable` is true, and this popup has `is_movable == false`) nor
-            // an in-window `WM_NCHITTEST` subclass can receive the click. The
-            // hook sees every mouse event globally, so it works regardless. It
-            // moves the window with `SetWindowPos` while the cursor is over the
-            // ball and swallows the event; clicks outside the ball pass through
-            // to the desktop (the 360 / Thunder style).
+            // Make the whole circular window a drag handle. `WindowControlArea::Drag`
+            // makes GPUI's hit test return `HTCAPTION` over the ball (our window
+            // uses the default `is_movable == true`, so `Drag` does yield
+            // `HTCAPTION` — confirmed in `crates/gpui_windows/src/events.rs:955`).
+            // `HTCAPTION` is what makes the OS deliver `WM_NCLBUTTONDOWN` to the
+            // window at all; without it the transparent window would be click-
+            // through. The actual move is then driven ourselves by the Win32
+            // subclass in `platform::windows::mod`, which intercepts that
+            // `WM_NCLBUTTONDOWN`, captures the pointer and tracks it with
+            // `SetWindowPos`, returning 0 so `DefWindowProc` never runs the OS
+            // caption-move loop (the black square we saw earlier). Clicks outside
+            // the circle have no control area, so they fall through to the
+            // desktop (the 360 / Thunder style).
+            .window_control_area(WindowControlArea::Drag)
             .on_hover(move |hovered, _win, app| {
                 me.update(app, |this, cx| {
                     this.hovered = *hovered;
