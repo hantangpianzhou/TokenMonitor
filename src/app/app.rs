@@ -267,6 +267,9 @@ impl TokenMonitorApp {
         }
 
         app.spawn_event_loop(cx);
+        // Install the accent before the first frame, so the very first paint is
+        // already correct instead of flashing gpui_component's Light default.
+        TokenMonitorApp::apply_theme(app.theme_color, cx);
         app.trigger_scan(cx); // initial auto-scan so data shows without manual action
         app.refresh_view(cx); // async: returns immediately, fills state in background
         app
@@ -304,8 +307,8 @@ impl TokenMonitorApp {
         cx.notify();
     }
 
-    /// Update the app accent theme color: persist it and re-render so the
-    /// dashboard highlights and charts pick up the new hue immediately.
+    /// Update the app accent theme color: persist it, push it into the global
+    /// theme, and repaint every window so the change is visible at once.
     pub fn select_theme_color(&mut self, color: ThemeColor, cx: &mut Context<Self>) {
         if self.theme_color == color {
             return;
@@ -314,6 +317,16 @@ impl TokenMonitorApp {
         if let Err(e) = self.collector.set_theme_color(color) {
             self.state.last_error = Some(format!("save theme color: {e}"));
         }
+        TokenMonitorApp::apply_theme(color, cx);
+        // A global mutation repaints nothing on its own. Notifying this root only
+        // dirties it and its ancestors, so the widget *views* nested inside it —
+        // the settings Select and friends, each an entity with its own cached
+        // prepaint — keep replaying their cached output in the old accent. That
+        // is why the change used to appear only after navigating away and back,
+        // which re-created them. Refreshing all windows forces one full
+        // re-render of every view in every window; the ball is a window of its
+        // own, so it is covered too.
+        cx.refresh_windows();
         cx.notify();
     }
 
@@ -685,8 +698,26 @@ impl Focusable for TokenMonitorApp {
     }
 }
 
-impl Render for TokenMonitorApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl TokenMonitorApp {
+    /// Push the app's accent `color` — and the dark surfaces it sits on — into
+    /// gpui_component's global `Theme`.
+    ///
+    /// Called at bootstrap and again whenever the accent changes, but
+    /// deliberately **not** as part of `render`:
+    ///
+    /// * `Theme::global_mut` queues a global-observer notification on every call,
+    ///   so writing the theme each frame is a standing request to repaint.
+    /// * Render is also too late for the views that own their own state. GPUI
+    ///   replays a child view's *cached* prepaint unless that view itself was
+    ///   notified or the whole window is refreshing (`ViewElement`'s cache in
+    ///   `crates/gpui/src/view.rs`), and `Window::mark_view_dirty` only dirties
+    ///   the ancestors of a notified view — never its descendants. Re-rendering
+    ///   this root alone therefore leaves every embedded widget view (the
+    ///   settings Select, the dropdowns) and the floating ball on the old hue.
+    ///
+    /// An associated function rather than a `&self` method so it can be exercised
+    /// without building the whole app, which owns a live database connection.
+    fn apply_theme(color: ThemeColor, cx: &mut App) {
         use gpui_component::{Theme, ThemeMode};
         if Theme::global(cx).mode != ThemeMode::Dark {
             Theme::change(ThemeMode::Dark, None, cx);
@@ -694,41 +725,62 @@ impl Render for TokenMonitorApp {
         // The default dark theme's surfaces are near-black (#0a0a0a). Lift the
         // main panels to a lighter slate so the app reads as dark-gray rather
         // than pure black.
-        {
-            let theme = Theme::global_mut(cx);
-            theme.background = ui::hsla_from_hex(0x1b1e24);
-            theme.secondary = ui::hsla_from_hex(0x262b33);
-            theme.muted = ui::hsla_from_hex(0x2a2f38);
-            theme.border = ui::hsla_from_hex(0x343a44);
-            // Floating popovers (Select dropdown, DatePicker) default to
-            // near-black too; lift them to the card surface so they sit above
-            // the panel without reading as a black void.
-            theme.tokens.popover = ui::hsla_from_hex(0x262b33).into();
-            // Segmented tab bars (dashboard time range, report filter) render
-            // their track and active pill from these tokens; both default to
-            // near-black, so lift them to the card/main background.
-            theme.tokens.tab_bar_segmented = ui::hsla_from_hex(0x262b33).into();
-            theme.tokens.background = ui::hsla_from_hex(0x1b1e24).into();
+        let theme = Theme::global_mut(cx);
+        theme.background = ui::hsla_from_hex(0x1b1e24);
+        theme.secondary = ui::hsla_from_hex(0x262b33);
+        theme.muted = ui::hsla_from_hex(0x2a2f38);
+        theme.border = ui::hsla_from_hex(0x343a44);
+        // Floating popovers (Select dropdown, DatePicker) default to near-black
+        // too; lift them to the card surface so they sit above the panel without
+        // reading as a black void.
+        theme.tokens.popover = ui::hsla_from_hex(0x262b33).into();
+        // Segmented tab bars (dashboard time range, report filter) render their
+        // track and active pill from these tokens; both default to near-black,
+        // so lift them to the card/main background.
+        theme.tokens.tab_bar_segmented = ui::hsla_from_hex(0x262b33).into();
+        theme.tokens.background = ui::hsla_from_hex(0x1b1e24).into();
 
-            // Apply the user's accent theme color to the primary/button/chart
-            // surfaces so the dashboard highlights, primary buttons, and chart
-            // series follow the selection.
-            let accent = ui::accent_color(self.theme_color);
-            let [c1, c2, c3, c4, c5] = ui::accent_palette(self.theme_color);
-            theme.primary = accent;
-            theme.primary_hover = accent.lighten(0.08);
-            theme.primary_active = accent.darken(0.08);
-            theme.button_primary = accent;
-            theme.button_primary_hover = accent.lighten(0.08);
-            theme.button_primary_active = accent.darken(0.08);
-            theme.ring = accent;
-            theme.blue = accent;
-            theme.blue_light = accent.lighten(0.2);
-            theme.chart_1 = c1;
-            theme.chart_2 = c2;
-            theme.chart_3 = c3;
-            theme.chart_4 = c4;
-            theme.chart_5 = c5;
+        // Apply the user's accent theme color to the primary/button/chart
+        // surfaces so the dashboard highlights, primary buttons, and chart
+        // series follow the selection. This must come *after* `Theme::change`,
+        // which re-applies the registry's default theme and would otherwise
+        // overwrite every one of these.
+        let accent = ui::accent_color(color);
+        let [c1, c2, c3, c4, c5] = ui::accent_palette(color);
+        theme.primary = accent;
+        theme.primary_hover = accent.lighten(0.08);
+        theme.primary_active = accent.darken(0.08);
+        theme.button_primary = accent;
+        theme.button_primary_hover = accent.lighten(0.08);
+        theme.button_primary_active = accent.darken(0.08);
+        theme.ring = accent;
+        theme.blue = accent;
+        theme.blue_light = accent.lighten(0.2);
+        theme.chart_1 = c1;
+        theme.chart_2 = c2;
+        theme.chart_3 = c3;
+        theme.chart_4 = c4;
+        theme.chart_5 = c5;
+    }
+}
+
+impl Render for TokenMonitorApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The theme is pushed by `apply_theme` — at bootstrap and on every accent
+        // change — rather than here; see its doc comment for why.
+        //
+        // What remains is a read-only staleness guard. Something can still reset
+        // the global behind our back: `gpui_component` boots at `ThemeMode::Light`
+        // and rewrites the entire theme whenever its registry changes. Comparing
+        // costs one global read, and the write only happens when the accent was
+        // actually lost, so this cannot become a per-frame mutation.
+        let theme_was_clobbered = {
+            use gpui_component::{Theme, ThemeMode};
+            let theme = Theme::global(cx);
+            theme.mode != ThemeMode::Dark || theme.primary != ui::accent_color(self.theme_color)
+        };
+        if theme_was_clobbered {
+            Self::apply_theme(self.theme_color, cx);
         }
 
         let p = crate::ui::palette(cx);
@@ -805,6 +857,55 @@ pub fn ensure_floating_window(cx: &mut App) {
             if let Some(app) = APP_WEAK.get().and_then(|w| w.upgrade()) {
                 app.update(cx, |app, _| app.floating = Some(entity.downgrade()));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use gpui_component::{Theme, ThemeMode};
+
+    /// The accent has to reach the **global** theme, because that is what every
+    /// widget paints from — setting `self.theme_color` alone changes nothing on
+    /// screen.
+    ///
+    /// This also pins the ordering inside `apply_theme`: `Theme::change`
+    /// re-applies the registry's default theme, which rewrites `primary`, the
+    /// button colours and all five chart colours, so the app's overrides are
+    /// only effective while they come *after* it. Moving that call down would
+    /// silently hand the whole app gpui_component's default blue.
+    #[gpui::test]
+    fn apply_theme_installs_the_accent_into_the_global_theme(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+
+        for color in ThemeColor::ALL {
+            cx.update(|cx| TokenMonitorApp::apply_theme(color, cx));
+            cx.update(|cx| {
+                let theme = Theme::global(cx);
+                let accent = ui::accent_color(color);
+                assert_eq!(theme.mode, ThemeMode::Dark, "the app always forces dark");
+                assert_eq!(theme.primary, accent, "{color:?}");
+                assert_eq!(theme.button_primary, accent, "{color:?}");
+                assert_eq!(theme.ring, accent, "{color:?}");
+                assert_eq!(theme.blue, accent, "{color:?}");
+                assert_eq!(
+                    [
+                        theme.chart_1,
+                        theme.chart_2,
+                        theme.chart_3,
+                        theme.chart_4,
+                        theme.chart_5
+                    ],
+                    ui::accent_palette(color),
+                    "{color:?}"
+                );
+                // The dark surface overrides have to survive too — they are what
+                // lifts the panels off gpui_component's near-black default.
+                assert_eq!(theme.background, ui::hsla_from_hex(0x1b1e24));
+                assert_eq!(theme.secondary, ui::hsla_from_hex(0x262b33));
+            });
         }
     }
 }
