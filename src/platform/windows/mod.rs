@@ -1,6 +1,5 @@
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -255,7 +254,12 @@ const WM_NCMOUSEMOVE: u32 = 0x00A0;
 /// `HTCAPTION` (2): the hit-test answer that makes the OS treat a press as a
 /// non-client caption press, delivering `WM_NCLBUTTONDOWN`.
 const HTCAPTION: isize = 2;
-const SWP_NOZORDER: u32 = 0x0002;
+/// `SWP_NOZORDER` is `0x0004`. Note `0x0002` is **`SWP_NOMOVE`** — using the
+/// wrong value here silently turns the drag into a no-op: `SetWindowPos` still
+/// succeeds and returns non-zero, but with `SWP_NOMOVE` set it ignores the x/y
+/// and the window never moves. That exact mistake is what made several earlier
+/// "the messages all arrive but the ball won't budge" attempts fail.
+const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 /// Unique id for this subclass (arbitrary; just must not collide with GPUI's
 /// own subclass ids).
@@ -272,34 +276,6 @@ static DRAGGING: OnceLock<Mutex<bool>> = OnceLock::new();
 /// (comctl32 subclasses are uninitialised until then on some Windows builds).
 static COMCTL_INIT: OnceLock<()> = OnceLock::new();
 
-/// Diagnostics: the drag is easy to get subtly wrong on this transparent popup,
-/// so the subclass records — once per process, to
-/// `%APPDATA%\TokenMonitor\ball-drag.log` — which message types it actually saw
-/// and the result of `SetWindowSubclass`. That turns a future "still can't
-/// drag" into a one-line fact instead of another guess. Bounded: at most one
-/// line per distinct message type. Truncated on each install.
-static SEEN_MSGS: AtomicU32 = AtomicU32::new(0);
-
-fn drag_log_path() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("TokenMonitor").join("ball-drag.log"))
-}
-
-/// Append `line`, but only the first time `bit` is observed this run.
-fn note_msg(bit: u32, line: &str) {
-    if SEEN_MSGS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-        if let Some(path) = drag_log_path() {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = writeln!(f, "{line}");
-            }
-        }
-    }
-}
-
 unsafe extern "system" fn ball_drag_subclass(
     hwnd: isize,
     msg: u32,
@@ -315,7 +291,6 @@ unsafe extern "system" fn ball_drag_subclass(
             // inside the circular region (the ball), so this is unconditional.
             // This is the reliable way to make the press reach the window on
             // this transparent popup; it does not depend on GPUI's control areas.
-            note_msg(1 << 0, "seen: WM_NCHITTEST -> HTCAPTION");
             return HTCAPTION;
         }
         WM_NCLBUTTONDOWN | WM_LBUTTONDOWN => {
@@ -325,18 +300,6 @@ unsafe extern "system" fn ball_drag_subclass(
             // (`WM_NCMOUSEMOVE` or `WM_MOUSEMOVE`) is routed to this window even
             // after the cursor leaves the ball, and record the grab offset so the
             // ball does not jump under the cursor.
-            note_msg(
-                if msg == WM_NCLBUTTONDOWN {
-                    1 << 1
-                } else {
-                    1 << 2
-                },
-                if msg == WM_NCLBUTTONDOWN {
-                    "seen: WM_NCLBUTTONDOWN"
-                } else {
-                    "seen: WM_LBUTTONDOWN"
-                },
-            );
             let mut pt = Point { x: 0, y: 0 };
             let mut rc = Rect {
                 left: 0,
@@ -357,18 +320,6 @@ unsafe extern "system" fn ball_drag_subclass(
             return 0;
         }
         WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
-            note_msg(
-                if msg == WM_NCMOUSEMOVE {
-                    1 << 3
-                } else {
-                    1 << 4
-                },
-                if msg == WM_NCMOUSEMOVE {
-                    "seen: WM_NCMOUSEMOVE"
-                } else {
-                    "seen: WM_MOUSEMOVE"
-                },
-            );
             if *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() {
                 let mut pt = Point { x: 0, y: 0 };
                 if GetCursorPos(&mut pt) != 0 {
@@ -377,8 +328,10 @@ unsafe extern "system" fn ball_drag_subclass(
                         .lock()
                         .unwrap();
                     // Move the whole window so the cursor stays on the same point
-                    // of the ball. `SWP_NOZORDER` keeps always-on-top;
-                    // `SWP_NOACTIVATE` avoids stealing focus mid-drag.
+                    // of the ball. `SWP_NOSIZE` keeps the size, `SWP_NOACTIVATE`
+                    // avoids stealing focus mid-drag. `SWP_NOZORDER` keeps
+                    // always-on-top — and its value must be `0x0004`: `0x0002`
+                    // is `SWP_NOMOVE`, which would make this call a silent no-op.
                     SetWindowPos(
                         hwnd,
                         0,
@@ -392,18 +345,6 @@ unsafe extern "system" fn ball_drag_subclass(
             }
         }
         WM_LBUTTONUP | WM_NCLBUTTONUP => {
-            note_msg(
-                if msg == WM_NCLBUTTONUP {
-                    1 << 5
-                } else {
-                    1 << 6
-                },
-                if msg == WM_NCLBUTTONUP {
-                    "seen: WM_NCLBUTTONUP"
-                } else {
-                    "seen: WM_LBUTTONUP"
-                },
-            );
             if *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() {
                 *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() = false;
                 ReleaseCapture();
@@ -434,16 +375,9 @@ pub fn install_ball_drag(hwnd: isize) {
         return;
     }
     COMCTL_INIT.get_or_init(|| unsafe { InitCommonControls() });
-    let ok =
-        unsafe { SetWindowSubclass(hwnd, ball_drag_subclass as *const (), DRAG_SUBCLASS_ID, 0) };
-    // Fresh log per install: makes a later failure diagnosable at a glance.
-    if let Some(path) = drag_log_path() {
-        let _ = std::fs::write(
-            path,
-            format!("install: hwnd={hwnd:#x} SetWindowSubclass returned {ok}\n"),
-        );
+    unsafe {
+        SetWindowSubclass(hwnd, ball_drag_subclass as *const (), DRAG_SUBCLASS_ID, 0);
     }
-    SEEN_MSGS.store(0, Ordering::Relaxed);
 }
 
 /// Whether `hwnd` still refers to a live window. Used by the show/hide toggle so
