@@ -95,9 +95,17 @@ const WINDOW_SIZE: f32 = 360.0;
 /// **Solid-ball** diameter at zero usage (px). Deliberately an explicit
 /// minimum: the ball stays a large, legible circle at zero usage instead of
 /// shrinking until the halo and the overlay text dominate its silhouette.
-const MIN_SPHERE: f32 = 144.0;
+const MIN_SPHERE: f32 = 128.0;
 /// **Solid-ball** diameter at / above the reference usage (px).
-const MAX_SPHERE: f32 = 232.0;
+///
+/// Both ends of the ramp were scaled down together (144→128, 232→200, ~0.86×)
+/// after the ball read as oversized on the desktop: at a mid-range usage it was
+/// a ~180 px disc of always-on-top glass carrying two short lines of text, i.e.
+/// mostly empty. Scaling both constants by one factor keeps `sphere_diameter_
+/// for`'s shape — the sqrt ramp, the hover pop and the ball's proportions — so
+/// only its size on screen changed, and the whole widget's clip circle shrank
+/// with it (`clip_diameter_for` is derived from the ball).
+const MAX_SPHERE: f32 = 200.0;
 /// Ceiling on the ball as a fraction of the window's smaller side.
 const MAX_BALL_FRACTION: f32 = 0.70;
 /// Usage (tokens) at which the ball reaches its maximum diameter.
@@ -113,8 +121,8 @@ const CLIP_MARGIN: f32 = 4.0;
 const CLIP_PAD: f32 = 12.0;
 /// Blur radius of the glow, as a multiple of the ball diameter. This is the
 /// gaussian's σ, so it sets how far the glow reaches and how soft it is: at
-/// 0.085 a ball 232 px across carries a glow that is still worth 2% of its peak
-/// a good 40 px out.
+/// 0.085 a ball 200 px across carries a glow that is still worth 2% of its peak
+/// a good 34 px out.
 const GLOW_BLUR_RATIO: f32 = 0.085;
 /// How many σ of the glow tail count as visible. A gaussian has no finite
 /// support, but past ~2σ its alpha is under 2% of the peak, i.e. below one 8-bit
