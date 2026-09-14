@@ -310,16 +310,40 @@ impl AtomCodeSource {
         let v: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("parse {:?}: {e}", path))?;
 
-        // The current AtomCode `.json` session format carries `messages` and a
-        // `turn_stats[]` with only an aggregate `total_tokens` (no per-call
-        // `model_usage`, no input/output/cache split). Its model name lives in
-        // the System prompt text, not a structured field — so it would otherwise
-        // collapse to "unknown". Detect and parse it on a separate path.
-        let looks_new = v.get("messages").is_some()
-            || v.get("turn_stats")
-                .and_then(|ts| ts.get(0))
-                .and_then(|t| t.get("total_tokens"))
-                .is_some();
+        // Route to the right parser. Prefer the rich per-call breakdown
+        // (`model_usage[].tokens{input,output,cached_input}`) whenever *any*
+        // turn carries one — that is the only place `cached_input` (缓存命中)
+        // lives.
+        //
+        // Why this guard matters: the current AtomCode `.meta` (observed as
+        // `"v": 1` in the wild) embeds BOTH a per-turn `total_tokens` aggregate
+        // AND a `model_usage[]` array with the real token split. The old
+        // heuristic keyed off `total_tokens` being present and routed such
+        // files into `parse_json_new`, which only reads the aggregate and so
+        // **dropped `cached_input` entirely** — cache hits were invisible. The
+        // aggregate `total_tokens` also proved *not* to be the sum of the call
+        // breakdown (e.g. 36857 vs input+output+cache ≈ 244k), so it must never
+        // stand in for `input_tokens` when the split exists. Genuinely
+        // aggregate-only files (legacy `.meta` without `model_usage`, and the
+        // true new `.json` session whose model name lives only in the System
+        // prompt) still fall through to `parse_json_new`.
+        let has_rich_breakdown = v
+            .get("turn_stats")
+            .and_then(|ts| ts.as_array())
+            .map(|arr| {
+                arr.iter().any(|t| {
+                    t.get("model_usage")
+                        .and_then(|m| m.as_array())
+                        .map_or(false, |a| !a.is_empty())
+                })
+            })
+            .unwrap_or(false);
+        let looks_new = !has_rich_breakdown
+            && (v.get("messages").is_some()
+                || v.get("turn_stats")
+                    .and_then(|ts| ts.get(0))
+                    .and_then(|t| t.get("total_tokens"))
+                    .is_some());
         if looks_new {
             return Self::parse_json_new(&raw, &v, path, root, emit);
         }
@@ -738,6 +762,65 @@ mod tests {
             1787100000000
         );
         assert_eq!(records[0].usage.cache_read_tokens, 0);
+    }
+
+    /// Regression: the current in-the-wild AtomCode `.meta` (`"v": 1`) carries
+    /// BOTH a per-turn `total_tokens` aggregate AND `model_usage[].tokens{
+    /// input, output, cached_input }`. The router must take the rich split,
+    /// not the aggregate — otherwise `cached_input` (缓存命中) is lost and
+    /// `total_tokens` would be misread as `input_tokens` (it is ~6x smaller
+    /// than input+output+cache in real data).
+    #[test]
+    fn rich_meta_with_total_tokens_keeps_cache_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("114d687823ac7f89/sess-rich");
+
+        let meta = r#"{
+  "v": 1,
+  "id": "sess-rich",
+  "working_dir": "E:/project/dbpt-zw",
+  "created_at": 1787319280476,
+  "updated_at": 1787321147793,
+  "turn_count": 3,
+  "turn_stats": [
+    {
+      "turn_id": 1,
+      "total_tokens": 36857,
+      "used_tokens": 34060,
+      "model_usage": [
+        { "provider_id": "AtomGit", "model_id": "LongCat-2.0",
+          "tokens": { "input": 44206, "output": 1272, "cached_input": 170240 } }
+      ]
+    },
+    {
+      "turn_id": 2,
+      "total_tokens": 40758,
+      "used_tokens": 40610,
+      "model_usage": [
+        { "provider_id": "AtomGit", "model_id": "LongCat-2.0",
+          "tokens": { "input": 5370, "output": 4331, "cached_input": 306304 } }
+      ]
+    }
+  ]
+}"#;
+        write_file(&base.with_extension("meta"), meta);
+
+        let (out, records) = scan_collect(&source_for(dir.path()));
+        assert!(out.errors.is_empty());
+        assert_eq!(records.len(), 2);
+        for r in &records {
+            assert_eq!(r.provider, Provider::AtomCode);
+            assert_eq!(r.project, "dbpt-zw");
+            // Model comes from `model_usage[].model_id`, not the System prompt.
+            assert_eq!(r.usage.model, "LongCat-2.0");
+        }
+        // Cache split is preserved (the whole point of this test).
+        assert_eq!(records[0].usage.cache_read_tokens, 170240);
+        assert_eq!(records[0].usage.input_tokens, 44206);
+        assert_eq!(records[0].usage.output_tokens, 1272);
+        assert_eq!(records[1].usage.cache_read_tokens, 306304);
+        // `total_tokens` must NOT leak into input_tokens.
+        assert_ne!(records[0].usage.input_tokens, 36857);
     }
 
     #[test]

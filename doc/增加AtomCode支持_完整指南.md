@@ -405,6 +405,24 @@ turns with model_usage: 973   without: 939
 解析器统一走 meta 口径，并且只用 meta —— 因为只有它带厂商自己的 `pricing`，
 成本才算得准。jsonl 只用来取时间戳，不取数字，避免两套口径打架。
 
+### 坑 7：当前 `.meta`（`"v": 1`）同时带 `total_tokens` 和 `model_usage`，路由别被 `total_tokens` 骗走
+
+实测中大量 `.meta` 文件**既**有每轮 `total_tokens`（聚合值），**又**有
+`model_usage[].tokens{ input, output, cached_input }`（逐次调用明细）。而且
+`total_tokens` **不是** 明细的求和——例如某轮 `total_tokens = 36857`，而
+`input(44206) + output(1272) + cached_input(170240) ≈ 244k`，差近 6 倍。
+
+因此解析路由必须先看"有没有 `model_usage` 明细"：
+- **有 `model_usage`**（哪怕同时有 `total_tokens`）→ 走明细路径，按
+  `input/output/cached_input` 拆分，`cache_read` 映射 `cached_input`。
+  这一步把缓存命中带出来；漏了就会被 `parse_json_new` 当成纯聚合格式，
+  `cached_input` 整个丢掉，仪表盘上"缓存读 / 缓存命中率"全为 0。
+- **无 `model_usage`**（旧格式只有 `used_tokens`，或真·新 `.json` 会话只有
+  `messages` + 聚合 `total_tokens`）→ 才走 `parse_json_new` 聚合路径。
+
+绝对不要用 `total_tokens` 去回填 `input_tokens`：它和明细口径不一致，会
+把输入 token 算少 6 倍，成本与趋势全失真。
+
 ---
 
 ## 七、改完后的验证清单
