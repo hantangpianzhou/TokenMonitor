@@ -1,11 +1,14 @@
 //! Persistent top bar: app title, scan status, and page navigation.
 
+use std::sync::Arc;
+
 use gpui::{
-    div, AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Styled, Window,
+    div, img, px, AnyElement, Context, Image, ImageFormat, ImageSource, InteractiveElement,
+    IntoElement, ParentElement, Styled, Window, WindowControlArea,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
-    h_flex, v_flex, IconName, Selectable, StyledExt,
+    h_flex, IconName, Selectable, StyledExt,
 };
 
 use crate::app::app::TokenMonitorApp;
@@ -24,7 +27,7 @@ pub fn render_topbar(
         ScanStatus::Idle => "尚未扫描".to_string(),
         ScanStatus::Scanning { .. } => "扫描中…".to_string(),
         ScanStatus::Done { at, .. } => {
-            format!("更新 {}", at.with_timezone(&east8()).format("%H:%M:%S"))
+            format!("更新 {}", at.with_timezone(&east8()).format("%H:%M"))
         }
         ScanStatus::Failed { .. } => "扫描失败".to_string(),
     };
@@ -35,17 +38,22 @@ pub fn render_topbar(
         .px_4()
         .py_2()
         .items_center()
-        .justify_between()
         .border_b_1()
         .border_color(p.border)
         .child(
-            v_flex().child(
+            h_flex().gap_2().items_center().child(app_icon()).child(
                 div()
-                    .text_lg()
-                    .font_bold()
+                    .text_sm()
+                    .font_semibold()
                     .text_color(p.foreground)
                     .child("TokenMonitor"),
             ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .self_stretch()
+                .window_control_area(WindowControlArea::Drag),
         )
         .child(
             h_flex()
@@ -84,9 +92,33 @@ pub fn render_topbar(
                     "nav-settings",
                     IconName::Settings,
                     ActivePage::Settings,
-                )),
+                ))
+                .child(close_button(cx)),
         )
         .into_any_element()
+}
+
+/// Small app logo pinned to the top-left corner of the top bar. The bitmap
+/// (orange ring + orange "T") is embedded at compile time so it ships inside
+/// the binary, matching the window/taskbar icon in `resources/tokenmonitor.ico`.
+fn app_icon() -> AnyElement {
+    let image = Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../../resources/tokenmonitor.png").to_vec(),
+    ));
+    img(ImageSource::Image(image))
+        .w(px(22.0))
+        .h(px(22.0))
+        .into_any_element()
+}
+
+/// Window close (X) sitting just left of the settings icon. Closes the window
+/// to the system tray on Windows (no-op elsewhere).
+fn close_button(cx: &mut Context<TokenMonitorApp>) -> Button {
+    Button::new("window-close")
+        .ghost()
+        .icon(IconName::Close)
+        .on_click(cx.listener(|_, _, _, _| crate::platform::close_window()))
 }
 
 fn nav_icon(

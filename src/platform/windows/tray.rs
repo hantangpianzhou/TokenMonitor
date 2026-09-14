@@ -152,6 +152,21 @@ pub fn start_tray(main_hwnd: isize) {
 
         add_tray_icon();
     }
+    // The window exists now, so later launches can raise it through the
+    // single-instance guard instead of opening a second window.
+    super::single_instance::listen_for_activation(main_hwnd);
+}
+
+/// Hide the main window to the system tray (close-to-tray). Equivalent to the
+/// title-bar X, which the subclassed window proc converts into `ShowWindow(SW_HIDE)`
+/// unless a quit was requested (see the tray menu's 退出).
+pub fn close_window() {
+    let Some(&hwnd) = MAIN_HWND.get() else {
+        return;
+    };
+    unsafe {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
 }
 
 /// Hand the tray the sender side of the command channel. Call once, on the
@@ -234,6 +249,13 @@ unsafe extern "system" fn main_subclass_proc(
     if taskbar_msg != 0 && msg == taskbar_msg {
         // Explorer restarted; the shell removed our icon — re-add it.
         add_tray_icon();
+        return 0;
+    }
+    // A second launch handed off through the single-instance guard
+    // (`single_instance.rs`) instead of opening its own window / tray icon.
+    let activate_msg = super::single_instance::activate_message();
+    if activate_msg != 0 && msg == activate_msg {
+        show_main_window();
         return 0;
     }
     match msg {

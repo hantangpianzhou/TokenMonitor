@@ -79,6 +79,11 @@ pub struct TokenMonitorApp {
     pub scan_interval: Arc<AtomicU64>,
     /// App accent theme color, applied to dashboard highlights and chart colors.
     pub theme_color: ThemeColor,
+    /// Whether the app is registered to launch at login (OS auto-start).
+    pub autostart_enabled: bool,
+    /// Bumped on every auto-start write; a background result whose sequence is
+    /// stale lost the race to a newer toggle and is discarded.
+    autostart_seq: Arc<AtomicU64>,
     /// Wakes the scheduler thread when the interval changes so the new value
     /// takes effect immediately instead of after the old cycle elapses.
     scheduler_wake: std::sync::mpsc::Sender<()>,
@@ -197,6 +202,11 @@ impl TokenMonitorApp {
             floating: None,
             #[cfg(target_os = "windows")]
             tray_task: None,
+            // Filled in by `refresh_autostart_enabled` right after construction:
+            // reading the registration spawns `reg.exe` on Windows, which must
+            // not run on the UI thread.
+            autostart_enabled: false,
+            autostart_seq: Arc::new(AtomicU64::new(0)),
         };
         // Expose a weak handle to this app so the floating ball can link
         // itself back onto the app when it is opened from the tray menu.
@@ -270,6 +280,7 @@ impl TokenMonitorApp {
         // Install the accent before the first frame, so the very first paint is
         // already correct instead of flashing gpui_component's Light default.
         TokenMonitorApp::apply_theme(app.theme_color, cx);
+        app.refresh_autostart_enabled(cx);
         app.trigger_scan(cx); // initial auto-scan so data shows without manual action
         app.refresh_view(cx); // async: returns immediately, fills state in background
         app
@@ -328,6 +339,58 @@ impl TokenMonitorApp {
         // own, so it is covered too.
         cx.refresh_windows();
         cx.notify();
+    }
+
+    /// Toggle OS auto-start registration (Run key / XDG entry / LaunchAgent).
+    ///
+    /// On Windows the write shells out to `reg.exe`, which costs tens of
+    /// milliseconds — blocking the UI thread for that long is what made every
+    /// click on the switch hitch. The switch is updated up front and the OS
+    /// write is handed to the background executor; a failure reverts the
+    /// switch and reports the error instead.
+    pub fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.autostart_enabled = enabled;
+        cx.notify();
+
+        let seq = self.autostart_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let pending = self.autostart_seq.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { crate::platform::set_autostart(enabled) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // A toggle that landed while this write ran owns the switch now.
+                if pending.load(Ordering::SeqCst) != seq {
+                    return;
+                }
+                if let Err(e) = result {
+                    this.autostart_enabled = !enabled;
+                    this.state.last_error = Some(format!("set auto-start: {e}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Read the OS auto-start registration on the background executor and sync
+    /// the switch to whatever it finds.
+    fn refresh_autostart_enabled(&self, cx: &mut Context<Self>) {
+        let seq = self.autostart_seq.load(Ordering::SeqCst);
+        let pending = self.autostart_seq.clone();
+        cx.spawn(async move |this, cx| {
+            let enabled = cx
+                .background_spawn(async move { crate::platform::autostart_enabled() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if pending.load(Ordering::SeqCst) != seq {
+                    return; // superseded by a toggle; that one knows the truth
+                }
+                this.autostart_enabled = enabled;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Switch the dashboard time-range tab and re-query the window.
@@ -739,6 +802,12 @@ impl TokenMonitorApp {
         // so lift them to the card/main background.
         theme.tokens.tab_bar_segmented = ui::hsla_from_hex(0x262b33).into();
         theme.tokens.background = ui::hsla_from_hex(0x1b1e24).into();
+        // Switch (开机自启) tokens: the unchecked track and the thumb are
+        // pulled straight from the stale gpui-component defaults otherwise,
+        // which look off against the lifted slate panel. Keep them in the
+        // palette; the checked track is set from the accent below.
+        theme.tokens.switch = ui::hsla_from_hex(0x2f3540).into();
+        theme.tokens.switch_thumb = ui::hsla_from_hex(0xd8dbe0).into();
 
         // Apply the user's accent theme color to the primary/button/chart
         // surfaces so the dashboard highlights, primary buttons, and chart
@@ -756,11 +825,31 @@ impl TokenMonitorApp {
         theme.ring = accent;
         theme.blue = accent;
         theme.blue_light = accent.lighten(0.2);
+        theme.tokens.primary = accent.into();
         theme.chart_1 = c1;
         theme.chart_2 = c2;
         theme.chart_3 = c3;
         theme.chart_4 = c4;
         theme.chart_5 = c5;
+
+        // Selected / highlighted surfaces read from these tokens: the
+        // top-bar nav icon (ghost button `selected`), the settings sidebar
+        // item, dropdown rows and checkmarked menu entries. Their dark
+        // defaults are near-black (#212121/#262626), which is darker than
+        // the panel they sit on, so a selected control looked like a black
+        // hole. Point them all at the shared lifted slate instead.
+        let selected = ui::selected_surface();
+        theme.accent = selected;
+        theme.tokens.accent = selected.into();
+        theme.sidebar_accent = selected;
+        theme.tokens.sidebar_accent = selected.into();
+        theme.secondary_active = selected;
+        theme.tokens.secondary_active = selected.into();
+        theme.list_active = selected;
+        theme.tokens.list_active = selected.into();
+        // The list/table "active" outline is drawn over the selected row;
+        // the stock dark blue belongs to no app color, so follow the accent.
+        theme.list_active_border = accent;
     }
 }
 

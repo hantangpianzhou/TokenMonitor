@@ -4,6 +4,12 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
+pub mod autostart;
+pub use autostart::{autostart_enabled, set_autostart};
+
+pub mod single_instance;
+pub use single_instance::{acquire_single_instance, activate_running_instance};
+
 pub mod tray;
 
 #[link(name = "dwmapi")]
