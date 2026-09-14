@@ -906,6 +906,7 @@ pub fn ensure_floating_window(cx: &mut App) {
         let visible = !is_floating_visible();
         show_window(hwnd, visible);
         set_floating_visible(visible);
+        persist_floating_visible(visible);
         return;
     }
     let bounds = Bounds::centered(None, size(px(FLOAT_WIN), px(FLOAT_WIN)), cx);
@@ -942,10 +943,26 @@ pub fn ensure_floating_window(cx: &mut App) {
     );
     if let Ok(handle) = handle {
         set_floating_visible(true);
+        persist_floating_visible(true);
         if let Ok(entity) = handle.entity(cx) {
             if let Some(app) = APP_WEAK.get().and_then(|w| w.upgrade()) {
                 app.update(cx, |app, _| app.floating = Some(entity.downgrade()));
             }
+        }
+    }
+}
+
+/// Mirror the floating ball's visibility into the settings table, so the next
+/// launch restores what the user last chose.
+///
+/// The preference was read at startup (`Collector::floating_window_visible`,
+/// which must stay the default `true`) but never written back, so hiding the
+/// ball from the tray did not survive a restart.
+#[cfg(target_os = "windows")]
+fn persist_floating_visible(visible: bool) {
+    if let Some(collector) = COLLECTOR.get() {
+        if let Err(err) = collector.set_floating_window_visible(visible) {
+            eprintln!("TokenMonitor: save floating window visibility: {err:#}");
         }
     }
 }

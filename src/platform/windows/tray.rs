@@ -198,9 +198,16 @@ pub fn set_floating_visible(visible: bool) {
 
 /// Forward a tray command into the app's event loop (no-op until
 /// `init_tray_commands` has been called).
+///
+/// `try_send`, **not** `send`: `async_channel::Sender::send` returns a future
+/// that only enqueues once it is polled, so `let _ = tx.send(cmd)` compiles
+/// cleanly and silently sends nothing — which is exactly how the tray's
+/// 显示/隐藏悬浮窗 item ended up doing nothing at all. The channel is
+/// unbounded, so `try_send` cannot block; it only fails if the receiver is
+/// gone (i.e. the app is shutting down), which is fine to ignore.
 pub fn send_tray_command(cmd: TrayCommand) {
     if let Some(tx) = TRAY_CMD_TX.get() {
-        let _ = tx.send(cmd);
+        let _ = tx.try_send(cmd);
     }
 }
 
@@ -393,4 +400,31 @@ fn write_wide_slot(slot: &mut [u16], text: &str) {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tray menu selection has to actually arrive at the app.
+    ///
+    /// `async_channel::Sender::send` is a future: dropping it without polling
+    /// (which `let _ = tx.send(cmd)` does, and which compiles without a
+    /// warning) sends nothing, so 显示/隐藏悬浮窗 did nothing at all.
+    #[test]
+    fn a_tray_command_reaches_the_channel() {
+        let (tx, rx) = async_channel::unbounded();
+        if TRAY_CMD_TX.set(tx).is_err() {
+            // The sender is a process-wide `OnceLock` and another test got
+            // there first; there is no second slot to assert against.
+            return;
+        }
+
+        send_tray_command(TrayCommand::Floating);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(TrayCommand::Floating)),
+            "the command must be enqueued, not dropped"
+        );
+    }
 }
