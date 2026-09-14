@@ -11,8 +11,12 @@
 //! - Right-click: context menu (显示/隐藏主窗口 / 显示/隐藏悬浮窗 / 退出).
 //! - Close (X):   hide to tray; quit from the tray menu.
 //!
-//! The floating-window toggle forwards a `TrayCommand::Floating` into the GPUI
-//! app, which owns the ball window; window show/hide and quit stay pure Win32.
+//! Two menu items cross into the GPUI app as a `TrayCommand`, because each needs
+//! something only the app can do: `Floating` creates / toggles the ball window,
+//! and `Quit` tears the **whole** application down (`App::quit`). Quitting by
+//! closing just the main window leaves the ball behind: GPUI auto-quits only
+//! once its *last* window closes, and the ball is a second top-level window.
+//! Plain window show/hide stays pure Win32.
 
 use std::mem;
 use std::os::raw::c_void;
@@ -50,12 +54,15 @@ const TRAY_CMD_TOGGLE_WINDOW: usize = 1;
 const TRAY_CMD_EXIT: usize = 2;
 const TRAY_CMD_FLOATING: usize = 3;
 
-/// Commands the tray icon sends to the GPUI app. Only `Floating` needs to
-/// cross into GPUI (to create / toggle the floating window); window show/hide
-/// and quit stay pure Win32.
+/// Commands the tray icon sends to the GPUI app.
+///
+/// Only these two need to cross into GPUI: creating / toggling the floating
+/// window, and quitting the application as a whole. Window show/hide stays pure
+/// Win32.
 #[derive(Clone, Copy)]
 pub enum TrayCommand {
     Floating,
+    Quit,
 }
 
 #[link(name = "shell32")]
@@ -196,19 +203,24 @@ pub fn set_floating_visible(visible: bool) {
     FLOATING_VISIBLE.store(visible, Relaxed);
 }
 
-/// Forward a tray command into the app's event loop (no-op until
-/// `init_tray_commands` has been called).
+/// Forward a tray command into the app's event loop. Returns whether it was
+/// queued; `false` means nobody is listening (the receiver is gone, or
+/// `init_tray_commands` was never called) so the caller can fall back.
 ///
 /// `try_send`, **not** `send`: `async_channel::Sender::send` returns a future
 /// that only enqueues once it is polled, so `let _ = tx.send(cmd)` compiles
 /// cleanly and silently sends nothing — which is exactly how the tray's
 /// 显示/隐藏悬浮窗 item ended up doing nothing at all. The channel is
 /// unbounded, so `try_send` cannot block; it only fails if the receiver is
-/// gone (i.e. the app is shutting down), which is fine to ignore.
-pub fn send_tray_command(cmd: TrayCommand) {
-    if let Some(tx) = TRAY_CMD_TX.get() {
-        let _ = tx.try_send(cmd);
-    }
+/// gone (i.e. the app is shutting down).
+pub fn send_tray_command(cmd: TrayCommand) -> bool {
+    forward_command(TRAY_CMD_TX.get(), cmd)
+}
+
+/// The pure half of [`send_tray_command`]: enqueue onto a sender if there is
+/// one, and always report whether that worked.
+fn forward_command(tx: Option<&Sender<TrayCommand>>, cmd: TrayCommand) -> bool {
+    tx.map(|tx| tx.try_send(cmd).is_ok()).unwrap_or(false)
 }
 
 unsafe fn add_tray_icon() {
@@ -373,6 +385,17 @@ unsafe fn show_context_menu() {
 unsafe fn quit_app() {
     QUIT_REQUESTED.store(true, Relaxed);
     remove_tray_icon();
+    // Ask the app to quit rather than closing the main window: `App::quit`
+    // ends the whole application, so *every* window goes. The main window is
+    // not the last one — the floating ball is a second top-level window — and
+    // GPUI only auto-quits once its last window closes, so the old
+    // `WM_CLOSE`-to-main-window route left the app (and the ball) running with
+    // no tray icon and no window to get back to it.
+    if send_tray_command(TrayCommand::Quit) {
+        return;
+    }
+    // Nothing is listening (already shutting down, or the channel was never
+    // wired): close the window the raw way so it still goes away.
     if let Some(&hwnd) = MAIN_HWND.get() {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
     }
@@ -411,8 +434,11 @@ mod tests {
     /// `async_channel::Sender::send` is a future: dropping it without polling
     /// (which `let _ = tx.send(cmd)` does, and which compiles without a
     /// warning) sends nothing, so 显示/隐藏悬浮窗 did nothing at all.
+    ///
+    /// 退出 must arrive for a second reason: it is the only code path that can
+    /// quit the whole application, and the ball only goes away with it.
     #[test]
-    fn a_tray_command_reaches_the_channel() {
+    fn tray_commands_reach_the_channel() {
         let (tx, rx) = async_channel::unbounded();
         if TRAY_CMD_TX.set(tx).is_err() {
             // The sender is a process-wide `OnceLock` and another test got
@@ -420,11 +446,33 @@ mod tests {
             return;
         }
 
-        send_tray_command(TrayCommand::Floating);
+        assert!(send_tray_command(TrayCommand::Floating), "queued");
+        assert!(send_tray_command(TrayCommand::Quit), "queued");
 
         assert!(
             matches!(rx.try_recv(), Ok(TrayCommand::Floating)),
             "the command must be enqueued, not dropped"
         );
+        assert!(
+            matches!(rx.try_recv(), Ok(TrayCommand::Quit)),
+            "退出 must reach the app: closing the main window alone leaves the \
+             floating ball — and the process — alive"
+        );
+    }
+
+    /// With no channel at all the command cannot be delivered, and the caller
+    /// has to be told so it can close the window the raw way instead.
+    #[test]
+    fn forwarding_reports_failure_when_there_is_no_sender() {
+        assert!(!forward_command(None, TrayCommand::Quit));
+    }
+
+    /// A sender whose receiver is gone (the app already shut down) is reported
+    /// as a failure too, not swallowed.
+    #[test]
+    fn forwarding_reports_failure_when_the_receiver_is_gone() {
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx);
+        assert!(!forward_command(Some(&tx), TrayCommand::Quit));
     }
 }

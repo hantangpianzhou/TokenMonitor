@@ -40,10 +40,12 @@ pub fn run() -> anyhow::Result<()> {
         gpui_component::set_locale("zh-CN");
         cx.on_action(|_: &Quit, cx| cx.quit());
 
-        // Windows: wire the system-tray icon's "悬浮窗" item to the floating ball.
-        // The tray forwards a `TrayCommand::Floating` over an async channel; here
-        // we translate it into the `ToggleFloatingWindow` action the app handles
-        // by showing / hiding / creating the ball window. The spawned `Task` is
+        // Windows: wire the system-tray icon's menu to the app. The tray
+        // forwards `TrayCommand`s over an async channel; here `Floating` becomes
+        // the `ToggleFloatingWindow` action the app handles by showing / hiding /
+        // creating the ball window, and `Quit` quits the application outright —
+        // the ball is a second top-level window, so closing just the main one
+        // would leave the process (and the ball) running. The spawned `Task` is
         // handed to the app entity so the listener survives for the app's life.
         #[cfg(target_os = "windows")]
         let tray_task;
@@ -55,8 +57,18 @@ pub fn run() -> anyhow::Result<()> {
                 crate::app::app::ensure_floating_window(cx);
             });
             tray_task = cx.spawn(async move |cx| {
-                while let Ok(_cmd) = tray_rx.recv().await {
-                    cx.update(|app| app.dispatch_action(&ToggleFloatingWindow));
+                while let Ok(cmd) = tray_rx.recv().await {
+                    match cmd {
+                        crate::platform::TrayCommand::Floating => {
+                            cx.update(|app| app.dispatch_action(&ToggleFloatingWindow))
+                        }
+                        // Quit the application, not just the main window. The
+                        // floating ball is a second top-level window, so GPUI's
+                        // "last window closed" auto-quit never fires while it is
+                        // up — the ball would stay on screen (and the process
+                        // alive, with its tray icon already removed) after 退出.
+                        crate::platform::TrayCommand::Quit => cx.update(|app| app.quit()),
+                    }
                 }
             });
         }
