@@ -8,15 +8,17 @@
 //!
 //! Behavior:
 //! - Left-click:  show / restore the main window.
-//! - Right-click: context menu (显示/隐藏主窗口 / 显示/隐藏悬浮窗 / 退出).
+//! - Right-click: context menu (显示/隐藏主窗口 / 显示/隐藏悬浮窗 / 刷新 / 退出).
 //! - Close (X):   hide to tray; quit from the tray menu.
 //!
-//! Two menu items cross into the GPUI app as a `TrayCommand`, because each needs
-//! something only the app can do: `Floating` creates / toggles the ball window,
-//! and `Quit` tears the **whole** application down (`App::quit`). Quitting by
-//! closing just the main window leaves the ball behind: GPUI auto-quits only
-//! once its *last* window closes, and the ball is a second top-level window.
-//! Plain window show/hide stays pure Win32.
+//! Three menu items cross into the GPUI app as a `TrayCommand`, because each
+//! needs something only the app can do: `Floating` creates / toggles the ball
+//! window, `Quit` tears the **whole** application down (`App::quit`), and
+//! `Refresh` re-scans every provider's source files on demand (the collector
+//! lives inside the app, not in the tray's Win32 thread). Quitting by closing
+//! just the main window leaves the ball behind: GPUI auto-quits only once its
+//! *last* window closes, and the ball is a second top-level window. Plain
+//! window show/hide stays pure Win32.
 
 use std::mem;
 use std::os::raw::c_void;
@@ -53,16 +55,19 @@ const TRAY_ID: u32 = 1;
 const TRAY_CMD_TOGGLE_WINDOW: usize = 1;
 const TRAY_CMD_EXIT: usize = 2;
 const TRAY_CMD_FLOATING: usize = 3;
+const TRAY_CMD_REFRESH: usize = 4;
 
 /// Commands the tray icon sends to the GPUI app.
 ///
-/// Only these two need to cross into GPUI: creating / toggling the floating
-/// window, and quitting the application as a whole. Window show/hide stays pure
-/// Win32.
+/// `Floating` creates / toggles the ball window, `Quit` tears the whole
+/// application down, and `Refresh` re-scans every provider from its source
+/// files on demand. All three need to cross into GPUI because only the app can
+/// do them; plain window show/hide stays pure Win32.
 #[derive(Clone, Copy)]
 pub enum TrayCommand {
     Floating,
     Quit,
+    Refresh,
 }
 
 #[link(name = "shell32")]
@@ -296,6 +301,10 @@ unsafe extern "system" fn main_subclass_proc(
                 send_tray_command(TrayCommand::Floating);
                 0
             }
+            TRAY_CMD_REFRESH => {
+                send_tray_command(TrayCommand::Refresh);
+                0
+            }
             TRAY_CMD_EXIT => {
                 quit_app();
                 0
@@ -319,7 +328,10 @@ unsafe fn on_tray_message(_hwnd: isize, lparam: isize) -> isize {
     0
 }
 
-unsafe fn show_main_window() {
+/// Show / restore the main window and bring it to the foreground. Shared by
+/// the tray's left-click and the floating ball's double-click (both mean "open
+/// the main view"), and by the single-instance activate hand-off.
+pub(crate) unsafe fn show_main_window() {
     let Some(&hwnd) = MAIN_HWND.get() else {
         return;
     };
@@ -364,9 +376,11 @@ unsafe fn show_context_menu() {
     } else {
         wide("显示悬浮窗")
     };
+    let refresh = wide("刷新");
     let exit = wide("退出");
     AppendMenuW(menu, MF_STRING, TRAY_CMD_TOGGLE_WINDOW, main_label.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_CMD_FLOATING, floating_label.as_ptr());
+    AppendMenuW(menu, MF_STRING, TRAY_CMD_REFRESH, refresh.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_CMD_EXIT, exit.as_ptr());
     let mut point = Point { x: 0, y: 0 };
     GetCursorPos(&mut point);
@@ -448,6 +462,7 @@ mod tests {
 
         assert!(send_tray_command(TrayCommand::Floating), "queued");
         assert!(send_tray_command(TrayCommand::Quit), "queued");
+        assert!(send_tray_command(TrayCommand::Refresh), "queued");
 
         assert!(
             matches!(rx.try_recv(), Ok(TrayCommand::Floating)),
@@ -457,6 +472,11 @@ mod tests {
             matches!(rx.try_recv(), Ok(TrayCommand::Quit)),
             "退出 must reach the app: closing the main window alone leaves the \
              floating ball — and the process — alive"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(TrayCommand::Refresh)),
+            "刷新 must reach the app: re-scanning the providers is something \
+             only the app (collector) can do, not the tray's Win32 thread"
         );
     }
 

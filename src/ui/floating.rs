@@ -94,7 +94,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::app::state::TimeTab;
 use crate::format::format_int_grouped;
-use crate::platform::{client_size_logical, set_window_circle_region};
+use crate::platform::{client_size_logical, set_floating_refresh_hit, set_window_circle_region};
 
 /// Nominal edge length of the square transparent window that hosts the ball.
 /// Must stay in sync with `FLOAT_WIN` in `app::app`. Only the *design*
@@ -752,7 +752,19 @@ impl Render for FloatingView {
         // absolutely positioned column sized to the ball. It is also a drag
         // handle so the centre of the ball (under the text) is grabbable, not
         // just the rim.
-        root.child(
+        // --- hit zone for the refresh icon, pinned to the lower-centre of the
+        // ball just below the token count. Purely visual here; the actual click
+        // is routed by the Win32 subclass (`ball_drag_subclass`) from this rect
+        // to `TrayCommand::Refresh`. The rect is in the window's logical px so
+        // the subclass can map the screen-px press into the same space.
+        let icon_d: f32 = 22.0;
+        let icon_cx = ball_left + sphere_d / 2.0;
+        let icon_cy = ball_top + sphere_d * 0.74;
+        let icon_l = icon_cx - icon_d / 2.0;
+        let icon_t = icon_cy - icon_d / 2.0;
+        set_floating_refresh_hit(Some((icon_l, icon_t, icon_l + icon_d, icon_t + icon_d)));
+
+        root = root.child(
             div()
                 .absolute()
                 .top(ball_y)
@@ -781,6 +793,29 @@ impl Render for FloatingView {
                         .font_semibold()
                         .child(tokens),
                 ),
+        );
+
+        // --- 1.5 Refresh icon: a small button pinned to the lower-centre of the
+        // ball, just **below the token count**. It is **purely visual here** — the
+        // click is handled by the ball's Win32 subclass (`ball_drag_subclass`),
+        // which reads the hit-rect we wrote above and routes a press on it to
+        // `TrayCommand::Refresh` instead of a drag / double-click-open.
+        root.child(
+            div()
+                .id("refresh-icon")
+                .absolute()
+                .top(px(icon_t))
+                .left(px(icon_l))
+                .w(px(icon_d))
+                .h(px(icon_d))
+                .rounded_full()
+                .bg(WHITE.opacity(if self.hovered { 0.34 } else { 0.18 }))
+                .border_1()
+                .border_color(WHITE.opacity(0.55))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(div().text_color(WHITE).text_size(px(13.0)).child("↻".to_string())),
         )
     }
 }

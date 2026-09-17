@@ -43,7 +43,8 @@ pub fn run() -> anyhow::Result<()> {
         // Windows: wire the system-tray icon's menu to the app. The tray
         // forwards `TrayCommand`s over an async channel; here `Floating` becomes
         // the `ToggleFloatingWindow` action the app handles by showing / hiding /
-        // creating the ball window, and `Quit` quits the application outright —
+        // creating the ball window, `Quit` quits the application outright, and
+        // `Refresh` triggers an on-demand re-scan of every provider —
         // the ball is a second top-level window, so closing just the main one
         // would leave the process (and the ball) running. The spawned `Task` is
         // handed to the app entity so the listener survives for the app's life.
@@ -61,6 +62,23 @@ pub fn run() -> anyhow::Result<()> {
                     match cmd {
                         crate::platform::TrayCommand::Floating => {
                             cx.update(|app| app.dispatch_action(&ToggleFloatingWindow))
+                        }
+                        // Refresh: re-scan every provider from its source files
+                        // right now, instead of waiting for the next periodic
+                        // tick. Works even when the main window is hidden — the
+                        // scan runs in the app's collector thread and the result
+                        // flows back through the same collector-event path that
+                        // refreshes the dashboard and the floating ball.
+                        // Refresh: re-scan every provider from its source files
+                        // right now, instead of waiting for the next periodic
+                        // tick. Works even when the main window is hidden — the
+                        // scan runs in the collector thread and the result flows
+                        // back through the same collector-event path that
+                        // refreshes the dashboard and the floating ball.
+                        crate::platform::TrayCommand::Refresh => {
+                            if let Some(collector) = crate::app::app::COLLECTOR.get() {
+                                let _ = collector.scan_async();
+                            }
                         }
                         // Quit the application, not just the main window. The
                         // floating ball is a second top-level window, so GPUI's

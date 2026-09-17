@@ -62,6 +62,9 @@ const HWND_TOPMOST: isize = -1;
 const HWND_NOTOPMOST: isize = -2;
 const SW_SHOW: c_int = 5;
 const SW_HIDE: c_int = 0;
+/// `GetSystemMetrics` index for the system double-click width (px). Used as the
+/// distance tolerance when timing the ball's two presses into a double-click.
+const SM_CXDOUBLECLK: c_int = 36;
 
 /// Pin a window above all others (used for the always-on-top floating ball).
 pub fn set_always_on_top(hwnd: isize, on_top: bool) {
@@ -216,6 +219,13 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
 //    of the two is what made earlier attempts look "stuck": the drag began on the
 //    non-client path, so every move arrived as `WM_NCMOUSEMOVE`.)
 // 4. `WM_NCLBUTTONUP` / `WM_LBUTTONUP` release the capture.
+// 5. A double-click opens the main window: the first press starts a drag, and
+//    the second press (still within `GetDoubleClickTime` and the same spot) is
+//    detected either by timing the two presses in `WM_NCLBUTTONDOWN` or by the
+//    OS `WM_*BUTTONDBLCLK` message — both call `show_main_window` (the same
+//    path the tray's left-click uses) and cancel the in-progress drag so the
+//    ball never moves. So a quick double-click brings the app forward while a
+//    press-and-drag repositions the ball.
 //
 // `SetWindowSubclass` (not `SetWindowLongPtrW`) composes with GPUI's own window
 // proc instead of replacing it, so the window keeps receiving every other
@@ -230,6 +240,11 @@ unsafe extern "system" {
     fn GetCursorPos(lp_point: *mut Point) -> i32;
     fn SetCapture(hwnd: isize) -> isize;
     fn ReleaseCapture() -> i32;
+    // Double-click detection for the floating ball: time the two presses
+    // ourselves (robust whether or not the window class carries CS_DBLCLKS).
+    fn GetMessageTime() -> i32;
+    fn GetDoubleClickTime() -> u32;
+    fn GetSystemMetrics(n_index: c_int) -> c_int;
 }
 
 #[link(name = "comctl32")]
@@ -257,6 +272,10 @@ const WM_LBUTTONUP: u32 = 0x0202;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 const WM_NCLBUTTONUP: u32 = 0x00A2;
 const WM_NCMOUSEMOVE: u32 = 0x00A0;
+// Double-click messages (the OS synthesises these when the window class carries
+// `CS_DBLCLKS`; otherwise we detect the double-click by timing two presses).
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
+const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
 /// `HTCAPTION` (2): the hit-test answer that makes the OS treat a press as a
 /// non-client caption press, delivering `WM_NCLBUTTONDOWN`.
 const HTCAPTION: isize = 2;
@@ -277,6 +296,26 @@ static DRAG_OFFSET: OnceLock<Mutex<(i32, i32)>> = OnceLock::new();
 /// Whether a left-button drag is in progress (the captured window is following
 /// the cursor).
 static DRAGGING: OnceLock<Mutex<bool>> = OnceLock::new();
+
+/// `(message_time, cursor_x, cursor_y)` of the previous left-button press on the
+/// ball. Used to detect a double-click by comparing the current press against it
+/// (time within `GetDoubleClickTime`, position within `SM_CXDOUBLECLK`). `None`
+/// until the first press.
+static LAST_CLICK: OnceLock<Mutex<Option<(i32, i32, i32)>>> = OnceLock::new();
+
+/// Hit-rect (logical px, relative to the ball window's client rect, top-left
+/// origin) of the refresh icon. Written by `FloatingView` on every render and
+/// read by `ball_drag_subclass` so a press on the icon routes to a refresh
+/// (via `TrayCommand::Refresh`) instead of a drag or a double-click-open. `None`
+/// until the first render.
+static FLOATING_REFRESH_HIT: OnceLock<Mutex<Option<(f32, f32, f32, f32)>>> = OnceLock::new();
+
+/// Publish the refresh icon's hit-rect (see [`FLOATING_REFRESH_HIT`]) so the
+/// ball's Win32 subclass can tell a click on the icon apart from a drag. Called
+/// from `FloatingView`'s render.
+pub fn set_floating_refresh_hit(rect: Option<(f32, f32, f32, f32)>) {
+    *FLOATING_REFRESH_HIT.get_or_init(|| Mutex::new(None)).lock().unwrap() = rect;
+}
 
 /// `InitCommonControls` must run once before `SetWindowSubclass` is usable
 /// (comctl32 subclasses are uninitialised until then on some Windows builds).
@@ -300,6 +339,78 @@ unsafe extern "system" fn ball_drag_subclass(
             return HTCAPTION;
         }
         WM_NCLBUTTONDOWN | WM_LBUTTONDOWN => {
+            // Double-click → open the main window. We time the two presses
+            // ourselves so this works whether or not the window class carries
+            // `CS_DBLCLKS`; the `WM_*BUTTONDBLCLK` branch below handles the case
+            // where the OS *does* synthesise that message. Every unsafe fn call
+            // here is in the `unsafe extern fn` body (not a closure), so it is a
+            // valid unsafe context.
+            let now = GetMessageTime();
+            let mut cur = Point { x: 0, y: 0 };
+            let have_pos = GetCursorPos(&mut cur) != 0;
+            // Refresh-icon hit-test takes priority over both the drag and the
+            // double-click-open: a press on the icon must refresh, never move or
+            // open the window. `FLOATING_REFRESH_HIT` is the icon's rect in the
+            // window's logical px (written by `FloatingView`); we map the press
+            // from screen px into that same space via the window rect and the
+            // client size, so the hit stays aligned at any DPI / window size.
+            if have_pos {
+                if let Some((rl, rt, rr, rb)) = FLOATING_REFRESH_HIT
+                    .get()
+                    .and_then(|m| *m.lock().unwrap())
+                {
+                    let dpi = GetDpiForWindow(hwnd);
+                    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+                    if let Some((lw, lh)) = client_size_logical(hwnd, scale) {
+                        let mut wrc = Rect {
+                            left: 0,
+                            top: 0,
+                            right: 0,
+                            bottom: 0,
+                        };
+                        if GetWindowRect(hwnd, &mut wrc) != 0 {
+                            let pw = (wrc.right - wrc.left) as f32;
+                            let ph = (wrc.bottom - wrc.top) as f32;
+                            if pw > 0.0 && ph > 0.0 {
+                                let lx = (cur.x - wrc.left) as f32 / pw * lw;
+                                let ly = (cur.y - wrc.top) as f32 / ph * lh;
+                                if lx >= rl && lx <= rr && ly >= rt && ly <= rb {
+                                    crate::platform::windows::tray::send_tray_command(
+                                        crate::platform::windows::tray::TrayCommand::Refresh,
+                                    );
+                                    return 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let tol = GetSystemMetrics(SM_CXDOUBLECLK).max(1);
+            let dbl_time = GetDoubleClickTime();
+            let is_double = have_pos
+                && {
+                    let mut last = LAST_CLICK.get_or_init(|| Mutex::new(None)).lock().unwrap();
+                    let hit = match *last {
+                        Some((t, x, y))
+                            if now.abs_diff(t) <= dbl_time
+                                && (cur.x - x).abs() <= tol
+                                && (cur.y - y).abs() <= tol =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    *last = Some((now, cur.x, cur.y));
+                    hit
+                };
+            if is_double {
+                // Cancel the drag the first press of the pair started, then open
+                // the main window. Swallow so the OS caption loop never runs.
+                *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() = false;
+                ReleaseCapture();
+                crate::platform::windows::tray::show_main_window();
+                return 0;
+            }
             // Begin a drag. `WM_NCLBUTTONDOWN` is the normal path (we answered
             // `HTCAPTION` above); the client `WM_LBUTTONDOWN` is kept as a
             // fallback. Capture the pointer so every later move message
@@ -357,6 +468,16 @@ unsafe extern "system" fn ball_drag_subclass(
                 // Swallow the release so the OS caption loop (if any) is closed.
                 return 0;
             }
+        }
+        WM_LBUTTONDBLCLK | WM_NCLBUTTONDBLCLK => {
+            // The OS synthesised a double-click (window class has `CS_DBLCLKS`):
+            // open the main window directly. Cancel any drag the first press
+            // started and swallow, so the caption double-click is never treated
+            // as maximise/restore of this frameless popup.
+            *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap() = false;
+            ReleaseCapture();
+            crate::platform::windows::tray::show_main_window();
+            return 0;
         }
         _ => {}
     }

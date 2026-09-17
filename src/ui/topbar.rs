@@ -65,6 +65,7 @@ pub fn render_topbar(
                         .text_color(p.muted_foreground)
                         .child(status_text),
                 )
+                .child(refresh_button(cx))
                 .child(nav_icon(
                     app,
                     cx,
@@ -134,5 +135,19 @@ fn nav_icon(
         .selected(app.state.active_page == page)
         .on_click(cx.listener(move |this, _, _, cx| {
             this.select_page(page, cx);
+        }))
+}
+
+/// Manual refresh sitting next to the scan-status text. Re-scans every provider
+/// from its source files on demand, instead of waiting for the next periodic
+/// tick — the same on-demand re-scan the tray's 刷新 item and the floating
+/// ball's refresh icon trigger.
+fn refresh_button(cx: &mut Context<TokenMonitorApp>) -> Button {
+    Button::new("topbar-refresh")
+        .ghost()
+        .icon(IconName::LoaderCircle)
+        .tooltip("刷新")
+        .on_click(cx.listener(|app, _, _, cx| {
+            app.trigger_scan(cx);
         }))
 }
