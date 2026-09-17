@@ -8,7 +8,7 @@
 //!
 //! Behavior:
 //! - Left-click:  show / restore the main window.
-//! - Right-click: context menu (显示/隐藏主窗口 / 显示/隐藏悬浮窗 / 刷新 / 退出).
+//! - Right-click: context menu (显示/隐藏主窗口 / 显示/隐藏悬浮窗 / 退出).
 //! - Close (X):   hide to tray; quit from the tray menu.
 //!
 //! Three menu items cross into the GPUI app as a `TrayCommand`, because each
@@ -55,7 +55,6 @@ const TRAY_ID: u32 = 1;
 const TRAY_CMD_TOGGLE_WINDOW: usize = 1;
 const TRAY_CMD_EXIT: usize = 2;
 const TRAY_CMD_FLOATING: usize = 3;
-const TRAY_CMD_REFRESH: usize = 4;
 
 /// Commands the tray icon sends to the GPUI app.
 ///
@@ -301,10 +300,6 @@ unsafe extern "system" fn main_subclass_proc(
                 send_tray_command(TrayCommand::Floating);
                 0
             }
-            TRAY_CMD_REFRESH => {
-                send_tray_command(TrayCommand::Refresh);
-                0
-            }
             TRAY_CMD_EXIT => {
                 quit_app();
                 0
@@ -376,11 +371,9 @@ unsafe fn show_context_menu() {
     } else {
         wide("显示悬浮窗")
     };
-    let refresh = wide("刷新");
     let exit = wide("退出");
     AppendMenuW(menu, MF_STRING, TRAY_CMD_TOGGLE_WINDOW, main_label.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_CMD_FLOATING, floating_label.as_ptr());
-    AppendMenuW(menu, MF_STRING, TRAY_CMD_REFRESH, refresh.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_CMD_EXIT, exit.as_ptr());
     let mut point = Point { x: 0, y: 0 };
     GetCursorPos(&mut point);
