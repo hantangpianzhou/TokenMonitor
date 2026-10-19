@@ -894,3 +894,15 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
 
 > AI生成
+
+### 9.25 第十二次：区域健康而内容过期——遮挡吃掉了落定帧（2026-10-19 21:5x 取证）
+
+**现象**：§9.24 构建下复测，残片（¼ 弧叠在主窗热力图/编辑器上）依旧，且同一时刻**真球完好**（两张截图并存的用户取证）。日志 5425 行：仅 1 条 `floating-start hwnd=0x2c02d8`（无窗口重建），**0 条 sentinel / region GONE**——整个会话区域从未失步。
+
+**结论修正**：本轮残片不是区域失步，而是**表面内容过期**。区域与 memo 一致（哨兵判定健康），但窗口 redirection surface 上还是旧像素：球画在旧形态中心，切口是当前形态的偏心盒，交集即 ¼ 弧。产生机制：morph/拖拽期间窗口被主窗完全遮挡 → GPUI/DWM 停止上屏 → 落定帧（含 settle 重切）未呈现 → 无新帧刷新，过期像素永驻。
+
+**修法（心跳从「事件驱动」升级为「恒定」）**：哨兵在静止期（`region_truth` 在位）**无条件 `cx.notify()`**——区域失步仍记日志，但唤醒不再依赖失步：过期表面 ≤0.8 s 必被重绘。静止球 1.25 fps 的渲染成本可忽略。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
+
+> AI生成

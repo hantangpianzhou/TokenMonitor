@@ -1041,8 +1041,18 @@ impl FloatingView {
                     frame_log(&format!(
                         "sentinel: region desync actual={actual:?} expected={expected:?} — waking render"
                     ));
-                    cx.notify();
                 }
+                // **Wake unconditionally at rest.** A matching region does not
+                // guarantee matching *content*: if the window was fully
+                // occluded mid-morph (behind the main window), GPUI/DWM can
+                // stop presenting, and the surface keeps the stale frame — the
+                // ball painted for the *previous* form's centre shows through
+                // the current form's off-centre cut as a quarter-arc shard
+                // (2026-10-19 ~21:4x, region verified healthy while the shard
+                // was on screen). A resting ball draws no frames of its own,
+                // so the only way stale pixels ever get replaced is a wake
+                // from out here. 1.25 fps on a resting ball is nothing.
+                cx.notify();
             });
         })
         .detach();
