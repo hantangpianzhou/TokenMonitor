@@ -1026,10 +1026,12 @@ impl FloatingView {
                 if !crate::platform::is_window_alive(view.hwnd) {
                     return;
                 }
-                let Some(actual) = crate::platform::region_box(view.hwnd) else {
-                    return;
-                };
-                if !region_box_matches(actual, expected) {
+                // **`None` is a desync too.** A window can lose its region
+                // outright (`GetWindowRgn` → ERROR, seen 2026-10-19 ~21:20 on a
+                // resting ball): the shard state this watch exists for. Only an
+                // actual, matching region counts as healthy.
+                let actual = crate::platform::region_box(view.hwnd);
+                if !actual.is_some_and(|a| region_box_matches(a, expected)) {
                     frame_log(&format!(
                         "sentinel: region desync actual={actual:?} expected={expected:?} — waking render"
                     ));
@@ -1427,6 +1429,9 @@ impl Render for FloatingView {
             );
             let in_force = crate::platform::region_box(hwnd);
             if !in_force.is_some_and(|a| region_box_matches(a, expected)) {
+                if in_force.is_none() {
+                    frame_log("truth-check: region GONE (GetWindowRgn=ERROR) — re-cutting");
+                }
                 changing = true;
                 // A bracket is about to run: the sentinel must stand down
                 // until a resting render has verified the new cut.

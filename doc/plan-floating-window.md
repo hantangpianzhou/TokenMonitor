@@ -870,3 +870,27 @@ let hrgn = unsafe { CreateRectRgn(origin_x, origin_y, origin_x + cw, origin_y + 
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
 
 > AI生成
+
+### 9.24 第十一次：区域被整只摘除，而哨兵恰好看不见"无区域"（2026-10-19 21:20 取证）
+
+**现象**：§9.23 哨兵上线后复测残片依旧。`tm-frame.log` 978 行、**0 条 sentinel 失步**——本进程窗口在帧层面全程健康。
+
+**外部探针（关键证据）**：残片在屏时用 ctypes `EnumWindows` + `GetWindowRgn` 直读 tokenmonitor-app 进程的全部顶层窗口：
+
+```text
+hwnd=0x606ea Zed::Window rect=(-78,117,298,516)  rgn_hr=0  rgn=(0,0,0,0)   ← 悬浮窗
+hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← 主窗
+```
+
+悬浮窗 rect 与 frame 日志最后一帧完全一致，但 **`GetWindowRgn` 返回 0（ERROR）——窗口区域被整只摘除**，而日志末帧它还是健康安装的 (73,96,302,325)。即：日志之后有某条外部路径（GPUI 重建/OS 剥除，产生路径待 sentinel 行定位）把区域清空，窗口静止无帧，render 检查永远不会跑。
+
+**结构性缺口**：§9.23 哨兵写了 `let Some(actual) = region_box(hwnd) else { return }`——**`None`（无区域）恰好被跳过**，唯一最严重的失步形态成了哨兵的盲区；render 侧检查虽把 `None` 判失步，但静止时无帧可跑。
+
+**修法**：
+
+1. 哨兵改为 `!actual.is_some_and(|a| region_box_matches(a, expected))`——`None` 也是失步，唤醒 render 强制重切；
+2. render 真值核对在 `None` 分支单独记 `truth-check: region GONE` 行，下次复现可直接定位区域被摘除的时刻。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
+
+> AI生成
