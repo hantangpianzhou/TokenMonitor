@@ -150,6 +150,7 @@
 //! bite out of the ball. Keeping the free window fixed keeps the circle exactly
 //! as it always was; only the docked square shrinks the window.
 
+use crate::platform::frame_log;
 use gpui::{
     div, ease_in_out, percentage, px, Animation, AnimationExt, BoxShadow, Context, Font,
     FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
@@ -995,10 +996,48 @@ pub struct FloatingView {
     num_fit: Option<TextFit>,
     /// Cached fit of the period label.
     label_fit: Option<TextFit>,
+    /// The region box the last **resting** render verified as actually in force
+    /// (`None` while a morph runs or a bracket is pending — frames come fast
+    /// then, and the render-side truth-check covers them). The region sentinel
+    /// compares the OS's region against this between frames: a window left out
+    /// of step while no frame is drawn would otherwise stay broken forever.
+    region_truth: Option<(i32, i32, i32, i32)>,
 }
 
 impl FloatingView {
-    pub fn new(window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // **The region sentinel.** The render-side truth-check only runs while
+        // frames are drawn, and a resting ball draws none — the morph's
+        // `request_animation_frame` chain ends at landing, and nothing wakes a
+        // window at rest. A window left out of step with its region at that
+        // point (the 2026-10-19 shard) would wait forever for a frame that
+        // never comes. This watch reads the OS's region every 800 ms and wakes
+        // a render only when it no longer matches the box the last resting
+        // render verified; the render-side check then forces the bracket and
+        // the window heals.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let Some(expected) = view.region_truth else {
+                    return;
+                };
+                if !crate::platform::is_window_alive(view.hwnd) {
+                    return;
+                }
+                let Some(actual) = crate::platform::region_box(view.hwnd) else {
+                    return;
+                };
+                if !region_box_matches(actual, expected) {
+                    frame_log(&format!(
+                        "sentinel: region desync actual={actual:?} expected={expected:?} — waking render"
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         Self {
             hwnd: hwnd_of(window),
             total_tokens: 0,
@@ -1022,6 +1061,7 @@ impl FloatingView {
             last_verified_client: (WINDOW_SIZE, WINDOW_SIZE),
             num_fit: None,
             label_fit: None,
+            region_truth: None,
         }
     }
 
@@ -1388,7 +1428,17 @@ impl Render for FloatingView {
             let in_force = crate::platform::region_box(hwnd);
             if !in_force.is_some_and(|a| region_box_matches(a, expected)) {
                 changing = true;
+                // A bracket is about to run: the sentinel must stand down
+                // until a resting render has verified the new cut.
+                self.region_truth = None;
+            } else if !self.animating {
+                // Healthy at rest: publish the verified box for the sentinel.
+                self.region_truth = Some(expected);
             }
+        } else {
+            // Animating (or no geometry yet): the render-side check owns the
+            // region for the whole morph, the sentinel stays out of it.
+            self.region_truth = None;
         }
         if changing {
             // (1) No clipping at all, sized to cover both clients — so the resize

@@ -850,3 +850,23 @@ let hrgn = unsafe { CreateRectRgn(origin_x, origin_y, origin_x + cw, origin_y + 
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
 
 > AI生成
+
+### 9.23 第十次：自愈只活在帧里——静止窗口永不复核（2026-10-19）
+
+**现象**：§9.22 真值核对上线后复测残片依旧。且复测时 `%TEMP%\tm-frame.on` 不存在——**取证全程没开，frame 日志零行**，残片发生时的几何未留下任何记录。
+
+**结构性根因**：§9.22 的区域真值核对写在 `render` 里，而静止球**不出帧**——morph 落定后 `request_animation_frame` 链条终止，唯一的唤醒是 hover/拖拽事件。残片一旦在静止态出现（或落定后残留），没有「下一帧」，heal 永远不会执行：检测器存在，但它的心跳停止了。
+
+**修法（独立心跳）**：
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `FloatingView.region_truth`（新字段） | 最后一个**静止** render 验证过的期望区域盒；动画期/待重切帧为 `None`（此时 render 侧检查自己管区域） |
+| 2 | render 真值核对 | 健康且静止 ⇒ 发布 `region_truth = Some(expected)`；失配进入括弧或动画期 ⇒ 清空 |
+| 3 | 区域哨兵（`new()` 里 spawn） | 800 ms 后台循环：窗口存活且 `region_truth` 在位时直读 `GetWindowRgn`，与期望盒失配 ⇒ `frame_log` 记录 actual/expected 并 `cx.notify()` 唤醒一帧——render 侧检查随即强制 open→resize→cut，失步窗口 ≤0.8 s 自愈，**与是否出帧无关** |
+
+**取证配套**：`tm-frame.on` 已重建，下次复现时 `%TEMP%\tm-frame.log` 会留下 `sentinel: region desync actual=… expected=…` 行，可直接判定失步窗口与产生时刻。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
+
+> AI生成
