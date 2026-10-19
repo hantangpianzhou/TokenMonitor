@@ -62,11 +62,20 @@ const TRAY_CMD_FLOATING: usize = 3;
 /// application down, and `Refresh` re-scans every provider from its source
 /// files on demand. All three need to cross into GPUI because only the app can
 /// do them; plain window show/hide stays pure Win32.
+///
+/// `Dock` is the odd one out: it does **not** come from the tray but from the
+/// ball's own drag subclass, which has already snapped the window to (or away
+/// from) a screen edge and only needs GPUI to morph the ball between its circle
+/// and square forms. It rides this channel because this is the established
+/// Win32 → GPUI path — a second channel for one message would be worse.
 #[derive(Clone, Copy)]
 pub enum TrayCommand {
     Floating,
     Quit,
     Refresh,
+    /// Where the ball was dropped: `Some(edge)` if it landed against a screen
+    /// edge (docked, square form), `None` if it landed free (circle form).
+    Dock(Option<super::DockEdge>),
 }
 
 #[link(name = "shell32")]
@@ -435,6 +444,7 @@ fn wide(text: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::windows::DockEdge;
 
     /// A tray menu selection has to actually arrive at the app.
     ///
@@ -456,6 +466,11 @@ mod tests {
         assert!(send_tray_command(TrayCommand::Floating), "queued");
         assert!(send_tray_command(TrayCommand::Quit), "queued");
         assert!(send_tray_command(TrayCommand::Refresh), "queued");
+        assert!(
+            send_tray_command(TrayCommand::Dock(Some(DockEdge::Left))),
+            "queued"
+        );
+        assert!(send_tray_command(TrayCommand::Dock(None)), "queued");
 
         assert!(
             matches!(rx.try_recv(), Ok(TrayCommand::Floating)),
@@ -470,6 +485,16 @@ mod tests {
             matches!(rx.try_recv(), Ok(TrayCommand::Refresh)),
             "刷新 must reach the app: re-scanning the providers is something \
              only the app (collector) can do, not the tray's Win32 thread"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(TrayCommand::Dock(Some(DockEdge::Left)))),
+            "a docked drop must reach the app: the Win32 side has snapped the \
+             window, but only GPUI can morph the ball into its square form"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(TrayCommand::Dock(None))),
+            "an un-docked drop must reach the app too, or the circle never \
+             comes back"
         );
     }
 

@@ -14,6 +14,17 @@ pub use windows::tray::{
 };
 #[cfg(target_os = "windows")]
 pub use windows::*;
+/// The floating ball's Win32 surface: the shape it is clipped to, the geometry
+/// it docks with, and the card size it publishes to the dock logic.
+#[cfg(target_os = "windows")]
+pub use windows::{
+    client_origin_in_window, client_size_device, client_size_logical, dock_window_x,
+    fit_floating_card_window, fitted_origin, frame_log, install_ball_drag, is_window_alive,
+    monitor_work_area, move_window, open_window_region, region_box, resize_floating_window_plain,
+    set_always_on_top, set_floating_card_frac, set_floating_refresh_hit, set_window_circle_region,
+    set_window_region, shift_floating_window, show_window, snap_floating_window_to_edge,
+    window_rect, window_scale, DockEdge, DOCK_GAP,
+};
 
 #[cfg(target_os = "macos")]
 mod macos;

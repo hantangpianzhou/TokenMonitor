@@ -556,6 +556,18 @@ impl TokenMonitorApp {
                 let _ = self.collector.scan_async();
             }
         }
+        #[cfg(target_os = "windows")]
+        {
+            // Light the floating ball's refresh spinner while a scan runs and
+            // clear it once `scan_status` leaves `Scanning` (Done / Failed).
+            // `total == 0` guards against a stuck spinner if a scan emits no
+            // provider events at all.
+            let refreshing = match self.state.scan_status {
+                ScanStatus::Scanning { total, .. } => total > 0,
+                _ => false,
+            };
+            self.set_floating_refreshing(refreshing, cx);
+        }
         cx.notify();
     }
 
@@ -568,6 +580,44 @@ impl TokenMonitorApp {
     /// collapse: the request channel is bounded to 1, so only the latest
     /// pending request survives — intermediate stale requests are
     /// overwritten before the worker picks them up.
+    /// Mirror the floating ball's refresh state so its refresh icon shows a
+    /// spinner while a scan is in flight. Driven from `handle_collector_event`
+    /// via `state.scan_status`, so every scan entry — the ball's own refresh
+    /// button, the top-bar button, the periodic tick, and file-watch — lights
+    /// the spinner consistently.
+    #[cfg(target_os = "windows")]
+    fn set_floating_refreshing(&mut self, refreshing: bool, cx: &mut Context<Self>) {
+        if let Some(f) = &self.floating {
+            if let Some(f) = f.upgrade() {
+                f.update(cx, |view, cx| {
+                    view.set_refreshing(refreshing);
+                    cx.notify();
+                });
+            }
+        }
+    }
+
+    /// Mirror the floating ball's docked state so it animates between its
+    /// circle and square forms. Called from the tray-command loop when the
+    /// ball's own Win32 drag subclass reports where it was dropped; the window
+    /// has already been snapped, so this carries the *shape* decision — plus
+    /// which edge it was docked against, which the view needs to keep the
+    /// shrinking square's outer edge where the snap left it.
+    #[cfg(target_os = "windows")]
+    fn set_floating_docked(
+        &mut self,
+        edge: Option<crate::platform::DockEdge>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.floating.clone().and_then(|f| f.upgrade()) {
+            Some(f) => f.update(cx, |view, cx| view.set_docked(edge, cx)),
+            // The ball's window is gone (e.g. the app closed it while the drop
+            // was in flight): drop the stale handle instead of leaving one that
+            // can never be upgraded again.
+            None => self.floating = None,
+        }
+    }
+
     fn refresh_view(&mut self, _cx: &mut Context<Self>) {
         let seq = self.view_seq.wrapping_add(1);
         self.view_seq = seq;
@@ -884,10 +934,10 @@ impl Render for TokenMonitorApp {
     }
 }
 
-/// Edge length of the floating window (px), matching `WINDOW_SIZE` in
-/// `ui::floating`. Must be ≥ the largest clip circle that module can ask for,
-/// plus its margin — otherwise the clip would fill the window and `SetWindowRgn`
-/// would degenerate into "no clip" (a square frame).
+/// Edge length the floating window is **opened** at (px), matching `WINDOW_SIZE`
+/// in `ui::floating`. Only the creation size: the view resizes the window to fit
+/// the ball on its first render (`platform::fit_floating_card_window`), so this
+/// only has to be big enough to hold the largest ball a first frame can draw.
 const FLOAT_WIN: f32 = 360.0;
 
 /// Shared so the floating ball can persist its visibility preference on close
@@ -899,14 +949,29 @@ pub(crate) static APP_WEAK: OnceLock<WeakEntity<TokenMonitorApp>> = OnceLock::ne
 
 /// Show, hide, or create the floating usage ball. Once the window exists, the
 /// toggle is a pure Win32 show/hide; the first call opens it through GPUI.
+///
+/// **Creation is guarded against re-entry.** The hwnd global is only written
+/// from `cx.open_window`'s constructor callback, so a second `ensure` arriving
+/// before the first callback ran still sees `0` and would open a *second*
+/// floating window — two stacked balls, the lower one orphaned (no usage
+/// updates, no hover, nothing that ever re-renders it) and frozen with
+/// whatever region it had when it was covered. The in-flight flag makes the
+/// second call a no-op instead; it clears once the creation returned, at which
+/// point the registered hwnd answers the alive-check.
 #[cfg(target_os = "windows")]
 pub fn ensure_floating_window(cx: &mut App) {
+    static OPENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let hwnd = get_floating_hwnd();
     if hwnd != 0 && crate::platform::is_window_alive(hwnd) {
         let visible = !is_floating_visible();
         show_window(hwnd, visible);
         set_floating_visible(visible);
         persist_floating_visible(visible);
+        return;
+    }
+    if OPENING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // A creation is already in flight; its callback will register the
+        // hwnd this call wanted to create.
         return;
     }
     let bounds = Bounds::centered(None, size(px(FLOAT_WIN), px(FLOAT_WIN)), cx);
@@ -950,6 +1015,7 @@ pub fn ensure_floating_window(cx: &mut App) {
             }
         }
     }
+    OPENING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Mirror the floating ball's visibility into the settings table, so the next
@@ -965,6 +1031,20 @@ fn persist_floating_visible(visible: bool) {
             eprintln!("TokenMonitor: save floating window visibility: {err:#}");
         }
     }
+}
+
+/// Route a drop report from the ball's Win32 drag subclass into the ball view
+/// (see [`TokenMonitorApp::set_floating_docked`]).
+///
+/// A free function rather than a method because the tray-command loop that
+/// receives the report only holds the `App`; the ball entity is reached through
+/// the same `APP_WEAK` handle the tray's other commands use.
+#[cfg(target_os = "windows")]
+pub fn set_floating_docked(edge: Option<crate::platform::DockEdge>, cx: &mut App) {
+    let Some(app) = APP_WEAK.get().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    app.update(cx, |app, cx| app.set_floating_docked(edge, cx));
 }
 
 #[cfg(test)]

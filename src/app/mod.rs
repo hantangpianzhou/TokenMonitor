@@ -80,6 +80,14 @@ pub fn run() -> anyhow::Result<()> {
                                 let _ = collector.scan_async();
                             }
                         }
+                        // The ball was dropped: `Some(edge)` = it landed against
+                        // a screen edge (the Win32 side has already snapped the
+                        // window there), `None` = it landed free. Either way
+                        // GPUI only has to morph the ball between its circle and
+                        // square forms.
+                        crate::platform::TrayCommand::Dock(edge) => {
+                            cx.update(|app| crate::app::app::set_floating_docked(edge, app))
+                        }
                         // Quit the application, not just the main window. The
                         // floating ball is a second top-level window, so GPUI's
                         // "last window closed" auto-quit never fires while it is
