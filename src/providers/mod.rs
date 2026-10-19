@@ -14,6 +14,7 @@ pub mod pi;
 pub mod qoder;
 mod roots;
 mod source;
+pub mod teleagent;
 pub mod trae;
 pub mod workbuddy;
 
@@ -22,7 +23,7 @@ pub use source::{FileStates, ProviderConfig, ProviderError, ProviderSource, Scan
 use crate::core::model::Provider;
 
 /// All providers TokenMonitor can track, in display order.
-pub fn all_providers() -> [Provider; 14] {
+pub fn all_providers() -> [Provider; 15] {
     Provider::ALL
 }
 
@@ -77,6 +78,9 @@ pub fn build_sources(configs: &[ProviderConfig]) -> Vec<Box<dyn ProviderSource>>
             }
             Provider::CodeArts => {
                 Box::new(codearts::CodeArtsSource::new(c.clone())) as Box<dyn ProviderSource>
+            }
+            Provider::TeleAgent => {
+                Box::new(teleagent::TeleAgentSource::new(c.clone())) as Box<dyn ProviderSource>
             }
         })
         .collect()

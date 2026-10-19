@@ -55,6 +55,7 @@ TokenMonitor 的桌面版与 TUI 版都是**单文件、自包含**的本地应�
   - `deepseek`：`~/.dsh/sessions/**/*.jsonl.zstd` 的 `assistant/message` 用量（已实现，zstd 解压，支持 WSL）
   - `pi`：`~/.pi/agent/sessions/**/*.jsonl` 的 assistant / toolResult / compaction 用量（已实现）
   - `antigravity`：`~/.gemini/antigravity-cli/` 与 `~/.gemini/antigravity-ide/` 的 `conversations/*.db`（SQLite + protobuf）中模型生成步骤的 Token 用量，同时覆盖 CLI 与 IDE（已实现）
+  - `teleagent`：`~/.local/share/TeleAgent/users/*/teleagent.db`（SQLite）的 `message.data.tokens`，按会话标题聚合，只读打开并容忍 `SQLITE_BUSY`（已实现，数据源调查见 `doc/teleagent-token-parsing.md`）
   - `gemini` / `qoder`：待实现（桩）
 - **SQLite 持久化**：用量记录（含 fingerprint 去重）、项目、配额、设置
 - **采集管线**：`scanner`（扫描解析）、`watcher`（文件监听）、`scheduler`（定时重扫）
@@ -129,3 +130,5 @@ cargo build --release --no-default-features --features tui
 ## 许可
 
 MIT
+
+> AI生成

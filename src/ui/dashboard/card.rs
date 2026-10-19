@@ -162,6 +162,7 @@ fn provider_icon_bytes(provider: Provider) -> Option<&'static [u8]> {
         "trae" => Some(include_bytes!("../../../assets/icons/trae.svg")),
         "atomcode" => Some(include_bytes!("../../../assets/icons/atomcode.svg")),
         "codearts" => Some(include_bytes!("../../../assets/icons/codearts.svg")),
+        "teleagent" => Some(include_bytes!("../../../assets/icons/teleagent.svg")),
         _ => None,
     }
 }
