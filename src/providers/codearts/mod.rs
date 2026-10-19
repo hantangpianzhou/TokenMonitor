@@ -2,16 +2,26 @@
 //!
 //! ## Where the usage lives
 //!
-//! CodeArts persists every session/message in a single **SQLite** database
-//! rather than the JSONL/JSON files the other adapters walk. On this machine
-//! the live database is at:
+//! CodeArts (华为云 CodeArts 代码智能体 / `codeartsdoer`) persists every
+//! session/message in a single **SQLite** database named `opencode.db`,
+//! rather than the JSONL/JSON files the other adapters walk. The CLI writes
+//! to a `cli-data/` sub-directory under its data root. Observed layouts on
+//! this machine:
 //!
 //! ```text
+//! # Active runtime DB (the CLI writes here, updated continuously):
+//! %USERPROFILE%/.codeartsdoer/cli-data/opencode.db
+//!
+//! # Older / migrated layout: opencode.db at the data-root itself:
 //! %USERPROFILE%/.local/share/.codeartsdoer/opencode.db
 //! ```
 //!
-//! (Some docs reference `~/.codeartsdoer/codearts-data/opencode.db`; the
-//! adapter probes several candidate locations so either layout works.)
+//! The adapter probes several candidate locations (see `DB_REL_PATHS`) and
+//! scans **every** `opencode.db` it finds, so either layout — and both at
+//! once — work. Records are deduped downstream by message id, so overlapping
+//! sessions across the two databases are never double-counted. A user can
+//! also point TokenMonitor at a custom location via the settings'
+//! `data_dir_override`.
 //!
 //! ## Schema (verified against the real DB)
 //!
@@ -57,12 +67,23 @@ use crate::core::usage::UsageRecord;
 use super::source::{fingerprint, ProviderConfig, ProviderError, ProviderSource, ScanOutput};
 
 /// Candidate database paths, relative to the user home dir, in priority order.
-/// Covers the observed Windows layout plus the documented Linux/macOS layout.
+/// Covers the observed Windows layout (`.codeartsdoer/cli-data/opencode.db`,
+/// the live runtime DB) plus the older/migrated `.local/share` layout and the
+/// documented Linux/macOS layout. Every existing candidate is scanned, so the
+/// two layouts can coexist without missing data.
 const DB_REL_PATHS: &[&str] = &[
-    ".local/share/.codeartsdoer/opencode.db",
-    ".codeartsdoer/codearts-data/opencode.db",
-    ".local/state/codeartsdoer/opencode.db",
+    // Live runtime DB on Windows — the CLI writes here continuously.
+    ".codeartsdoer/cli-data/opencode.db",
+    // Older layout: opencode.db at the data-root itself.
     ".codeartsdoer/opencode.db",
+    // Migrated / Linux-macOS-style layout.
+    ".local/share/.codeartsdoer/opencode.db",
+    ".local/share/.codeartsdoer/cli-data/opencode.db",
+    ".local/state/codeartsdoer/opencode.db",
+    ".local/state/codeartsdoer/cli-data/opencode.db",
+    // Windows AppData fallbacks.
+    "AppData/Local/codearts/opencode.db",
+    "AppData/Roaming/codearts/opencode.db",
 ];
 
 pub struct CodeArtsSource {
