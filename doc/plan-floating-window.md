@@ -906,3 +906,17 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
 
 > AI生成
+
+### 9.26 第十三次：区域从未失步——「摘除」是跨进程探针的伪证；嫌疑转向局部呈现（2026-10-19 22:0x 取证）
+
+**现象**：§9.25 心跳构建下残片依旧，>1 s 不消失。日志 7153 行：2 条 `floating-start`（两次启动，无窗口重建），**仍 0 条 sentinel / region GONE**；末尾静止帧每 ~800 ms 一帧（心跳生效），逐帧 `region=Some((73,96,302,325))` 健康居中、球心 (180,180) 同心。
+
+**证据修正**：跨进程探针两次读到 `GetWindowRgn=ERROR`，但应用内每帧直读同窗口区域均健康（frame 行 `region=` 即 `region_box` 的 OS 真值）——**跨进程 `GetWindowRgn` 对该窗口不可信，§9.24「区域被整只摘除」系探针伪证，作废**。区域自始至终健康。
+
+**重新归因**：残片 = **呈现层（present）问题**。布局、区域、内容在应用侧全部正确，但上屏的合成结果停在一张局部帧——¼ 弧 = 一次 damage sub-rect 呈现只有四分之一被合成，其余滞留旧帧；静止球无自发帧，局部呈现永不修复。探针同时发现系统运行着 **AweSun 远程控制**（`OrayUI_Shadow` 窗口）——远程捕获链路是干预 DWM 呈现/合成的头号嫌疑，残片也可能只存在于远程视图。
+
+**修法（全量 damage 防御）**：新增 `platform::invalidate_whole_window`（user32 `InvalidateRect(hwnd, NULL, FALSE)`，手写 extern 风格）；哨兵心跳每 800 ms 唤醒前先**全窗失效**——下一次 present 的 damage 被迫覆盖整窗，局部呈现无从立足。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
+
+> AI生成

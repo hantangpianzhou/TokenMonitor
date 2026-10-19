@@ -47,6 +47,9 @@ unsafe extern "system" {
     fn SetWindowRgn(hwnd: isize, hrgn: isize, bredraw: i32) -> i32;
     fn GetDpiForWindow(hwnd: isize) -> u32;
     fn GetTickCount() -> u32;
+    /// Marks the whole client rect invalid so the next frame's present cannot
+    /// be reduced to a damage sub-rect (see [`invalidate_whole_window`]).
+    fn InvalidateRect(hwnd: isize, lprect: *const Rect, berase: i32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -1086,6 +1089,23 @@ pub fn region_box(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
         let ok = GetRgnBox(dst, &mut box_) != 0;
         DeleteObject(dst);
         ok.then_some((box_.left, box_.top, box_.right, box_.bottom))
+    }
+}
+
+/// Force a **full-window** repaint on the next pass: the whole client rect is
+/// marked invalid, so the next frame's present cannot be reduced to a damage
+/// sub-rect. A window whose surface shows a stale *partial* frame (a quarter of
+/// the ball while the region is verifiably healthy — the 2026-10-19 shard) only
+/// recovers when the entire surface is re-fetched, which is exactly what a
+/// full invalidation asks of the compositor.
+pub fn invalidate_whole_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        // `None` = the whole client rect; `false` = no WM_ERASEBKGND (the
+        // surface is GPUI-owned, an erase would flash black).
+        InvalidateRect(hwnd, std::ptr::null(), 0);
     }
 }
 

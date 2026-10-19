@@ -1051,7 +1051,11 @@ impl FloatingView {
                 // (2026-10-19 ~21:4x, region verified healthy while the shard
                 // was on screen). A resting ball draws no frames of its own,
                 // so the only way stale pixels ever get replaced is a wake
-                // from out here. 1.25 fps on a resting ball is nothing.
+                // from out here — and the wake **invalidates the whole
+                // window**, so the present cannot shrink to a damage sub-rect
+                // and leave the other three quarters stale. 1.25 fps on a
+                // resting ball is nothing.
+                crate::platform::invalidate_whole_window(view.hwnd);
                 cx.notify();
             });
         })
