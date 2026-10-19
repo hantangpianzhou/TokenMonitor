@@ -1020,12 +1020,18 @@ impl FloatingView {
                 .timer(Duration::from_millis(800))
                 .await;
             let _ = this.update(cx, |view, cx| {
+                if !crate::platform::is_window_alive(view.hwnd) {
+                    // The window is gone; logging it once beats silently
+                    // spinning forever and hiding a stale-hwnd situation.
+                    frame_log(&format!(
+                        "sentinel: hwnd {:#x} no longer alive — watch ends",
+                        view.hwnd
+                    ));
+                    return;
+                }
                 let Some(expected) = view.region_truth else {
                     return;
                 };
-                if !crate::platform::is_window_alive(view.hwnd) {
-                    return;
-                }
                 // **`None` is a desync too.** A window can lose its region
                 // outright (`GetWindowRgn` → ERROR, seen 2026-10-19 ~21:20 on a
                 // resting ball): the shard state this watch exists for. Only an
@@ -1040,6 +1046,10 @@ impl FloatingView {
             });
         })
         .detach();
+        // Mark the log with this instance's hwnd: a second start line with a
+        // different hwnd means the window was recreated, and every stale-hwnd
+        // suspect (region ops into a dead window) becomes visible in the log.
+        frame_log(&format!("floating-start hwnd={:#x}", hwnd_of(window)));
         Self {
             hwnd: hwnd_of(window),
             total_tokens: 0,
