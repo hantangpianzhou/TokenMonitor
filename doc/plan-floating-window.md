@@ -946,3 +946,28 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
 
 > AI生成
+
+### 9.29 第十六次：整个 `SetWindowRgn` 机制退场——形状交给绘制，命中交给 HTTEST（2026-10-20）
+
+**现象**：§9.28 心跳 nudge 构建下，残片与空白**都还出现**，且动一下屏幕就复原。至此确认：只要窗口带 region，「合成器侧形状/内容过期」这一类问题就修不完——nudge 挪到哪里都只是在猜 DWM 什么时候会丢、丢哪一帧。
+
+**决策（根修）**：**`SetWindowRgn` 机制整体退役。** 悬浮窗回归普通透明无边框矩形窗口，球的圆形由 GPUI 绘制本身呈现（本就如此），圆外的点击穿透由子类 `WM_NCHITTEST` 自己回答——形状不再有「应用侧状态」与「合成器侧状态」两份，过期失步失去存在基础。
+
+**floating.rs**：
+
+- 删除 render 的 open→resize→cut 括弧、区域 memo（`last_region`/`last_clip_client`/`RegionKey`）、真值核对（`expected_region_box`/`region_box_matches`）、`region_truth` 字段与哨兵失步分支；render 只剩一步 plain/anchored resize。
+- 删除 `seed_window_region`、`SEED_CLIP_FRACTION`、`CLIP_MARGIN` 及其常量注释；`clip_diameter_for` 语义改为「卡的适配尺寸」（docked 窗口边长），不再切割任何东西。
+- 哨兵简化为纯呈现心跳：`InvalidateRect` 全窗失效 + `cx.notify()`（nudge 一并移除——没有 region 后 DWM 不再需要被提醒形状）。
+- 测试增删：删 seed/真值核对/memo 键/镜像 cut 算术四类测试；`window_wraps_the_card_and_its_glow`、`the_free_ball_keeps_the_fixed_window`、envelope/pinning/settle/包含测试全部改写为窗口几何语义（`the_window_contains_the_card_and_its_glow` 替代 region 版）。
+
+**platform/windows**：
+
+- 删除 `set_window_region`、`set_window_circle_region`、`open_window_region`、`cut_region`、`region_box`、`nudge_dwm_composition` 与 gdi32 区块（`CreateRoundRectRgn`/`CreateRectRgn`/`GetWindowRgn`/`GetRgnBox`/`DeleteObject`）及 `SetWindowRgn` extern、`SWP_FRAMECHANGED`；`platform/mod.rs` 同步收窄导出。
+- `ball_drag_subclass` 的 `WM_NCHITTEST` 从无条件 `HTCAPTION` 改为 **`ball_hit_test`**：把屏幕坐标映射进逻辑客户区，与「卡半径（`FLOATING_CARD_FRAC`）+ `HIT_SLACK`(12px) 光晕余量」的圆做距离测试——圆内 `HTCAPTION`（拖拽路径），圆外 `HTTRANSPARENT`（穿透桌面，360/Thunder 观感）。几何不可信的首几帧回退全窗 `HTCAPTION`，不吞按键。
+- msg/frame 日志行去掉 region 字段；受影响文档（`client_size_logical`/`client_size_device`/`client_origin_in_window`/拖拽子类 1.）全部改写为无区域语义。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **207 passed**（-4：删除的是区域机制自身的测试）；`cargo check --bins --no-default-features --features tui` 通过。
+
+**遗留语义变化**：圆外的光晕不再被硬切割（此前区域落在光晕已淡出的空环上，视觉无差）；球的抗锯齿由 GPUI 渲染负责，边缘反而比 region 的硬切更平滑。风险点：`ball_hit_test` 在拖拽中窗口尺寸变化时的分数换算依赖 render 持续发布 `card_frac`——静止时不发布新值，沿用上次的即正确。
+
+> AI生成

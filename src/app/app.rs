@@ -991,12 +991,6 @@ pub fn ensure_floating_window(cx: &mut App) {
                     let hwnd = win.hwnd.get();
                     register_floating_hwnd(hwnd);
                     set_always_on_top(hwnd, true);
-                    // Round the window before the first paint. `render` also
-                    // applies the region every frame, but on the very first
-                    // frame the client rect may not be initialised yet — and
-                    // then the popup would show its square frame (most visible
-                    // at zero usage, where the ball is smallest).
-                    crate::ui::floating::seed_window_region(hwnd);
                     // Drag the ball with our own Win32 subclass (not GPUI's
                     // `WindowControlArea::Drag`, which routes the move through
                     // the OS caption loop and flashes a black square).

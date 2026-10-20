@@ -40,38 +40,14 @@ unsafe extern "system" {
     fn ShowWindow(hwnd: isize, n_cmd_show: c_int) -> i32;
     fn GetClientRect(hwnd: isize, lprect: *mut Rect) -> i32;
     /// The client area's top-left in **screen** px. Together with `GetWindowRect`
-    /// it gives the client's origin *inside the window* — the space `SetWindowRgn`
-    /// actually works in, and the reason a region laid out on `GetClientRect` has
-    /// to be translated before it is applied.
+    /// it gives the client's origin *inside the window* — the space dock snapping
+    /// and the drag maths work in.
     fn ClientToScreen(hwnd: isize, lppoint: *mut Point) -> i32;
-    fn SetWindowRgn(hwnd: isize, hrgn: isize, bredraw: i32) -> i32;
     fn GetDpiForWindow(hwnd: isize) -> u32;
     fn GetTickCount() -> u32;
     /// Marks the whole client rect invalid so the next frame's present cannot
     /// be reduced to a damage sub-rect (see [`invalidate_whole_window`]).
     fn InvalidateRect(hwnd: isize, lprect: *const Rect, berase: i32) -> i32;
-}
-
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    /// A rounded-rectangle region. Its corner *ellipses* are given as full
-    /// diameters, clamped by the region to the rectangle — so passing the
-    /// rectangle's own side as the ellipse diameter makes the four corners meet
-    /// and the region degenerates into exactly the ellipse (a circle for a
-    /// square rect). One call therefore covers both forms of the floating ball:
-    /// the circle and the docked rounded square.
-    fn CreateRoundRectRgn(
-        nleft: c_int,
-        ntop: c_int,
-        nright: c_int,
-        nbottom: c_int,
-        width_ellipse: c_int,
-        height_ellipse: c_int,
-    ) -> isize;
-    fn CreateRectRgn(nleft: c_int, ntop: c_int, nright: c_int, nbottom: c_int) -> isize;
-    fn GetWindowRgn(hwnd: isize, hrgn: isize) -> i32;
-    fn GetRgnBox(hrgn: isize, lprc: *mut Rect) -> i32;
-    fn DeleteObject(hrgn: isize) -> isize;
 }
 
 #[repr(C)]
@@ -84,9 +60,6 @@ struct Rect {
 
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOSIZE: u32 = 0x0001;
-/// `SetWindowPos` flag that reruns the frame path — the nudge that makes DWM
-/// re-read a window region its composition queue missed.
-const SWP_FRAMECHANGED: u32 = 0x0020;
 const HWND_TOPMOST: isize = -1;
 const HWND_NOTOPMOST: isize = -2;
 const SW_SHOW: c_int = 5;
@@ -126,18 +99,16 @@ pub fn show_window(hwnd: isize, visible: bool) {
 /// Logical-px size of a window's client area, or `None` if it is not laid out
 /// yet.
 ///
-/// [`set_window_circle_region`] clips in *client* pixels, so anything drawn
-/// inside that window must be laid out against this same rectangle — otherwise
-/// the ball and the circle it is clipped to are centred on two different
-/// rectangles. That mismatch is invisible in the arithmetic but very visible on
-/// screen: the clip then shaves one side of the ball (a hard, aliased rim) and
-/// eats the glow on exactly that side.
+/// Anything drawn inside the window must be laid out against this same
+/// rectangle — otherwise the ball and the window it sits in are centred on two
+/// different rectangles. That mismatch is invisible in the arithmetic but very
+/// visible on screen: the window edge then shaves one side of the ball (a hard,
+/// aliased rim) and eats the glow on exactly that side.
 ///
 /// GPUI's `Window::viewport_size()` is *not* a safe substitute. It reports the
 /// size GPUI believes the window has, which can disagree with the real client
 /// area (DPI rounding, a popup the OS sized differently). Deriving the ball from
-/// the viewport while clipping from the client rect is what produced the
-/// one-sided cut.
+/// the viewport instead of the client rect is what produced the one-sided cut.
 pub fn client_size_logical(hwnd: isize, scale: f32) -> Option<(f32, f32)> {
     if hwnd == 0 || !(scale > 0.0) {
         return None;
@@ -160,17 +131,14 @@ pub fn client_size_logical(hwnd: isize, scale: f32) -> Option<(f32, f32)> {
     }
 }
 
-/// The client rect's size in **device px** — the rectangle `SetWindowRgn` is
-/// cut from, in the very units it is cut in. `None` when there is no
+/// The client rect's size in **device px**. `None` when there is no
 /// believable client area to measure (the handle is gone, or the window has
 /// not been laid out yet).
 ///
-/// Exists so the view can tell whether a region cut earlier is still the cut
-/// *this* client area calls for. The region's device geometry is a fraction
-/// of the client rect, so a client rect that changed size — a DPI change
-/// resizing the window behind the app's back when the ball is dragged across
-/// monitors, an OS-clamped resize — invalidates a cut even though every
-/// *logical* quantity stayed identical. See `ui::floating`'s `last_clip_client`.
+/// The view compares this against the size a frame asked for, so a client rect
+/// that changed size behind the app's back — a DPI change resizing the window
+/// when the ball is dragged across monitors, an OS-clamped resize — is visible
+/// as a mismatch rather than as a silently wrong layout.
 pub fn client_size_device(hwnd: isize) -> Option<(i32, i32)> {
     if hwnd == 0 {
         return None;
@@ -189,282 +157,19 @@ pub fn client_size_device(hwnd: isize) -> Option<(i32, i32)> {
     (w > 0 && h > 0).then_some((w, h))
 }
 
-/// Clip the floating window to a rounded square of side `diameter` (logical px,
-/// concentric with a square window of `window_size` logical px) whose corners
-/// are `corner_ratio` of that side — `1.0` is the circle the ball rests as, and
-/// the docked form passes its own smaller ratio so the region always traces the
-/// shape actually being drawn. This removes the square OS frame and its
-/// rectangular shadow, and makes clicks outside the shape pass through to the
-/// desktop — the 360 / Thunder-style floating ball.
-///
-/// The view passes the region's diameter as a **fraction of the window**
-/// (`diameter / window_size`). Docked, `diameter == window_size`, so the region
-/// is the whole client area, rounded — the window itself was resized to the card
-/// (`ui::floating::window_side_for`). Free, `diameter` is the ball's own fit
-/// (`ui::floating::clip_diameter_for`) and the region is a smaller circle inside
-/// the fixed window: the same fitted circle the ball has always been cut to, with
-/// the window's empty slack around it. Either way the diameter is derived from
-/// what is **drawn**, never from the window, so the cut can never come out
-/// smaller than the card and shave its rim.
-///
-/// The region is computed as a **fraction of the client rect**
-/// (`diameter / window_size`), not by converting logical px to device px
-/// through an assumed scale. That is what the layout actually guarantees: the
-/// card is laid out at `diameter / window_size` of the window whatever the DPI,
-/// whichever monitor the ball is dragged onto, and whatever rounding the OS
-/// applied to the window size. Scaling *both* sides by the same unknown factor
-/// cancels out, so the clip can never come out smaller than the card and shave
-/// its rim — the failure mode that made the ball look cut off.
-///
-/// Three things keep the result a true shape:
-/// * The shape is centred on the client rect on each axis, so a client area that
-///   is not exactly square (a frame or two while the OS applies a resize) cannot
-///   shift the clip off-centre.
-/// * The side is clamped to `min(client_w, client_h)`. A region *larger* than
-///   the client rect would reach outside the client area, and a region as large
-///   as the *window* makes `SetWindowRgn` degenerate into "no clip at all", which
-///   shows the square frame. (The caller already keeps `diameter` inside
-///   `window_size`, so this is belt-and-braces.)
-/// * The centre is translated by [`client_origin_in_window`] before the region is
-///   built. `SetWindowRgn` measures from the **window's** top-left, but the card
-///   is laid out — and centred — in the **client** area, and this window has a
-///   caption and border, so the two origins differ. Skipping the translation puts
-///   the whole clip `(8, 31)` px up and to the left of the ball: the top and left
-///   keep a generous halo while the bottom and right slice straight through the
-///   card. That is the bug this offset exists to prevent.
-///
-/// Rounding the corners is what keeps the region off the glow: a region with a
-/// hard, non-anti-aliased edge must land on pixels the gaussian tail has already
-/// faded out, and its corner radius (not just its side) has to grow with the
-/// side — which is exactly what keeping the ratio constant does, at any size.
-///
-/// Returns the client-rect size (device px) the cut was actually made from, or
-/// `(0, 0)` when no cut was made — **including when the real client rect was
-/// unreadable**. The view records it as the memo of *which rectangle this
-/// region traces*: the cut's device geometry is a fraction of the client rect,
-/// so a client rect that changed size (a DPI change resizing the window behind
-/// the app's back) invalidates the cut even though every logical quantity the
-/// view compares stayed identical — the exact shape of the "ball sliced by its
-/// own stale region" bug. See `ui::floating`'s `last_clip_client`.
-///
-/// **Strict by design.** A monitor-DPI fallback used to live here and centred
-/// the region on a `window_size × scale` *phantom* client rect. Combined with a
-/// layout box that trusted a stale 360 px client while the OS clipped to the
-/// real (docked-sized) one, the ball's centre landed on the client rect's
-/// corner — the 2026-10-14 "ball shrank to a 24 px sliver" regression, visible
-/// as the ball being sliced by the L-shaped seam between two monitors. Only the
-/// seed path ([`set_window_circle_region`]) keeps the fallback: there is no
-/// previous cut to preserve, and an approximately round window beats a square
-/// one on frame one.
-///
-/// `client` is the client rect (device px) **the caller measured**, never a fresh
-/// one. The card is laid out in that same rectangle, so the region has to be cut
-/// from that exact measurement; measuring again here would be a second instant,
-/// and a window resized inside it leaves the card laid out in one rectangle with
-/// the region centred on another. That is precisely the 2026-10-14 frame: the
-/// window was already back to its free 360 px, the ball was drawn dead centre in
-/// it, and the region still traced the docked 148 px cut from the previous form —
-/// so the OS showed a ~145 px window of a ~150 px ball and the user saw a shard.
-///
-/// Returns whether a cut was installed. `false` means the previous cut is still
-/// in force, and the caller must **not** record the memo: a memo written for a cut
-/// that never happened is what lets a stale region look up to date forever.
-pub fn set_window_region(
-    hwnd: isize,
-    diameter: f32,
-    corner_ratio: f32,
-    window_size: f32,
-    client: (i32, i32),
-) -> bool {
-    if hwnd == 0 || window_size <= 0.0 || diameter <= 0.0 {
-        return false;
-    }
-    if client.0 <= 0 || client.1 <= 0 {
-        return false;
-    }
-    cut_region(
-        hwnd,
-        diameter,
-        corner_ratio,
-        window_size,
-        client.0 as f32,
-        client.1 as f32,
-    )
-}
-
-/// Force DWM to re-read the window's region: a zero `SetWindowPos` that moves
-/// nothing, sizes nothing, and only reruns the frame path.
-///
-/// `SetWindowRgn(bRedraw=1)` can reach the region object without a DWM
-/// recomposition (the deterministic undock shard of 2026-10-19): the app goes
-/// on drawing and presenting correct content into a verifiably healthy region
-/// while the compositor keeps clipping to the stale shape, until some unrelated
-/// event — a hover — happens to recompose the correct state and "heals" it.
-///
-/// **Call this only while the window is at rest** — content laid out, region
-/// verified, nothing mid-bracket. The first attempt put this nudge inside the
-/// render, right after each `SetWindowRgn`: DWM then recomposed the bracket's
-/// *transient* states (open region over a backbuffer the resize had just
-/// invalidated) and froze on those — the window went solid black (2026-10-20).
-/// At rest every sampled state is the final, correct one, so the recomposition
-/// can only ever capture what the app intended.
-pub fn nudge_dwm_composition(hwnd: isize) {
-    if hwnd == 0 {
-        return;
-    }
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            0,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-    }
-}
-
-/// Shared core of [`set_window_region`] and [`set_window_circle_region`]: build
-/// and install the round-rect cut from an already-measured client rect
-/// (`cw` × `ch`, device px). Returns whether the cut was installed.
-fn cut_region(
-    hwnd: isize,
-    diameter: f32,
-    corner_ratio: f32,
-    window_size: f32,
-    cw: f32,
-    ch: f32,
-) -> bool {
-    let max_d = cw.min(ch);
-    let frac = (diameter / window_size).clamp(0.0, 1.0);
-    let d = (max_d * frac).round().clamp(1.0, max_d.round());
-    let corner = (d * corner_ratio.clamp(0.0, 1.0)).round().clamp(0.0, d);
-    let d = d as c_int;
-    let corner = corner as c_int;
-    // Client px → window px. `SetWindowRgn` measures from the window's top-left,
-    // so a rect centred on the client has to be moved by the client's own origin
-    // inside the window first (see the doc note above).
-    let (origin_x, origin_y) = client_origin_in_window(hwnd);
-    let left = origin_x + ((cw - d as f32) / 2.0).round() as c_int;
-    let top = origin_y + ((ch - d as f32) / 2.0).round() as c_int;
-    let hrgn = unsafe { CreateRoundRectRgn(left, top, left + d, top + d, corner, corner) };
-    if hrgn != 0 {
-        unsafe {
-            SetWindowRgn(hwnd, hrgn, 1);
-        }
-        true
-    } else {
-        // No region object: the previous cut (if any) is still in force, so
-        // report "no cut happened" and let the caller retry next frame.
-        false
-    }
-}
-
-/// Drop the window's clip entirely for a frame, by installing a region that
-/// covers `cw` × `ch` device px of client area — i.e. one that clips nothing.
-///
-/// This is what a resize is bracketed with. `SetWindowPos` does not move or
-/// rescale an existing region, so the instant between "window has the new size"
-/// and "region describes the new size" is a state Windows will happily present.
-/// Whichever order the two calls are made in, one of them leaves the ball
-/// showing through a hole cut for the other size:
-///
-/// ```text
-/// cut → resize    growing is fine, shrinking is not
-/// resize → cut    shrinking survives, growing is not
-/// ```
-///
-/// (Both have been shipped and both shipped a visible shard — see
-/// `ui::floating`'s render.) Opening the clip to the **union** of the old and
-/// the new client area answers both at once: the two rects share their origin,
-/// so the union is the larger of them, and Windows intersects an oversized
-/// region with the window rect, so a region that swallows a whole client clips
-/// nothing at all. The window is therefore fully visible for the whole of the
-/// resize, whichever way it is about to move, and the real shape goes back on
-/// immediately afterwards.
-///
-/// Costs one `SetWindowRgn` — paid only on the frames that actually resize.
-///
-/// **The region is a plain rectangle, not a rounded one.** It would be tempting
-/// to reuse [`cut_region`] with `diameter == window_size` and a corner ratio of
-/// `1.0`, but that does not produce "the whole client area": a round-rect whose
-/// corner ellipse diameters equal its sides has its four corner arcs meet, so
-/// the region *degenerates into the inscribed ellipse* — a circle. A circle
-/// centred on the large client does not contain the small client's top-left
-/// corner, so the ball sitting there during a dock/undock resize gets a bite
-/// taken out of it by the very call that was supposed to open the clip. That
-/// bite — one arc against two straight edges — is the "triangle" the user sees.
-/// Only `CreateRectRgn` actually covers the rectangle.
-pub fn open_window_region(hwnd: isize, cw: i32, ch: i32) -> bool {
-    if hwnd == 0 || cw <= 0 || ch <= 0 {
-        return false;
-    }
-    // Region coordinates are window coordinates, so the rect starts at the
-    // client's own origin inside the window — same translation `cut_region` does.
-    let (origin_x, origin_y) = client_origin_in_window(hwnd);
-    let hrgn = unsafe { CreateRectRgn(origin_x, origin_y, origin_x + cw, origin_y + ch) };
-    if hrgn == 0 {
-        return false;
-    }
-    unsafe {
-        SetWindowRgn(hwnd, hrgn, 1);
-    }
-    true
-}
-
-/// [`set_window_region`] with fully round corners — the resting ball, and the
-/// shape the window is seeded with before the first `render` runs.
-///
-/// The seed runs before any client rect is guaranteed, so this is the one caller
-/// still allowed to fall back to the monitor DPI (a `window_size × scale`
-/// phantom rect). It is approximate but harmless: the first real render
-/// immediately re-cuts from the measured client, and no user-visible frame
-/// depends on the seed's exactness.
-pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
-    if hwnd == 0 || window_size <= 0.0 || diameter <= 0.0 {
-        return;
-    }
-    let mut rc = Rect {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    unsafe {
-        GetClientRect(hwnd, &mut rc);
-    }
-    let client_w = (rc.right - rc.left) as f32;
-    let client_h = (rc.bottom - rc.top) as f32;
-    let (cw, ch) = if client_w > 0.0 && client_h > 0.0 {
-        (client_w, client_h)
-    } else {
-        // Not laid out yet: the very first frame can run before the client
-        // rect is valid. Fall back to the monitor DPI so the window is still
-        // round on frame one, instead of staying square until the next render
-        // (which, with a static ball, may never come).
-        let dpi = unsafe { GetDpiForWindow(hwnd) };
-        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-        let side = window_size * scale;
-        (side, side)
-    };
-    cut_region(hwnd, diameter, 1.0, window_size, cw, ch);
-}
-
 // ── Custom drag via Win32 subclass ───────────────────────────────────────────
 //
 // The ball is dragged by a Win32 subclass on the ball HWND. The subclass owns the
 // whole interaction, so it does not depend on GPUI's `WindowControlArea::Drag` or
 // on the ball's client area being hit-testable:
 //
-// 1. `WM_NCHITTEST` → the subclass answers `HTCAPTION` for every point. Every
-//    point the OS can hit is inside the circular window region (see
-//    `set_window_circle_region`), i.e. the ball, so an unconditional `HTCAPTION`
-//    is correct — clicks outside the circle never reach this window at all. This
-//    forces the OS to route a press as a **non-client** `WM_NCLBUTTONDOWN`
-//    instead of a client `WM_LBUTTONDOWN`. That non-client path is the one we
-//    could prove reaches the window on this transparent popup; the client path
-//    is not relied on.
+// 1. `WM_NCHITTEST` → the subclass answers `HTCAPTION` on the ball and
+//    `HTTRANSPARENT` everywhere else. `HTTRANSPARENT` is what makes clicks
+//    outside the ball fall through to whatever is underneath (the 360 / Thunder
+//    look) without any Win32 region; `HTCAPTION` forces the OS to route a press
+//    as a **non-client** `WM_NCLBUTTONDOWN` instead of a client
+//    `WM_LBUTTONDOWN`. That non-client path is the one we could prove reaches
+//    the window on this transparent popup; the client path is not relied on.
 // 2. On `WM_NCLBUTTONDOWN` (or the client `WM_LBUTTONDOWN` fallback) the subclass
 //    calls `SetCapture`, records the cursor→window offset, and **swallows** the
 //    message (`return 0`). Swallowing is what stops `DefWindowProc` from starting
@@ -488,8 +193,9 @@ pub fn set_window_circle_region(hwnd: isize, diameter: f32, window_size: f32) {
 // `SetWindowSubclass` (not `SetWindowLongPtrW`) composes with GPUI's own window
 // proc instead of replacing it, so the window keeps receiving every other
 // message (hover, show/hide, paint) and stays responsive. Clicks outside the
-// ball's circle pass through to the desktop via `SetWindowRgn` + the transparent
-// window style (the 360 / Thunder look).
+// ball's circle pass through to the desktop via the subclass's `WM_NCHITTEST`
+// (`HTTRANSPARENT` beyond the ball) + the transparent window style (the
+// 360 / Thunder look).
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -537,6 +243,14 @@ const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
 /// `HTCAPTION` (2): the hit-test answer that makes the OS treat a press as a
 /// non-client caption press, delivering `WM_NCLBUTTONDOWN`.
 const HTCAPTION: isize = 2;
+/// `HTTRANSPARENT` (-1): the hit-test answer that makes the OS hand the mouse
+/// message to whatever is underneath the point — the click-through half of the
+/// ball's shape, now that no `SetWindowRgn` carves the window.
+const HTTRANSPARENT: isize = -1;
+/// Slack (logical px) the hit-test circle keeps beyond the card's own radius,
+/// so the clickable area matches the visible halo rather than just the solid
+/// disc — the same generosity the old region's glow room gave.
+const HIT_SLACK: f32 = 12.0;
 /// `SWP_NOZORDER` is `0x0004`. Note `0x0002` is **`SWP_NOMOVE`** — using the
 /// wrong value here silently turns the drag into a no-op: `SetWindowPos` still
 /// succeeds and returns non-zero, but with `SWP_NOMOVE` set it ignores the x/y
@@ -606,11 +320,19 @@ unsafe extern "system" fn ball_drag_subclass(
 ) -> isize {
     match msg {
         WM_NCHITTEST => {
-            // Answer `HTCAPTION` so the OS routes a press here as a non-client
-            // `WM_NCLBUTTONDOWN`. Every hit-testable point of this window is
-            // inside the circular region (the ball), so this is unconditional.
-            // This is the reliable way to make the press reach the window on
-            // this transparent popup; it does not depend on GPUI's control areas.
+            // **The shape is the hit test.** There is no `SetWindowRgn` any
+            // more, so the subclass draws the boundary itself: the drag path
+            // (`HTCAPTION`) on the ball's own circle, `HTTRANSPARENT` beyond
+            // it — which is what makes clicks outside the ball reach whatever
+            // is underneath, the 360 / Thunder look, without any region.
+            // This stays the reliable way to make a press reach the window on
+            // this transparent popup; it does not depend on GPUI's control
+            // areas.
+            if let Some(hit) = ball_hit_test(hwnd, lparam) {
+                return hit;
+            }
+            // No believable geometry yet (first frames, DPI churn): keep the
+            // whole window on the drag path rather than dropping presses.
             return HTCAPTION;
         }
         WM_NCLBUTTONDOWN | WM_LBUTTONDOWN => {
@@ -756,11 +478,10 @@ unsafe extern "system" fn ball_drag_subclass(
             // Log only (never swallow): the geometry messages still have to reach
             // GPUI's own window proc through `DefSubclassProc` below.
             frame_log(&format!(
-                "msg={msg:#06x} dragging={} window={:?} client={:?} region={:?}",
+                "msg={msg:#06x} dragging={} window={:?} client={:?}",
                 *DRAGGING.get_or_init(|| Mutex::new(false)).lock().unwrap(),
                 window_rect(hwnd),
                 client_size_device(hwnd),
-                region_box(hwnd),
             ));
         }
         WM_LBUTTONDBLCLK | WM_NCLBUTTONDBLCLK => {
@@ -913,6 +634,60 @@ fn floating_card_frac() -> f32 {
     }
 }
 
+/// The hit-test half of the ball's shape: `Some(HTCAPTION)` on the ball's own
+/// circle, `Some(HTTRANSPARENT)` beyond it, `None` when no believable geometry
+/// exists yet.
+///
+/// The circle is the **card** (the published [`FLOATING_CARD_FRAC`] of the
+/// smaller client side) plus a [`HIT_SLACK`] of halo, centred on the client
+/// rect — the same rectangle the card is drawn in, so the two can never drift
+/// apart at any DPI. `lparam` carries the query point in **screen** px; it is
+/// mapped through the window rect into client space before the distance test.
+///
+/// # Safety
+/// `hwnd` must be a live window handle; the Win32 calls are ordinary.
+unsafe fn ball_hit_test(hwnd: isize, lparam: isize) -> Option<isize> {
+    let x = (lparam & 0xFFFF) as u16 as i32 as f32;
+    let y = ((lparam >> 16) & 0xFFFF) as u16 as i32 as f32;
+    // Screen-negative coordinates (a monitor left of / above the primary)
+    // arrive sign-extended; the u16→i32 round trip above keeps them negative.
+    let x = if x > 32767.0 { x - 65536.0 } else { x };
+    let y = if y > 32767.0 { y - 65536.0 } else { y };
+
+    let mut wr = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if GetWindowRect(hwnd, &mut wr) == 0 || wr.right <= wr.left || wr.bottom <= wr.top {
+        return None;
+    }
+    let dpi = GetDpiForWindow(hwnd);
+    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    let (lw, lh) = client_size_logical(hwnd, scale)?;
+    // The card's radius, in logical px, from the fraction the last render
+    // published — plus the halo slack, so the clickable circle matches what is
+    // visible rather than just the solid disc.
+    let card = lw.min(lh) * floating_card_frac();
+    let r = card / 2.0 + HIT_SLACK;
+    // The press point in window px → logical client px. The client's origin
+    // inside the window (`client_origin_in_window`) converts between the two;
+    // the card is centred on the client, so the centre is client/2.
+    let (ox, oy) = client_origin_in_window(hwnd);
+    let px_logical = (x - wr.left as f32 - ox as f32) / scale;
+    let py_logical = (y - wr.top as f32 - oy as f32) / scale;
+    let cx = lw / 2.0;
+    let cy = lh / 2.0;
+    let dx = px_logical - cx;
+    let dy = py_logical - cy;
+    Some(if dx * dx + dy * dy <= r * r {
+        HTCAPTION
+    } else {
+        HTTRANSPARENT
+    })
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
@@ -1042,10 +817,8 @@ pub fn shift_floating_window(hwnd: isize, dx: i32) {
 /// minus `GetWindowRect` instead.
 ///
 /// The distinction matters because the ball is laid out in **client** px while
-/// `SetWindowRgn` measures its region from the **window's** top-left. A region
-/// centred on the client rect but applied untranslated therefore lands `(8, 31)`
-/// px up and to the left of the content it is meant to enclose — which is the
-/// visible slice taken out of the ball's bottom-right.
+/// window moves (`SetWindowPos`) are measured from the **window's** top-left:
+/// any screen-space maths that mixes the two has to cancel this offset first.
 pub fn client_origin_in_window(hwnd: isize) -> (i32, i32) {
     if hwnd == 0 {
         return (0, 0);
@@ -1095,43 +868,9 @@ fn window_frame_size(hwnd: isize) -> (i32, i32) {
     )
 }
 
-/// The window region's bounding box in **window** coords, or `None` when there
-/// is no region (or it cannot be read).
-///
-/// Exists for the frame log: a region that no longer traces the client rect is
-/// invisible from the inside — the ball is simply sliced — so telling "the cut
-/// is stale" from "the layout box drifted" needs the region's actual box next to
-/// the geometry the frame asked for.
-pub fn region_box(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
-    if hwnd == 0 {
-        return None;
-    }
-    unsafe {
-        let dst = CreateRectRgn(0, 0, 1, 1);
-        if dst == 0 {
-            return None;
-        }
-        let got = GetWindowRgn(hwnd, dst);
-        if got == 0 {
-            DeleteObject(dst);
-            return None;
-        }
-        let mut box_ = Rect {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        let ok = GetRgnBox(dst, &mut box_) != 0;
-        DeleteObject(dst);
-        ok.then_some((box_.left, box_.top, box_.right, box_.bottom))
-    }
-}
-
 /// Force a **full-window** repaint on the next pass: the whole client rect is
 /// marked invalid, so the next frame's present cannot be reduced to a damage
-/// sub-rect. A window whose surface shows a stale *partial* frame (a quarter of
-/// the ball while the region is verifiably healthy — the 2026-10-19 shard) only
+/// sub-rect. A window whose surface shows a stale *partial* frame only
 /// recovers when the entire surface is re-fetched, which is exactly what a
 /// full invalidation asks of the compositor.
 pub fn invalidate_whole_window(hwnd: isize) {

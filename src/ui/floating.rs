@@ -1,13 +1,13 @@
 //! Always-on-top floating "usage ball".
 //!
 //! A single sphere filled with the app's **theme accent** (`cx.theme().primary`),
-//! drawn in a transparent, frameless popup window that is clipped to a circle
-//! via `SetWindowRgn` — so there is no square OS frame or rectangular shadow,
-//! and clicks outside the ball pass through to the desktop (the 360 / Thunder
-//! style). Its diameter grows with total token usage (area ∝ usage) and it
-//! pops slightly on hover for a floating feel. The total token count and the
-//! period it was aggregated over ("今日" / "本周" / …) are overlaid on the
-//! sphere; data is pushed from `TokenMonitorApp`.
+//! drawn in a transparent, frameless popup window — so there is no square OS
+//! frame or rectangular shadow, and clicks outside the ball pass through to the
+//! desktop (`WM_NCHITTEST` answers `HTTRANSPARENT` beyond the ball; the
+//! 360 / Thunder look). Its diameter grows with total token usage
+//! (area ∝ usage) and it pops slightly on hover for a floating feel. The total
+//! token count and the period it was aggregated over ("今日" / "本周" / …) are
+//! overlaid on the sphere; data is pushed from `TokenMonitorApp`.
 //!
 //! Dropped against the left or right screen edge it **docks** into a rounded
 //! square instead — see "Two forms, one card" below.
@@ -26,19 +26,18 @@
 //!
 //! # The rules, and the bugs that produced them
 //!
-//! ## 1. The ball and the clip are laid out from the *same* rectangle
+//! ## 1. The ball is laid out from the window's *own* rectangle
 //!
 //! Everything is derived from the window's real **client rect**
-//! ([`crate::platform::client_size_logical`]) — the same rectangle
-//! `SetWindowRgn` clips in — converted to logical px with the window's own
-//! scale factor. Both the ball's offset and the region are then centred on that
-//! one rectangle, so they are concentric *by construction*, at any DPI.
+//! ([`crate::platform::client_size_logical`]) converted to logical px with the
+//! window's own scale factor, so the ball is centred on the rectangle the
+//! window actually occupies — concentric *by construction*, at any DPI.
 //!
 //! Using GPUI's `viewport_size()` instead was the bug behind "I can only see
 //! part of the circle": the viewport is the size GPUI *believes* the window
 //! has, which can disagree with the real client area. A ball centred on the
-//! viewport inside a clip centred on the client rect ends up off-centre, and
-//! the clip then severs one rim — leaving a hard, aliased, one-sided cut and no
+//! viewport inside a window of the real client size ends up off-centre, and the
+//! window edge then severs one rim — leaving a hard, one-sided cut and no
 //! glow on that side, which is exactly what a pixel dump of the broken build
 //! showed.
 //!
@@ -54,19 +53,20 @@
 //! corners, so a child near a corner stays fully visible and pokes out — the
 //! ball read as a teardrop. `overflow_hidden` is not used here at all.
 //!
-//! ## 3. The clip always keeps real empty space beyond the glow
+//! ## 3. The window keeps real empty space beyond the glow
 //!
-//! [`clip_diameter_for`] sizes the region to the card plus
-//! `2 * (glow tail + CLIP_PAD)`, which keeps the region's hard, non-anti-aliased
-//! edge on pixels the gaussian tail has already faded below one 8-bit level. A
-//! region that touched a drawn edge would jag it, and a region *larger* than the
-//! window makes `SetWindowRgn` degenerate into "no clip at all".
+//! The glow's gaussian tail has to fade below one 8-bit level **inside** the
+//! window: nothing clips it any more (there is no `SetWindowRgn`), but the
+//! window edge itself must never land on a pixel the glow still visibly
+//! covers, or the transparent popup's rectangle would show as a faint square
+//! against some desktops. [`card_pad`] keeps that empty ring around the glow
+//! — and `clip_diameter_for`, the card's **fit**, is the docked window side
+//! built from it.
 //!
-//! The region is derived from the **card**, never from the window: a region that
+//! The fit is derived from the **card**, never from the window: a fit that
 //! followed the window would silently shrink below what is drawn the moment the
-//! two disagree, and the disagreement would surface as a shaved rim. Window and
-//! region are one rectangle only when docked; free, the window is the fixed
-//! [`WINDOW_SIZE`] around a smaller region.
+//! two disagree. Window and fit are one rectangle only when docked; free, the
+//! window is the fixed [`WINDOW_SIZE`] around a smaller fit.
 //!
 //! ## 4. The glow is one blurred disc, never a stack of discs
 //!
@@ -103,12 +103,11 @@
 //! reports the decision here, and this view owns the *shape*.
 //!
 //! The morph is one `morph` value (0 = circle, 1 = square) that the entire
-//! render reads — the corner radius of every shading layer, the card's **side**,
-//! the region cut around it, and the label's unit. It is driven by our own frame
-//! timer rather than `with_animation`, because a GPUI animation element can only
-//! restyle its **own** root: the ball is a stack of *sibling* layers (base, foot
-//! shade, sheen, rim) plus a native region, and all of them have to move
-//! together.
+//! render reads — the corner radius of every shading layer, the card's **side**
+//! and the label's unit. It is driven by GPUI's frame callback rather than
+//! `with_animation`, because a GPUI animation element can only restyle its
+//! **own** root: the ball is a stack of *sibling* layers (base, foot shade,
+//! sheen, rim) and all of them have to move together.
 //!
 //! Two things beyond the rounding change when it docks, and both are derived
 //! from the same `morph`:
@@ -140,15 +139,14 @@
 //!
 //! **Free, the ball keeps the fixed [`WINDOW_SIZE`] window.** A circle never
 //! docks, so every problem above belongs to the docked form — while resizing the
-//! window under a *circle* costs something real. The ball and the region are both
-//! centred on the client rect, so as long as neither the window nor the
-//! measurement of it ever changes, they are concentric by construction and the
-//! region cannot shave a rim. Resizing turns that into an arithmetic guarantee
-//! that only holds if the two are computed from the *same* rectangle in the
-//! *same* frame — and a single frame where the card is laid out on the old
-//! rectangle while the region is cut from the new one slices a hard, one-sided
-//! bite out of the ball. Keeping the free window fixed keeps the circle exactly
-//! as it always was; only the docked square shrinks the window.
+//! window under a *circle* costs something real. The ball is centred on the
+//! client rect, so as long as neither the window nor the measurement of it ever
+//! changes, the two are concentric by construction. Resizing turns that into an
+//! arithmetic guarantee that only holds if the two are computed from the *same*
+//! rectangle in the *same* frame — and a single frame where the card is laid
+//! out on a rectangle the window does not have slices a hard, one-sided bite
+//! out of the ball. Keeping the free window fixed keeps the circle exactly as
+//! it always was; only the docked square shrinks the window.
 
 use crate::platform::frame_log;
 use gpui::{
@@ -164,8 +162,7 @@ use crate::app::state::TimeTab;
 use crate::format::{format_int_grouped, format_tokens_wan};
 use crate::platform::{
     client_origin_in_window, client_size_device, fit_floating_card_window, monitor_work_area,
-    move_window, open_window_region, resize_floating_window_plain, set_floating_card_frac,
-    set_floating_refresh_hit, set_window_circle_region, set_window_region,
+    move_window, resize_floating_window_plain, set_floating_card_frac, set_floating_refresh_hit,
     snap_floating_window_to_edge, window_rect, window_scale, DockEdge, DOCK_GAP,
 };
 
@@ -186,27 +183,19 @@ const MIN_SPHERE: f32 = 112.0;
 /// ends are scaled by one factor — 144/232 → 128/200 → 112/175 so far. Scaling
 /// both keeps `sphere_diameter_for`'s shape (the sqrt ramp, the hover pop, the
 /// ball's proportions), so a size tweak only changes how big the ball is, never
-/// how it grows with usage. The card's side drives the region, and — docked — the
-/// window ([`window_side_for`]), so the whole widget's footprint follows it.
+/// how it grows with usage. The card's side drives the window (docked:
+/// [`window_side_for`]), so the whole widget's footprint follows it.
 const MAX_SPHERE: f32 = 175.0;
 /// Usage (tokens) at which the ball reaches its maximum diameter.
 const REF_TOKENS: f64 = 200_000_000.0;
 /// Hover pop scale — the ball lifts / grows a touch when the mouse is over it.
 const HOVER_SCALE: f32 = 1.06;
-/// Slack (px) the region keeps inside the client rect. The region is cut from
-/// the window's own size, and a region that *equals* the window stops excluding
-/// anything — the rounded corners would come back as clickable dead spots. Four
-/// px in is enough for `SetWindowRgn` to keep cutting, and costs nothing: the
-/// glow's tail ends [`CLIP_PAD`] short of the edge, so the region still lands on
-/// empty pixels.
-const CLIP_MARGIN: f32 = 4.0;
 /// Clear gap (px) the window keeps around the outermost *visible* glow pixel.
-/// The region is cut with a hard, non-anti-aliased edge, so the window has to
-/// carry this much empty margin for the cut to land on pixels the gaussian tail
-/// has already faded out — otherwise it jags whatever it lands on. It is also the
-/// only reason the card is not flush with the client edge, and it is deliberately
-/// small: everything the window covers beyond this ring is dead weight (see the
-/// module note).
+/// The glow has to fade below one 8-bit level before the window's own edge, or
+/// the transparent popup's rectangle shows as a faint square. It is also the
+/// only reason the card is not flush with the client edge, and it is
+/// deliberately small: everything the window covers beyond this ring is dead
+/// weight (see the module note).
 const CLIP_PAD: f32 = 12.0;
 /// Blur radius of the glow, as a multiple of the ball diameter. This is the
 /// gaussian's σ, so it sets how far the glow reaches and how soft it is: at
@@ -215,33 +204,23 @@ const CLIP_PAD: f32 = 12.0;
 const GLOW_BLUR_RATIO: f32 = 0.085;
 /// How many σ of the glow tail count as visible. A gaussian has no finite
 /// support, but past ~2σ its alpha is under 2% of the peak, i.e. below one 8-bit
-/// level against a light desktop — so this, and not 3σ, is the radius the clip
-/// and the window have to clear.
+/// level against a light desktop — so this, and not 3σ, is the radius the
+/// window has to clear.
 const GLOW_TAIL_SIGMA: f32 = 2.0;
 /// Composited opacity of the glow at the ball's rim, before the blur halves it.
 /// A blurred disc covers its own edge with exactly half the source alpha, so
 /// this is the strength the glow *peaks* at, right where it meets the ball.
 const GLOW_PEAK_ALPHA: f32 = 0.24;
-/// Fraction of the window the *seeded* (first-frame) clip uses. Large on
-/// purpose: a first frame that is too generous merely looks like a bigger
-/// click-through circle for one frame, while a first frame that is too tight
-/// would visibly shave the ball.
-const SEED_CLIP_FRACTION: f32 = 0.98;
 /// Below this, a measured size is not believable (the client rect can read 0
 /// before the first layout) and the layout falls back to the size the frame is
 /// asking the window to be, rather than drawing a sub-pixel ball into a
-/// degenerate region.
+/// degenerate window.
 const MIN_SANE_WINDOW: f32 = 32.0;
 
 /// Corner roundness of the docked **square**, as the corner ellipse's diameter
 /// over the card's side. `1.0` is the circle — the ellipse's diameter equals
 /// the side, so the four corners meet — and `0.36` leaves an
 /// 18%-of-side radius: a rounded square, not a hard-cornered tile.
-///
-/// The Win32 region is cut from the *same* ratio (`set_window_region`), so the
-/// shape drawn and the shape clicks pass through are one shape at every point
-/// of the morph and at every size — see
-/// `clip_contains_the_morphed_card_and_its_glow`.
 const SQUARE_CORNER_RATIO: f32 = 0.36;
 /// Side of the docked square, as a fraction of the ball's diameter.
 ///
@@ -358,20 +337,20 @@ fn glow_visible_radius(sphere_d: f32) -> f32 {
     sphere_d / 2.0 + GLOW_TAIL_SIGMA * glow_blur(sphere_d)
 }
 
-/// Room (px) the **region** keeps on each side of the card: the glow's visible
-/// tail, plus [`CLIP_PAD`] of empty pixels for the region's hard edge to land on.
+/// Room (px) the window keeps on each side of the card: the glow's visible
+/// tail, plus [`CLIP_PAD`] of empty pixels before the window's own edge.
 fn card_pad(card_d: f32) -> f32 {
     glow_visible_radius(card_d) - card_d / 2.0 + CLIP_PAD
 }
 
-/// Diameter (px) of the region cut around a card of `card_d` px: the card plus
-/// [`card_pad`] on each side.
+/// Diameter (px) of the card's **fit** — the smallest window side that holds a
+/// card of `card_d` px plus its glow with [`card_pad`] to spare.
 ///
-/// Derived *from the card*, so the region can never come out too small for what
-/// is drawn — the card is not capped by the window any more, the region follows
-/// the card. It is also the docked widget's whole footprint: docked, the window
-/// is resized to exactly this, so "the region is the card plus the room its glow
-/// needs" holds by construction rather than by arithmetic.
+/// Derived *from the card*, so the docked footprint can never come out too
+/// small for what is drawn. It is also the docked widget's whole footprint:
+/// docked, the window is resized to exactly this, so "the window is the card
+/// plus the room its glow needs" holds by construction rather than by
+/// arithmetic.
 fn clip_diameter_for(card_d: f32) -> f32 {
     card_d + 2.0 * card_pad(card_d)
 }
@@ -382,15 +361,11 @@ fn clip_diameter_for(card_d: f32) -> f32 {
 /// Two ends, deliberately different:
 ///
 /// * **Free** (`t = 0`) — [`WINDOW_SIZE`], the size the app opens the window at.
-///   The window is *not* resized while the ball is a circle. Card and region are
-///   both centred on the client rect, so as long as nothing resizes the window
-///   they are concentric by construction and the region cannot shave the ball;
-///   resizing turns that into an arithmetic guarantee, and one frame where the
-///   card is laid out on the old rectangle while the region is cut from the new
-///   one cuts a hard, one-sided slice out of the ball.
-/// * **Docked** (`t = 1`) — [`clip_diameter_for`], i.e. exactly the region. A
-///   card resting against the screen edge then carries no invisible margin beyond
-///   it, which is the whole point of docking: nothing the widget does can reach
+///   The window is *not* resized while the ball is a circle: the card is centred
+///   on the client rect, so it stays concentric with the window by construction.
+/// * **Docked** (`t = 1`) — [`clip_diameter_for`], the card's own fit. A card
+///   resting against the screen edge then carries no invisible margin beyond it,
+///   which is the whole point of docking: nothing the widget does can reach
 ///   off-screen.
 ///
 /// The walk between the two is linear in `t` — the same ramp as the corner radius
@@ -412,16 +387,15 @@ fn window_side_for(card_d: f32, t: f32) -> f32 {
 ///   the window, which can be twice the real client area while the OS is still
 ///   applying a resize it made behind the app's back (a `WM_DPICHANGED` rewrites
 ///   the window rect when the ball crosses the monitor boundary). Laying the card
-///   out on one rectangle while the OS clips to another puts the ball's centre on
-///   the client rect's own corner and slices a quarter off — measured as a
-///   *sharp* rectangle, not the region's rounded square, which is how that one was
-///   told apart from a stale region.
+///   out on one rectangle while the window really is another puts the ball's
+///   centre on the client rect's own corner and slices a quarter off — a cut
+///   along a *sharp* rectangle, which is how that one was told apart.
 /// * A "does this match the size we asked for" sanity test. The measurement is
 ///   taken right after a synchronous `SetWindowPos`, so a mismatch means DPI
 ///   rounding (or a frame or two the OS has not painted yet), not a window that
 ///   is about to be replaced. Treating it as the latter threw away the real
 ///   rectangle — which is how a window that is *not* that size ends up with a
-///   ball nowhere near the centre of the region cut around it.
+///   ball nowhere near the centre of the window it sits in.
 
 /// Whether a dot of radius `r` centred at `(cx, cy)` (all fractions of the ball
 /// diameter) fits inside the ball's inscribed circle. Guards the specular
@@ -436,8 +410,8 @@ fn dot_is_inside_disc(cx: f32, cy: f32, r: f32) -> bool {
 /// Corner roundness (corner-ellipse diameter / side) of the card at morph
 /// progress `t`: `1.0` — the circle — at 0, [`SQUARE_CORNER_RATIO`] at 1.
 ///
-/// One value drives the drawn corner radii *and* the Win32 region's corners, so
-/// the two can never disagree while the ball morphs.
+/// One value drives the card's drawn corner radii, so the shape on screen is
+/// always the one that belongs to the `t` the window side was read at.
 fn corner_ratio_for(t: f32) -> f32 {
     1.0 + (SQUARE_CORNER_RATIO - 1.0) * t.clamp(0.0, 1.0)
 }
@@ -447,10 +421,10 @@ fn corner_ratio_for(t: f32) -> f32 {
 ///
 /// The morph therefore moves *two* things at once — the corner radius (see
 /// [`corner_ratio_for`]) and this side — and both are read from the same `t`, so
-/// what is drawn, the region cut around it and the drop the Win32 side already
-/// made can never disagree about how big the widget is. Linear in `t` on
-/// purpose: [`corner_ratio_for`] is linear too, so the shrink and the
-/// rounding-up land together instead of one arriving first.
+/// what is drawn and the window sized around it (see [`window_side_for`]) can
+/// never disagree about how big the widget is. Linear in `t` on purpose:
+/// [`corner_ratio_for`] is linear too, so the shrink and the rounding-up land
+/// together instead of one arriving first.
 fn card_side_for(sphere_d: f32, t: f32) -> f32 {
     sphere_d * (1.0 - (1.0 - DOCK_SIDE_RATIO) * t.clamp(0.0, 1.0))
 }
@@ -459,10 +433,10 @@ fn card_side_for(sphere_d: f32, t: f32) -> f32 {
 /// outer edge of a corner arc, along the diagonal.
 ///
 /// It is `side / 2` for a circle (`corner_ratio = 1`) and less than
-/// `side / 2 * SQRT_2` for a rounded square, which is exactly the quantity the
-/// region has to exceed so it does not slice the card mid-flight. Only the
-/// invariant test needs the number, but the model belongs next to the geometry
-/// it describes.
+/// `side / 2 * SQRT_2` for a rounded square — the quantity the window side has
+/// to exceed so the card can never poke out of the popup. Only the invariant
+/// test needs the number, but the model belongs next to the geometry it
+/// describes.
 #[cfg(test)]
 fn rounded_reach(side: f32, corner_ratio: f32) -> f32 {
     let radius = side * corner_ratio.clamp(0.0, 1.0) / 2.0;
@@ -577,89 +551,31 @@ fn morph_walk_progress(morph_from: f32, morph_target: f32, morph: f32) -> f32 {
     }
 }
 
-/// The window-region box a frame needs, in window coordinates: the open
-/// rectangle covering the whole client while a morph runs, the centred cut at
-/// rest. Pure arithmetic on inputs the render already computed, so it is
-/// directly unit-testable.
-///
-/// This is the **expected** half of the region truth-check: the OS's own
-/// region (read via `platform::region_box`, which is `GetWindowRgn`'s word, not
-/// a cache) is compared against this every frame, and any disagreement forces
-/// the open → resize → cut bracket to run again even when the memo claims the
-/// region is current. See `FloatingView::render` for why that check exists.
-fn expected_region_box(
-    client_origin: (i32, i32),
-    client: (i32, i32),
-    region_d: f32,
-    scale: f32,
-    animating: bool,
-) -> (i32, i32, i32, i32) {
-    if animating {
-        // The open state: the client-sized rectangle at the client's own
-        // origin — the shape `open_window_region` installs.
-        (
-            client_origin.0,
-            client_origin.1,
-            client_origin.0 + client.0,
-            client_origin.1 + client.1,
-        )
-    } else {
-        // The resting cut: a `region_d`-side square centred on the client —
-        // the box `cut_region` centres (what `GetWindowRgnBox` reports for the
-        // round-rect region, since a region's box is its bounding box).
-        let d = (region_d * scale).round().max(1.0) as i32;
-        let side = client.0.min(client.1);
-        let l = client_origin.0 + (side - d) / 2;
-        let t = client_origin.1 + (side - d) / 2;
-        (l, t, l + d, t + d)
-    }
-}
-
-/// Whether the region actually in force matches the box a frame needs, to
-/// within the ±px tolerance that rounds `cut_region`'s own arithmetic can
-/// wobble by (it scales the *device* client by a logical fraction; this check
-/// scales the *logical* diameter by the scale factor — the two paths agree to
-/// ~1 px at any DPI).
-fn region_box_matches(actual: (i32, i32, i32, i32), expected: (i32, i32, i32, i32)) -> bool {
-    const TOL: i32 = 3;
-    (actual.0 - expected.0).abs() <= TOL
-        && (actual.1 - expected.1).abs() <= TOL
-        && (actual.2 - expected.2).abs() <= TOL
-        && (actual.3 - expected.3).abs() <= TOL
-}
-
-/// The `(window side, region diameter)` the transition runs on, instead of the
+/// The `(window side, card fit)` the transition runs on, instead of the
 /// per-frame geometry it is animating between.
 ///
-/// A morph moves the card **and** the window **and** the native region together,
-/// and each of the two structural calls costs 20–33 ms measured — `SetWindowPos`
-/// has to make DWM re-allocate the window's surface, `SetWindowRgn` has to
-/// recompute the clip. Fifteen of those in a 240 ms animation do not fit in a
-/// 16 ms frame: they serialise on the main thread, so the timer falls behind by
-/// whatever the frame cost, and the transition lands as 5–6 frames at ~60 ms
-/// apart (measured) — `morph` jumping 0 → 0.03 → 0.26 → 1.0 with whole frames
-/// dropped in between. That is the jank.
+/// A morph moves the card **and** the window together, and the window move costs
+/// 20–33 ms measured — `SetWindowPos` has to make DWM re-allocate the window's
+/// surface. Fifteen of those in a 240 ms animation do not fit in a 16 ms frame:
+/// they serialise on the main thread, so the timer falls behind by whatever the
+/// frame cost, and the transition lands as 5–6 frames at ~60 ms apart
+/// (measured) — `morph` jumping 0 → 0.03 → 0.26 → 1.0 with whole frames dropped
+/// in between. That is the jank.
 ///
 /// So while a morph runs, both are pinned to the **envelope**: one shape large
 /// enough to hold the card at *both* ends of the transition plus the room its
 /// glow needs. The circle is the big end (`card_side_for` shrinks towards the
 /// square), so the envelope is the free circle's own geometry — and since the
 /// free window is [`WINDOW_SIZE`] and already exceeds that, the envelope window
-/// is simply `WINDOW_SIZE` and the envelope region is the free circle's region.
-/// Which means a morph performs its two structural changes at the **ends only**:
-/// docking cuts once as it lands, undocking cuts once as it leaves, and every
-/// frame in between is pure GPUI drawing.
-///
-/// The envelope is a circle, and the card is a rounded square in the second half
-/// of the morph — but the card's own corners are inside a circle of the
-/// *circle's* diameter (that is what [`clip_diameter_for`] derives from), so
-/// nothing can be sliced mid-flight.
+/// is simply `WINDOW_SIZE`. Which means a morph performs its one structural
+/// change at the **ends only**, and every frame in between is pure GPUI
+/// drawing.
 fn morph_envelope(sphere_d: f32) -> (f32, f32) {
     let clip = clip_diameter_for(sphere_d);
     (WINDOW_SIZE.max(clip), clip)
 }
 
-/// `(window side, region diameter, corner ratio)` for a frame — the frame's own
+/// `(window side, card fit, corner ratio)` for a frame — the frame's own
 /// geometry while the ball is at rest, the **envelope**'s while a morph runs.
 ///
 /// This is the single place the two regimes meet, so it is the single place that
@@ -854,24 +770,6 @@ fn quantize(v: f32) -> i32 {
     (v * 100.0).round() as i32
 }
 
-/// Seed the window's circular clip from Win32, before the first `render` runs.
-///
-/// `render` re-applies the region, but the very first frame can see an
-/// uninitialised client rect (and the region would then be skipped), leaving the
-/// popup square until the next `notify`. Seeding it here makes the window round
-/// from the first paint. The seeded circle is deliberately generous
-/// ([`SEED_CLIP_FRACTION`] of whatever the window turns out to be) so it can
-/// never clip the ball on the frame before the real geometry is known.
-pub fn seed_window_region(hwnd: isize) {
-    set_window_circle_region(hwnd, WINDOW_SIZE * SEED_CLIP_FRACTION, WINDOW_SIZE);
-}
-
-/// Identity of a region cut: the **requested** geometry (`window side`, `corner
-/// ratio`, `region diameter`) **plus the device client rect it was measured
-/// against**. See [`FloatingView::last_region`] for why the device half is not
-/// redundant and why "requested" rather than "measured" is the operative word.
-type RegionKey = (f32, i32, i32, Option<(i32, i32)>);
-
 pub struct FloatingView {
     hwnd: isize,
     total_tokens: u64,
@@ -902,12 +800,11 @@ pub struct FloatingView {
     /// near.
     edge: Option<DockEdge>,
     /// Morph progress: 0 = circle, 1 = square. Every layer of the render reads
-    /// it, and so does the Win32 region, so the drawn shape and the clickable
-    /// shape stay one shape.
+    /// it, so the drawn shape is one shape at every point of the transition.
     morph: f32,
-    /// Whether a morph is in flight — the window and the region are held at their
-    /// **envelope** while it runs (see [`morph_envelope`]), so a 240 ms transition
-    /// costs two structural changes instead of fifteen.
+    /// Whether a morph is in flight — the window is held at its **envelope**
+    /// while it runs (see [`morph_envelope`]), so a 240 ms transition costs two
+    /// structural changes instead of fifteen.
     animating: bool,
     /// The in-flight morph's endpoints and start. Held as data rather than as a
     /// running task, because the transition is advanced by
@@ -926,8 +823,8 @@ pub struct FloatingView {
     /// invisible; a gap-width off is not.
     ///
     /// A re-snap is a position-only move, which cannot clip anything — the
-    /// region and the content travel with the window — so deferring it costs
-    /// no intermediate state.
+    /// content travels with the window — so deferring it costs no intermediate
+    /// state.
     pending_snap: Option<DockEdge>,
     /// Layout-box centre (client-area px) the in-flight morph started from: the
     /// old form's client centre, snapshotted when the morph begins. The walk
@@ -964,57 +861,35 @@ pub struct FloatingView {
     /// back to the anchored move, which is the move that carries the old
     /// content off-centre).
     settle_plain: bool,
-    /// Identity of the region currently in force: `(window_size, corner_ratio,
-    /// region_diameter, client rect it was cut from)`. Re-applying an identical
-    /// region forces the OS to recompute and repaint the whole window for
-    /// nothing — and a needless re-cut of the rim can flicker — so the region is
-    /// only pushed when the geometry actually moved.
-    ///
-    /// The logical triple alone cannot be the whole memo: the region's *device*
-    /// geometry is a fraction of the client rect, and that rect changes size
-    /// without any logical quantity moving whenever the window is resized (a
-    /// `WM_DPICHANGED` suggested rect, a queued `SetWindowPos`, the morph's own
-    /// freeze-then-land resize). That is the 2026-10-14 shard: the window was
-    /// free 360 px, the card was drawn centred in it, and the region still traced
-    /// the docked 148 px cut, with a memo that said everything was up to date.
-    last_region: RegionKey,
-    /// Client-rect size (device px) the region currently in force was cut from.
-    last_clip_client: (i32, i32),
-    /// Logical client size of the last frame that *proved* it — cut installed and
-    /// the window still the same size when it went in.
+    /// Logical client size of the last frame that *proved* it — the window was
+    /// verifiably this size when the frame went in.
     ///
     /// This is the fallback for a frame where no client rect can be read at all.
     /// It is safe precisely because it is not a general-purpose "last known
     /// size": a frame that reaches the fallback did **not** touch the window, so
     /// the window still has exactly this geometry. Laying out in it keeps the
-    /// card and the clip concentric; laying out in the size we *would* have asked
-    /// for does not, and a resize that never lands (a morph cancelled mid-flight,
-    /// a drag that outruns the message) would leave the ball drawn for a window
-    /// that does not exist.
+    /// card centred on the real window; laying out in the size we *would* have
+    /// asked for does not, and a resize that never lands (a morph cancelled
+    /// mid-flight, a drag that outruns the message) would leave the ball drawn
+    /// for a window that does not exist.
     last_verified_client: (f32, f32),
     /// Cached fit of the token-count string.
     num_fit: Option<TextFit>,
     /// Cached fit of the period label.
     label_fit: Option<TextFit>,
-    /// The region box the last **resting** render verified as actually in force
-    /// (`None` while a morph runs or a bracket is pending — frames come fast
-    /// then, and the render-side truth-check covers them). The region sentinel
-    /// compares the OS's region against this between frames: a window left out
-    /// of step while no frame is drawn would otherwise stay broken forever.
-    region_truth: Option<(i32, i32, i32, i32)>,
 }
 
 impl FloatingView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // **The region sentinel.** The render-side truth-check only runs while
-        // frames are drawn, and a resting ball draws none — the morph's
-        // `request_animation_frame` chain ends at landing, and nothing wakes a
-        // window at rest. A window left out of step with its region at that
-        // point (the 2026-10-19 shard) would wait forever for a frame that
-        // never comes. This watch reads the OS's region every 800 ms and wakes
-        // a render only when it no longer matches the box the last resting
-        // render verified; the render-side check then forces the bracket and
-        // the window heals.
+        // **The presentation heartbeat.** A resting ball draws no frames of its
+        // own — the morph's `request_animation_frame` chain ends at landing,
+        // and nothing wakes the window until an input event. If the window was
+        // fully occluded mid-morph, GPUI/DWM can stop presenting and the surface
+        // keeps stale pixels while the app's state stays perfectly healthy —
+        // invisible from inside the app. Every 800 ms this watch invalidates
+        // the whole client (forcing the next present to cover the window) and
+        // wakes one render. It runs **between** frames, so it can only ever
+        // observe the settled state, never a transition mid-flight.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(800))
@@ -1029,44 +904,14 @@ impl FloatingView {
                     ));
                     return;
                 }
-                let Some(expected) = view.region_truth else {
-                    return;
-                };
-                // **`None` is a desync too.** A window can lose its region
-                // outright (`GetWindowRgn` → ERROR, seen 2026-10-19 ~21:20 on a
-                // resting ball): the shard state this watch exists for. Only an
-                // actual, matching region counts as healthy.
-                let actual = crate::platform::region_box(view.hwnd);
-                if !actual.is_some_and(|a| region_box_matches(a, expected)) {
-                    frame_log(&format!(
-                        "sentinel: region desync actual={actual:?} expected={expected:?} — waking render"
-                    ));
-                }
-                // **Recompose the whole window at rest, unconditionally.** Two
-                // failure modes die here. (1) A stale *shape*: the landing
-                // `SetWindowRgn(bRedraw=1)` can miss the DWM recomposition, and
-                // the compositor keeps clipping correct content to the stale
-                // form's cut — the deterministic undock shard until a hover
-                // recomposed the truth (2026-10-19). The frame-changed nudge
-                // makes the compositor re-read the region. (2) A stale
-                // *surface*: a window fully occluded mid-morph stops being
-                // presented and keeps old pixels on screen (the same shard,
-                // second appearance). The full invalidation forces the next
-                // present to cover the whole window. Both nudges are safe only
-                // because this runs **at rest** — content, region and memo all
-                // verified in the same frame; the first attempt nudged inside
-                // the render instead and froze the bracket's transient black
-                // state onto the screen (2026-10-20). 1.25 Hz on a resting
-                // ball costs nothing.
                 crate::platform::invalidate_whole_window(view.hwnd);
-                crate::platform::nudge_dwm_composition(view.hwnd);
                 cx.notify();
             });
         })
         .detach();
         // Mark the log with this instance's hwnd: a second start line with a
         // different hwnd means the window was recreated, and every stale-hwnd
-        // suspect (region ops into a dead window) becomes visible in the log.
+        // suspect becomes visible in the log.
         frame_log(&format!("floating-start hwnd={:#x}", hwnd_of(window)));
         Self {
             hwnd: hwnd_of(window),
@@ -1086,12 +931,9 @@ impl FloatingView {
             anim_center_now: (WINDOW_SIZE / 2.0, WINDOW_SIZE / 2.0),
             anim_screen_anchor: (0.0, 0.0),
             settle_plain: false,
-            last_region: (0.0, 0, 0, None),
-            last_clip_client: (0, 0),
             last_verified_client: (WINDOW_SIZE, WINDOW_SIZE),
             num_fit: None,
             label_fit: None,
-            region_truth: None,
         }
     }
 
@@ -1160,19 +1002,9 @@ impl FloatingView {
 
     /// Animate [`Self::morph`] to `target` (0 = circle, 1 = square).
     ///
-    /// Driven by our own frame timer rather than `with_animation`, because the
-    /// shape is *several* sibling layers plus the native region: a GPUI
-    /// animation element can only restyle its own root, while here every layer —
-    /// and the region with them — has to read the same progress.
-    ///
-    /// Assigning to `morph_task` drops the previous task, which is what cancels
-    /// a morph that is still in flight (dropping a `Task` aborts it).
-    /// Animate [`Self::morph`] to `target` (0 = circle, 1 = square).
-    ///
     /// Driven by GPUI's own frame callback rather than `with_animation`, because
-    /// the shape is *several* sibling layers plus the native region: a GPUI
-    /// animation element can only restyle its own root, while here every layer —
-    /// and the region with them — has to read the same progress.
+    /// the shape is *several* sibling layers that all have to read the same
+    /// progress — a GPUI animation element can only restyle its own root.
     ///
     /// All this does is **start** the transition: it records where it starts and
     /// asks for a repaint. The advancing itself happens in [`Render::render`],
@@ -1232,8 +1064,8 @@ impl FloatingView {
     ///
     /// The advance lives here, in `render`, rather than in a background timer,
     /// because of what the two cost. Measured on this widget: `render`'s own body
-    /// is **0.9–2.0 ms** per frame once the window and the region are pinned to
-    /// the morph envelope, while a 16 ms `background_executor` timer delivered
+    /// is **0.9–2.0 ms** per frame once the window is pinned to the morph
+    /// envelope, while a 16 ms `background_executor` timer delivered
     /// frames **19–77 ms** apart. The timer is not slow — it wakes on time — but
     /// it wakes on *its own* schedule, which has no relation to the display's
     /// refresh: a wake-up that lands just after a vsync waits a whole refresh
@@ -1321,8 +1153,8 @@ impl Render for FloatingView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let hwnd = self.hwnd;
         // Advance the transition first: everything below — the corner radius,
-        // the card's side, the region, the label's unit — reads `self.morph`,
-        // and this frame is the first one that knows its own timestamp.
+        // the card's side, the label's unit — reads `self.morph`, and this frame
+        // is the first one that knows its own timestamp.
         self.advance_morph(window);
         let me = cx.entity();
         let accent = cx.theme().primary;
@@ -1338,25 +1170,22 @@ impl Render for FloatingView {
         };
 
         // Morph progress: 1 = docked square, 0 = free circle. One value drives
-        // the roundness, the card's side *and* the client area cut around it, so
-        // the shape drawn and the shape that takes clicks are the same shape
-        // mid-morph.
+        // the roundness and the card's side, so the shape on screen is one
+        // shape at every point of the transition.
         let morph = self.morph.clamp(0.0, 1.0);
         let card_d = card_side_for(self.sphere_diameter(), morph);
-        // While the morph runs, the window and the region are held at the
-        // **envelope** rather than at this frame's geometry — see
-        // [`morph_envelope`] for why (fifteen `SetWindowPos`+`SetWindowRgn` pairs
-        // do not fit in a 240 ms transition's frame budget, and the measured cost
-        // of that overrun is the transition collapsing into five frames). The
-        // card itself still animates every frame: it is drawn by GPUI, which
-        // costs well under a millisecond.
+        // While the morph runs, the window is held at the **envelope** rather
+        // than at this frame's geometry — see [`morph_envelope`] for why
+        // (fifteen `SetWindowPos` calls do not fit in a 240 ms transition's
+        // frame budget, and the measured cost of that overrun is the transition
+        // collapsing into five frames). The card itself still animates every
+        // frame: it is drawn by GPUI, which costs well under a millisecond.
         let (want, clip_d, corner_ratio) =
             morph_geometry(self.sphere_diameter(), morph, self.animating);
 
         let scale = window.scale_factor();
         let sane = scale > 0.0 && scale.is_finite();
-        // The client this frame is *asking for*, in device px. Used to cut the
-        // region **before** the resize — see the ordering note below.
+        // The client this frame is *asking for*, in device px.
         let want_dev = sane && want.is_finite() && want > 0.0;
         let want_client = if want_dev {
             (
@@ -1367,128 +1196,15 @@ impl Render for FloatingView {
             (0, 0)
         };
 
-        // **Three steps, and the middle one is the whole point.**
+        // **One step: resize the window onto the requested geometry.**
         //
-        // A Win32 region lives in *window* coordinates, and `SetWindowPos`
-        // neither moves nor rescales it. So between the resize and the re-cut
-        // there is a window that already has one size and a region drawn for the
-        // other — and Windows presents it. Whichever order we pick, one direction
-        // gets a hole:
-        //
-        //   cut → resize   grows fine (the future region on today's small window
-        //                  reads as "no clipping"), but **shrinking** puts the new
-        //                  small cut on the old big window: a 152 px hole at its
-        //                  top-left through a 360 px ball.
-        //   resize → cut   shrinking is survivable, but **growing** leaves the old
-        //                  small cut on the new big window — the 2026-10-14 shard
-        //                  (`fit: side=360 -> window=(376, 399)` /
-        //                  `msg=0x0047 client=(360,360) region=(10,33,158,181)`).
-        //
-        // Both directions are answered by the same third step: **open the clip to the
-        // union before resizing**. Opening it means replacing it with a plain
-        // rectangle covering `max(old, new)` — the two client rects share their
-        // origin, so that rectangle contains both, and Windows intersects an
-        // oversized region with the window rect, so it clips nothing at all. The
-        // ball is therefore whole for the entire resize, whichever way the window
-        // is about to move, and the real shape goes back on immediately after. It
-        // costs a single `SetWindowRgn`, paid only on frames that actually resize.
-        //
-        // The memo is keyed on the **requested** geometry, so the final cut below
-        // is issued once per change; if the resize did not land, the re-read at the
-        // bottom refuses to record it and the next frame tries again.
-        let region_d = clip_d.min(want - CLIP_MARGIN);
-        // While a morph runs the clip is held **open** — a plain rectangle over
-        // the whole envelope client — because the layout-centre walk moves the
-        // card off the envelope centre, and no fixed shape centred there can
-        // hold it. The sentinel key `(-1, -1)` tells the memo an open clip is
-        // installed, so the animation frames do not re-open it every frame;
-        // the real shape is cut by the landing frame (the `!animating` guard
-        // on the cut below).
-        let region: RegionKey = if self.animating {
-            (
-                want,
-                -1,
-                -1,
-                if want_client.0 > 0 {
-                    Some(want_client)
-                } else {
-                    None
-                },
-            )
-        } else {
-            (
-                want,
-                quantize(corner_ratio),
-                quantize(region_d),
-                if want_client.0 > 0 {
-                    Some(want_client)
-                } else {
-                    None
-                },
-            )
-        };
-        // A frame must be bracketed whenever **anything** is about to move — the
-        // requested geometry, or the window itself. The second half matters: the
-        // OS can resize the window behind the app's back (`WM_DPICHANGED`), and on
-        // that frame the memo above still matches, so a bracket gated on the memo
-        // alone would resize straight through a region cut for the old size.
-        let cur_client = client_size_device(hwnd);
-        let resizing = cur_client.is_some() && cur_client != Some(want_client);
-        let mut changing = want_client.0 > 0
-            && (region != self.last_region || want_client != self.last_clip_client || resizing);
-        // **The region truth-check.** The memo trusts that the last cut is still
-        // installed — but the shard of 2026-10-19 20:24 proved a window can sit
-        // with the region of one form while its content draws another (the free,
-        // hovered ball behind the *docked* cut: a quarter-arc shard no single
-        // frame of this code ever composed), and nothing in the memo path ever
-        // notices. So ask the OS what region is *actually* in force, compare it
-        // with the box this frame needs — open while a morph runs, the centred
-        // cut at rest — and force the bracket below when they disagree. A
-        // desynced window then heals on its very next render, whatever put it
-        // out of step: an interrupted bracket, an external `SetWindowRgn`, a
-        // state left behind before the window was re-created.
-        if want_client.0 > 0 && !changing {
-            let expected = expected_region_box(
-                client_origin_in_window(hwnd),
-                want_client,
-                region_d,
-                scale,
-                self.animating,
-            );
-            let in_force = crate::platform::region_box(hwnd);
-            if !in_force.is_some_and(|a| region_box_matches(a, expected)) {
-                if in_force.is_none() {
-                    frame_log("truth-check: region GONE (GetWindowRgn=ERROR) — re-cutting");
-                }
-                changing = true;
-                // A bracket is about to run: the sentinel must stand down
-                // until a resting render has verified the new cut.
-                self.region_truth = None;
-            } else if !self.animating {
-                // Healthy at rest: publish the verified box for the sentinel.
-                self.region_truth = Some(expected);
-            }
-        } else {
-            // Animating (or no geometry yet): the render-side check owns the
-            // region for the whole morph, the sentinel stays out of it.
-            self.region_truth = None;
-        }
-        if changing {
-            // (1) No clipping at all, sized to cover both clients — so the resize
-            // below cannot expose a hole.
-            let opened = match cur_client {
-                Some(cur) => {
-                    open_window_region(hwnd, cur.0.max(want_client.0), cur.1.max(want_client.1))
-                }
-                None => false,
-            };
-            if !opened {
-                // Nothing readable to open to; the cut below still has to happen.
-                set_window_region(hwnd, region_d, corner_ratio, want, want_client);
-            }
-        }
-
-        // (2) Now the window may be resized onto the requested geometry.
+        // There is no Win32 region any more — the window is a plain transparent
+        // rectangle and the ball is drawn inside it, so a resize can no longer
+        // expose a hole or a shard: every state the window passes through is
+        // just "a differently-sized rectangle with the same content". The
+        // open → resize → cut bracket, its memo and its truth-check all existed
+        // only to keep `SetWindowRgn` in step with `SetWindowPos`, and died with
+        // the region.
         //
         // While the morph runs — and on the docking landing frame, and on any
         // frame a plain settle has not landed yet — the resize is the **plain**
@@ -1512,12 +1228,6 @@ impl Render for FloatingView {
         if client_dev == Some(want_client) {
             self.settle_plain = false;
         }
-        // (3) …and only now is the real shape safe to cut: the window is
-        // already the size this cut is a fraction of — and the clip was open
-        // for the whole transition, so this is the one frame it closes.
-        if changing && !self.animating && client_dev == Some(want_client) {
-            set_window_region(hwnd, region_d, corner_ratio, want, want_client);
-        }
         let (win_w, win_h) = match client_dev {
             Some((w, h)) if sane => (w as f32 / scale, h as f32 / scale),
             // No believable client rect: the window still has whatever geometry
@@ -1535,14 +1245,10 @@ impl Render for FloatingView {
         // why it is published after the resize, not before.
         set_floating_card_frac(card_d / win.max(1.0));
 
-        // Record the memo only once the OS is known to be in the state the cut
-        // describes: the region installed **and** the window actually sitting on
-        // the client the cut was measured against. A memo written for a cut that
-        // did not happen — or for a window that was resized again behind the
-        // app's back — is what lets a stale region look up to date forever.
+        // Record the verified client only once the OS is known to actually sit
+        // on it — a fallback written for a resize that did not happen would
+        // make later frames lay out for a window that does not exist.
         if client_dev == Some(want_client) && client_size_device(hwnd) == Some(want_client) {
-            self.last_region = region;
-            self.last_clip_client = want_client;
             self.last_verified_client = (win_w, win_h);
         }
 
@@ -1581,8 +1287,8 @@ impl Render for FloatingView {
         }
 
         // One line per frame while `%TEMP%\tm-frame.on` exists: everything the
-        // frame laid out and cut, next to what the OS currently believes. The
-        // ball sliced by a sharp rectangle is a layout box and a client rect
+        // frame laid out, next to what the OS currently believes. The ball
+        // sliced by a sharp rectangle is a layout box and a client rect
         // disagreeing; this is the only place both numbers are on the same line,
         // and the message side of the log (see `platform::frame_log`) is what
         // dates the disagreement to the `WM_DPICHANGED` that caused it.
@@ -1590,26 +1296,24 @@ impl Render for FloatingView {
             "frame morph={morph:.3} anim={} edge={:?} docked={} hovered={} \
              sphere={:.1} card={card_d:.1} scale={scale:.4} want={want:.1} clip={clip_d:.1} \
              ratio={corner_ratio:.2} client={win_w:.1}x{win_h:.1} center={center_x:.1},{center_y:.1} \
-             region_d={region_d:.1} last_clip={:?} device={:?} region={:?} snap={:?}",
+             device={:?} snap={:?}",
             self.animating,
             self.edge,
             self.docked,
             self.hovered,
             self.sphere_diameter(),
-            self.last_clip_client,
             client_size_device(hwnd),
-            crate::platform::region_box(hwnd),
             self.pending_snap,
         ));
 
         // While the morph runs, hold the card at its anchor **on screen**. The
         // walk moves the card's centre through the layout box, so the window
         // origin has to move the same distance the other way — a position-only
-        // move, which cannot clip anything (the region, the client rect and
-        // the surface content all travel together, so their intersection does
-        // not change). Docking re-aims the x at the dock line every frame — the
-        // card shrinks along it, so its centre creeps outward; undocking holds
-        // both axes where the drag released them.
+        // move, which cannot clip anything (the surface content travels with
+        // the origin, so the content's screen position does not change).
+        // Docking re-aims the x at the dock line every frame — the card
+        // shrinks along it, so its centre creeps outward; undocking holds both
+        // axes where the drag released them.
         if self.animating {
             let (ax, ay) = self.anim_screen_anchor;
             let card_dev = card_d * scale;
@@ -1639,7 +1343,7 @@ impl Render for FloatingView {
         // describes the card that is actually on screen, so the snap puts its
         // outer edge exactly on `DOCK_GAP` instead of on the pre-morph estimate
         // (which came out ~7 px wide). A position-only move cannot clip anything
-        // — region and content travel with the window — so it is safe to run
+        // — content travels with the window — so it is safe to run
         // after every other geometry change of the frame, present included.
         if let Some(edge) = self.pending_snap.take() {
             snap_floating_window_to_edge(hwnd, edge);
@@ -1700,10 +1404,10 @@ impl Render for FloatingView {
             // in the subclass keeps the whole interaction in one place and off
             // GPUI's message plumbing.
             //
-            // Clicks outside the circular region still pass through to the desktop
-            // because of `SetWindowRgn` + the transparent window style (the 360 /
-            // Thunder look); only hits *inside* the region reach the window, and
-            // those are exactly the ball.
+            // Clicks outside the ball still pass through to the desktop because
+            // the drag subclass answers `WM_NCHITTEST` with `HTTRANSPARENT`
+            // beyond the ball's own rect (the 360 / Thunder look); only hits on
+            // the ball itself reach the window.
             .on_hover(move |hovered, _win, app| {
                 me.update(app, |this, cx| {
                     this.hovered = *hovered;
@@ -2059,16 +1763,16 @@ mod tests {
     }
 
     /// **The whole point of the fix.** For every usage and every step of the morph
-    /// the region has to (a) hold the card, (b) clear the glow's outermost visible
-    /// pixel by [`CLIP_PAD`] — its hard, non-anti-aliased edge has to land on that
-    /// empty ring, or it jags whatever it lands on — and (c) leave nothing *more*
-    /// than that ring empty. The margin is not free: an empty window is invisible
-    /// but real, and it is what used to hang a hundred pixels off the screen edge
-    /// when docked.
+    /// the window has to (a) hold the card, (b) clear the glow's outermost visible
+    /// pixel by [`CLIP_PAD`] — the window's own edge has to land on that empty
+    /// ring, or the transparent popup's rectangle shows as a faint square — and
+    /// (c) leave nothing *more* than that ring empty. The margin is not free: an
+    /// empty window is invisible but real, and it is what used to hang a hundred
+    /// pixels off the screen edge when docked.
     ///
-    /// And the window has to be at least the region — plus, **docked, exactly the
-    /// region**, which is what makes the docked widget carry no margin at all.
-    /// Free, it is the untouched [`WINDOW_SIZE`], and the slack around the region
+    /// And the window has to be at least the card's fit — plus, **docked, exactly
+    /// the fit**, which is what makes the docked widget carry no margin at all.
+    /// Free, it is the untouched [`WINDOW_SIZE`], and the slack around the fit
     /// is the price of never resizing it (see `the_free_ball_keeps_the_fixed_window`).
     #[test]
     fn window_wraps_the_card_and_its_glow() {
@@ -2077,32 +1781,29 @@ mod tests {
                 let ball = sphere_diameter_for(tokens, hovered);
                 for morph in MORPHS {
                     let card = card_side_for(ball, morph);
-                    let region = clip_diameter_for(card);
+                    let fit = clip_diameter_for(card);
                     let win = window_side_for(card, morph);
                     let tail = GLOW_TAIL_SIGMA * glow_blur(card);
                     let pad = card_pad(card);
-                    assert!(region > card, "the region leaves no room for the glow");
+                    assert!(fit > card, "the fit leaves no room for the glow");
                     assert!(
                         (pad - (tail + CLIP_PAD)).abs() < 0.01,
-                        "the region's room per side is {pad}px, not the glow's tail \
+                        "the window's room per side is {pad}px, not the glow's tail \
                          ({tail}px) plus CLIP_PAD ({CLIP_PAD}px) — card {card}, \
                          tokens {tokens}, t={morph}"
                     );
-                    // The region sits `CLIP_MARGIN` inside the client rect, so it
-                    // is that much closer to the glow: still empty, or the cut
-                    // would land on a visible pixel.
+                    // The window's edge sits `CLIP_PAD` beyond the glow's visible
+                    // tail: still empty, or the edge would land on a visible pixel.
                     assert!(
-                        pad - CLIP_MARGIN / 2.0 >= tail + 1.0,
-                        "the region's edge ({pad}px - {}px) reaches the glow tail \
-                         ({tail}px)",
-                        CLIP_MARGIN / 2.0
+                        pad >= tail + 1.0,
+                        "the window's edge ({pad}px) reaches the glow tail ({tail}px)"
                     );
-                    // A window smaller than the region would leave the region
-                    // clamped short of what is drawn, i.e. a shaved rim.
+                    // A window smaller than the fit would clamp short of what is
+                    // drawn, i.e. a shaved rim.
                     assert!(
-                        win >= region - 0.01,
-                        "the window ({win}) is smaller than the region it has to \
-                         hold ({region}) — card {card}, t={morph}"
+                        win >= fit - 0.01,
+                        "the window ({win}) is smaller than the fit it has to \
+                         hold ({fit}) — card {card}, t={morph}"
                     );
                     // ...and it never outgrows the one the app creates, so a first
                     // frame is never clipped before the resize lands.
@@ -2111,7 +1812,7 @@ mod tests {
                         "the window ({win}) outgrew the one the app creates"
                     );
                 }
-                // Docked, window == region: no invisible margin beyond the card.
+                // Docked, window == fit: no invisible margin beyond the card.
                 let docked_card = card_side_for(ball, 1.0);
                 assert!(
                     (window_side_for(docked_card, 1.0) - clip_diameter_for(docked_card)).abs()
@@ -2122,13 +1823,12 @@ mod tests {
         }
     }
 
-    /// **The free ball is never resized and never re-cut.** The card and the region
-    /// are both centred on the client rect, so as long as the window stays at
-    /// [`WINDOW_SIZE`] they are concentric *by construction* and nothing can shave
-    /// a rim. Tying the free window to the card is what turned that into an
-    /// arithmetic guarantee — and one frame where the card is laid out on the old
-    /// rectangle while the region is cut from the new one took a hard, one-sided
-    /// bite out of the ball's lower rim.
+    /// **The free ball is never resized.** The card is centred on the client
+    /// rect, so as long as the window stays at [`WINDOW_SIZE`] the ball is
+    /// concentric with the window *by construction*. Tying the free window to
+    /// the card is what turned that into an arithmetic guarantee — and one frame
+    /// where the card is laid out on a rectangle the window does not have took a
+    /// hard, one-sided bite out of the ball's rim.
     #[test]
     fn the_free_ball_keeps_the_fixed_window() {
         for tokens in USAGES {
@@ -2139,80 +1839,13 @@ mod tests {
                     WINDOW_SIZE,
                     "the free window must stay exactly the size the app opened it at"
                 );
-                // ...and the free region is still the ball's own fit — the glow
-                // plus CLIP_PAD, comfortably inside the window, exactly as the
-                // fitted circle always was.
-                let region = clip_diameter_for(card).min(WINDOW_SIZE - CLIP_MARGIN);
-                assert!((region - clip_diameter_for(card)).abs() < 0.01);
+                // ...and the fit is comfortably inside the window — the glow plus
+                // CLIP_PAD, exactly as the fitted circle always was.
+                let fit = clip_diameter_for(card);
                 assert!(
-                    region < WINDOW_SIZE,
-                    "a region as big as the window stops excluding anything"
+                    fit < WINDOW_SIZE,
+                    "a fit as big as the window leaves the glow no empty ring"
                 );
-            }
-        }
-    }
-
-    /// **The 2026-10-14 "the ball shrank" regression, in one arithmetic check.**
-    ///
-    /// The platform cut is a *fraction* of the client rect: `region_d / win`,
-    /// applied to whatever `GetClientRect` returns. So the region the OS installs
-    /// only equals the requested diameter when `win` — the box the card is laid
-    /// out in — is **the same rectangle the cut is taken from**.
-    ///
-    /// It was not. The layout box fell back to a remembered `last_client` (the
-    /// free-state 360) whenever the live measurement came back unreadable, while
-    /// the OS had already converged the real client onto the docked size. The cut
-    /// then came out at `client × region_d / 360` — a ~40 px sliver where a ~110 px
-    /// circle was asked for, and the card (centred in the *real* client) had its
-    /// centre land on that client rect's corner. On screen: the ball appeared to
-    /// shrink to a fragment, sliced along the L-shaped seam between the two
-    /// monitors.
-    ///
-    /// The fallback is now the size this very frame asked the OS for, so this
-    /// pins the invariant directly: with the fit's own size as the box, the cut
-    /// reproduces the requested diameter exactly — for every usage, every hover,
-    /// and every step of the morph.
-    #[test]
-    fn the_layout_box_is_the_rectangle_the_cut_is_taken_from() {
-        // Mirrors `platform::windows::cut_region`'s diameter arithmetic.
-        fn cut_diameter(client: f32, diameter: f32, window_size: f32) -> f32 {
-            let frac = (diameter / window_size).clamp(0.0, 1.0);
-            (client * frac).round().clamp(1.0, client.round())
-        }
-        for tokens in USAGES {
-            for hovered in [false, true] {
-                let ball = sphere_diameter_for(tokens, hovered);
-                for morph in MORPHS {
-                    let card = card_side_for(ball, morph);
-                    let region = clip_diameter_for(card);
-                    let win = window_side_for(card, morph);
-                    // The client the fit converges onto: `win` itself.
-                    // (The platform rounds the cut to whole device px, so the
-                    // reproduction is exact to within one pixel.)
-                    let cut = cut_diameter(win, region, win);
-                    assert!(
-                        (cut - region).abs() < 1.01,
-                        "cut {cut} != requested region {region} — card {card}, t={morph}"
-                    );
-                    // The bug, reproduced: a stale free-state 360 box against a
-                    // smaller real client shrinks the installed region — and
-                    // docked, where the client *is* the region, it halves it.
-                    if win < WINDOW_SIZE - 0.01 {
-                        let stale = cut_diameter(win, region, WINDOW_SIZE);
-                        assert!(
-                            stale < region - 1.0,
-                            "a stale box should have shrunk the region it did \
-                             (got {stale} for region {region})"
-                        );
-                        if (win - region).abs() < 0.01 {
-                            assert!(
-                                stale < region * 0.5,
-                                "docked, the stale box halved the region — the \
-                                 sliver the user saw (got {stale} for {region})"
-                            );
-                        }
-                    }
-                }
             }
         }
     }
@@ -2441,56 +2074,33 @@ mod tests {
         }
     }
 
-    /// The first frame must be clipped to a circle that comfortably encloses a
-    /// full ball, whatever the window's real size is.
-    #[test]
-    fn seeded_clip_is_generous_enough_for_any_window() {
-        assert!(SEED_CLIP_FRACTION > 0.0 && SEED_CLIP_FRACTION <= 1.0);
-        for ball in BALLS {
-            for morph in MORPHS {
-                let card = card_side_for(ball, morph);
-                // Both the window the app opens with and the one the first render
-                // asks for — the seed has to be generous in either.
-                for win in [WINDOW_SIZE, window_side_for(card, 1.0)] {
-                    let seeded = win * SEED_CLIP_FRACTION;
-                    assert!(
-                        seeded > card,
-                        "seeded clip {seeded} must enclose the first-frame card \
-                         {card} (win={win})"
-                    );
-                }
-            }
-        }
-    }
-
     /// **The envelope must hold the whole transition.** While a morph runs the
-    /// window and the region are pinned to one shape instead of the frame's own
-    /// geometry, so that shape has to enclose the card at *every* progress value
-    /// — the circle end (the big one) and the square end alike, each with the
-    /// room its glow needs.
+    /// window is pinned to one shape instead of the frame's own geometry, so
+    /// that shape has to enclose the card at *every* progress value — the
+    /// circle end (the big one) and the square end alike, each with the room
+    /// its glow needs.
     ///
-    /// If it did not, the pinning would slice the card mid-flight, which is the
+    /// If it did not, the pinning would clip the card mid-flight, which is the
     /// very failure the per-frame geometry was replaced to avoid — just with the
     /// roles swapped.
     #[test]
     fn the_envelope_holds_every_frame_of_the_morph() {
         for ball in BALLS {
             let (side, clip) = morph_envelope(ball);
-            // The pinned window must be big enough for the pinned region, with
-            // the clamp margin the region is kept inside the client rect.
+            // The pinned window must be big enough for the pinned fit.
             assert!(
                 side >= clip,
-                "envelope window {side} cannot hold its own region {clip}"
+                "envelope window {side} cannot hold its own fit {clip}"
             );
             assert!(
                 clip > ball,
-                "envelope region {clip} must enclose the card at the big end {ball}"
+                "envelope fit {clip} must enclose the card at the big end {ball}"
             );
             for morph in MORPHS {
                 let card = card_side_for(ball, morph);
                 assert!(
                     clip >= clip_diameter_for(card),
-                    "envelope region {clip} slices the card's own fit {} at \
+                    "envelope fit {clip} slices the card's own fit {} at \
                      morph {morph} (ball {ball})",
                     clip_diameter_for(card)
                 );
@@ -2499,14 +2109,14 @@ mod tests {
     }
 
     /// **The pinning must actually pin.** Every frame of a transition has to ask
-    /// for the *same* window and the *same* region — otherwise the pinning is
-    /// nominal and `SetWindowPos`/`SetWindowRgn` still run per frame, which is
-    /// the 20–33 ms per frame that made the morph collapse into five frames.
+    /// for the *same* window — otherwise the pinning is nominal and
+    /// `SetWindowPos` still runs per frame, which is the 20–33 ms per frame that
+    /// made the morph collapse into five frames.
     ///
     /// At rest the geometry must still follow `morph`, or the ball would never
     /// reach the docked square's shape.
     #[test]
-    fn a_morph_holds_one_window_and_one_region_for_its_whole_run() {
+    fn a_morph_holds_one_window_for_its_whole_run() {
         for ball in BALLS {
             let animating: Vec<(f32, f32, f32)> = MORPHS
                 .iter()
@@ -2515,7 +2125,7 @@ mod tests {
             for (i, g) in animating.iter().enumerate() {
                 assert_eq!(
                     *g, animating[0],
-                    "frame {i} of the transition moved the window/region: {g:?} vs {:?}",
+                    "frame {i} of the transition moved the window: {g:?} vs {:?}",
                     animating[0]
                 );
             }
@@ -2526,60 +2136,6 @@ mod tests {
                 assert_eq!(clip, clip_diameter_for(card_side_for(ball, morph)));
                 assert_eq!(corner, corner_ratio_for(morph));
             }
-        }
-    }
-
-    /// **The region truth-check must recognise every shape it is supposed to
-    /// see, and reject the desynced one it exists to heal.** The expected box
-    /// is what a healthy frame leaves behind — the open rectangle while a
-    /// morph runs, the centred cut at rest — and the shard of 2026-10-19
-    /// 20:24 was exactly a window whose actual box was *neither*: the docked
-    /// cut still in force over a grown, free-form window. If the check ever
-    /// accepts that combination, the desync stays forever.
-    #[test]
-    fn the_region_truth_check_accepts_healthy_and_rejects_desynced_boxes() {
-        let origin = (8, 31);
-        // At rest: a 360 client, a 226.8 logical cut at 1.0x → a 227-side
-        // square centred on the client.
-        let rest = expected_region_box(origin, (360, 360), 226.8, 1.0, false);
-        assert_eq!(rest, (8 + 66, 31 + 66, 8 + 66 + 227, 31 + 66 + 227));
-        // The box the cut itself leaves (rounding wobble ≤ ~1 px) matches.
-        assert!(region_box_matches((74, 97, 301, 324), rest));
-        // A slightly different rounding still matches within tolerance.
-        assert!(region_box_matches((75, 98, 300, 323), rest));
-        // The docked-era cut on the same grown window — the exact shard state
-        // of 2026-10-19 — must be rejected.
-        assert!(!region_box_matches((10, 33, 162, 185), rest));
-        // While a morph runs, the expected box is the open rectangle.
-        let open = expected_region_box(origin, (360, 360), 226.8, 1.0, true);
-        assert_eq!(open, (8, 31, 368, 391));
-        assert!(region_box_matches((8, 31, 368, 391), open));
-        // The docked cut is not the open rectangle either.
-        assert!(!region_box_matches((10, 33, 162, 185), open));
-        // At a fractional scale the two rounding paths still agree within
-        // tolerance, so the check never churns a healthy region.
-        for scale in [1.25_f32, 1.5] {
-            let client = (
-                (360.0 * scale).round() as i32,
-                (360.0 * scale).round() as i32,
-            );
-            let d = (226.8 * scale).round() as i32;
-            let cut_d = ((client.0 as f32) * (226.8 / 360.0)).round() as i32;
-            assert!(
-                (d - cut_d).abs() <= 3,
-                "rounding paths disagree by more than the tolerance at scale {scale}"
-            );
-            let expected = expected_region_box(origin, client, 226.8, scale, false);
-            let actual = (
-                origin.0 + (client.0 - cut_d) / 2,
-                origin.1 + (client.1 - cut_d) / 2,
-                origin.0 + (client.0 - cut_d) / 2 + cut_d,
-                origin.1 + (client.1 - cut_d) / 2 + cut_d,
-            );
-            assert!(
-                region_box_matches(actual, expected),
-                "healthy cut rejected at scale {scale}: actual {actual:?} vs expected {expected:?}"
-            );
         }
     }
 
@@ -2661,9 +2217,8 @@ mod tests {
 
     /// **Every frame of the walk keeps the card inside the envelope client.**
     /// The envelope window is the only thing holding the pixels while the
-    /// transition runs, and the clip is a plain rectangle over it (the sentinel
-    /// region key) — so the walked card, glow included, has to stay inside the
-    /// 360 client at every progress value, both hover states and every ball.
+    /// transition runs — so the walked card, glow included, has to stay inside
+    /// the 360 client at every progress value, both hover states and every ball.
     #[test]
     fn every_walked_frame_keeps_the_card_inside_the_envelope_client() {
         let steps = [0.0_f32, 0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95, 0.99, 1.0];
@@ -2701,8 +2256,7 @@ mod tests {
     /// the previous frame's pixels keep their window coordinates. The walk has
     /// put them at the target client's own centre — so the strictest
     /// intermediate state of the landing (client already shrunk, content still
-    /// the previous frame, clip still the open rectangle) holds the card whole
-    /// and dead centre, and the cut that follows holds it too.
+    /// the previous frame) holds the card whole and dead centre.
     ///
     /// This is exactly the state the 2026-10-19 forensics caught being sampled
     /// as a quarter-arc shard: the anchored move used to shift the origin by
@@ -2710,7 +2264,7 @@ mod tests {
     /// new client (they follow the origin, staying at the old 360-layout
     /// centre in window coordinates) — the old card sat at (188, 211) inside a
     /// 154 client, and the compositor showed a 23×23 corner slice of it for
-    /// the ~31 ms between the landing `SetWindowPos` pair and the re-cut.
+    /// the ~31 ms between the landing `SetWindowPos` pair and the repaint.
     #[test]
     fn the_settle_shrink_leaves_the_walked_card_inside_the_new_client() {
         for ball in BALLS {
@@ -2718,14 +2272,13 @@ mod tests {
                 let sphere = ball * if hovered { HOVER_SCALE } else { 1.0 };
                 let card = card_side_for(sphere, 1.0);
                 let client = window_side_for(card, 1.0);
-                let region_d = clip_diameter_for(card).min(client - CLIP_MARGIN);
                 let glow = glow_visible_radius(card);
                 // The previous frame's card at the walk's end — the new
                 // client's own centre. Window and client coordinates differ
                 // by the client's constant offset inside the window, which
                 // cancels in a containment check.
                 let c = (client / 2.0, client / 2.0);
-                // (a) The shrunken client rect holds the card, glow included.
+                // The shrunken client rect holds the card, glow included.
                 assert!(
                     c.0 - glow >= -0.5 && c.0 + glow <= client + 0.5,
                     "the walked card sticks out of the landed client \
@@ -2737,16 +2290,6 @@ mod tests {
                     c.1 - glow >= -0.5 && c.1 + glow <= client + 0.5,
                     "the walked card sticks out of the landed client vertically
                      (ball {ball}, hovered {hovered})"
-                );
-                // (b) The final region — cut after the shrink, centred on the
-                // landed client — holds it too.
-                let off = ((c.0 - client / 2.0).powi(2) + (c.1 - client / 2.0).powi(2)).sqrt();
-                assert!(
-                    off + glow <= region_d / 2.0 + 0.5,
-                    "the landed region slices the card that is still on screen
-                     (ball {ball}, hovered {hovered}): {} + {glow:.1} vs {:.1}",
-                    off,
-                    region_d / 2.0
                 );
             }
         }
@@ -2866,44 +2409,6 @@ mod tests {
         assert!(morph_arrived(MORPH_DURATION));
     }
 
-    /// Re-cutting an identical region forces a full window repaint for nothing,
-    /// and a needless re-cut can flicker the rim. So the memo has to be exactly
-    /// as coarse as the decision it guards and no coarser.
-    ///
-    /// All four parts count. The first three — the window side, the region's
-    /// diameter and the roundness — are the morph's own geometry, and the fourth
-    /// is the client rect the cut is a fraction of, which can change without any
-    /// of the others moving (the OS resizing the window behind the app's back).
-    ///
-    /// **They describe the geometry the frame *asked for*, not the geometry the
-    /// OS happened to be in.** That is not a detail: the cut is issued *before*
-    /// the resize precisely so that no frame is ever presented through a stale
-    /// region, which means the key cannot be the pre-resize measurement — that
-    /// would make every resize frame look "already done" and skip the very cut
-    /// the frame exists to install.
-    #[test]
-    fn identical_regions_are_not_reapplied() {
-        let free = Some((360, 360));
-        let a: RegionKey = (360.0, quantize(1.0), quantize(232.4), free);
-        let differs = |k: RegionKey| k != a;
-        assert!(!differs(a));
-        assert!(differs((153.0, quantize(1.0), quantize(232.4), free)));
-        assert!(differs((360.0, quantize(1.0), quantize(220.6), free)));
-        assert!(differs((
-            360.0,
-            quantize(SQUARE_CORNER_RATIO),
-            quantize(232.4),
-            free
-        )));
-        assert!(differs((
-            360.0,
-            quantize(1.0),
-            quantize(232.4),
-            Some((153, 153))
-        )));
-        assert!(differs((360.0, quantize(1.0), quantize(232.4), None)));
-    }
-
     /// The two forms are the ends of one ramp: fully round at rest, the docked
     /// ratio once docked, and nothing beyond either end (a morph task that
     /// overruns its last frame must not overshoot the shape).
@@ -2978,15 +2483,13 @@ mod tests {
         }
     }
 
-    /// **The region must not slice the card.** The window is cut to a rounded
-    /// rectangle derived from the *card* — [`clip_diameter_for`], clamped inside
-    /// the client rect — at the card's own corner ratio, so it has to stay outside
-    /// the card, and outside the glow, which reaches past it, at every step of the
-    /// morph. Using the same ratio on a larger side is what makes that hold at any
-    /// size: the corner radius grows with the side, so the region's corners clear
-    /// the card's by the same margin its edges do.
+    /// **The window must not clip the card.** The card sits centred in its
+    /// window at the frame's own corner ratio, so the window side has to stay
+    /// outside the card, and outside the glow, which reaches past it, at every
+    /// step of the morph. The corner radius growing with the side is what makes
+    /// that hold at any size.
     #[test]
-    fn the_region_contains_the_card_and_its_glow() {
+    fn the_window_contains_the_card_and_its_glow() {
         for tokens in USAGES {
             for hovered in [false, true] {
                 let ball = sphere_diameter_for(tokens, hovered);
@@ -2995,21 +2498,15 @@ mod tests {
                     let ratio = corner_ratio_for(t);
                     let card = card_side_for(ball, t);
                     let win = window_side_for(card, t);
-                    // The diameter the view actually cuts.
-                    let region = clip_diameter_for(card).min(win - CLIP_MARGIN);
                     let needed = rounded_reach(card, ratio) + GLOW_TAIL_SIGMA * glow_blur(card);
-                    let available = rounded_reach(region, ratio);
+                    let available = rounded_reach(win, ratio);
                     assert!(
                         needed <= available + 0.01,
-                        "the region slices the card mid-morph: card {card}, window \
-                         {win}, region {region}, ratio {ratio}, needs {needed}px, has \
+                        "the window clips the card mid-morph: card {card}, window \
+                         {win}, ratio {ratio}, needs {needed}px, has \
                          {available}px (tokens {tokens}, t={t})"
                     );
-                    // ...and a region is never bigger than its window, or
-                    // `SetWindowRgn` would degenerate into "no clip at all" and
-                    // the square frame would show.
                     assert!(win > 0.0 && win <= WINDOW_SIZE);
-                    assert!(region > 0.0 && region <= win);
                 }
             }
         }
