@@ -905,6 +905,7 @@ impl FloatingView {
                     return;
                 }
                 crate::platform::invalidate_whole_window(view.hwnd);
+                crate::platform::nudge_dwm_recomposition(view.hwnd);
                 cx.notify();
             });
         })

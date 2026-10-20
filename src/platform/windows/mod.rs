@@ -60,6 +60,10 @@ struct Rect {
 
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOSIZE: u32 = 0x0001;
+/// `SetWindowPos` flag that reruns the frame path — the nudge that makes DWM
+/// recomposite a window whose composition queue it has dropped (see
+/// [`nudge_dwm_recomposition`]).
+const SWP_FRAMECHANGED: u32 = 0x0020;
 const HWND_TOPMOST: isize = -1;
 const HWND_NOTOPMOST: isize = -2;
 const SW_SHOW: c_int = 5;
@@ -881,6 +885,40 @@ pub fn invalidate_whole_window(hwnd: isize) {
         // `None` = the whole client rect; `false` = no WM_ERASEBKGND (the
         // surface is GPUI-owned, an erase would flash black).
         InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+}
+
+/// Force DWM to recomposite the window: a zero `SetWindowPos` that moves
+/// nothing, sizes nothing, and only reruns the frame path.
+///
+/// Why this exists: a frame the app draws and presents is not necessarily a
+/// frame the compositor shows. A background, always-on-top, transparent window
+/// (this ball) can have its DirectComposition visual dropped from DWM's
+/// recomposition queue — the frame log then shows correct content presented
+/// every heartbeat while the screen keeps the old pixels, until some
+/// activation change (a click anywhere) shames the compositor into catching
+/// up. The nudge is the programmatic equivalent of that click.
+///
+/// **Safe at rest, dangerous mid-transition.** With the region retired the
+/// window is at every instant a plain transparent rectangle — there is no
+/// bracket, no transient open-region-over-black-backbuffer state for the
+/// recomposition to sample (that is exactly how an earlier mid-render nudge
+/// froze a black window onto the screen, 2026-10-20, see plan §9.28). At rest
+/// the only state to sample is the settled, correct one.
+pub fn nudge_dwm_recomposition(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
 }
 

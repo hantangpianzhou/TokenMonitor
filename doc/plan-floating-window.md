@@ -971,3 +971,25 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **遗留语义变化**：圆外的光晕不再被硬切割（此前区域落在光晕已淡出的空环上，视觉无差）；球的抗锯齿由 GPUI 渲染负责，边缘反而比 region 的硬切更平滑。风险点：`ball_hit_test` 在拖拽中窗口尺寸变化时的分数换算依赖 render 持续发布 `card_frac`——静止时不发布新值，沿用上次的即正确。
 
 > AI生成
+
+### 9.30 第十七次：呈现链路取证闭环——DWM 丢弃了后台视觉的重合成（2026-10-20）
+
+**用户复测**：区域退役后残片/空白不再出现，但球会**静止后不更新**，且「外部点击一下就显示正常」。
+
+**gpui 源码链路取证**（zed checkout `56b1e79`，`gpui_windows`/`gpui`）：
+
+| 环节 | 事实 |
+|---|---|
+| vsync 线程 | 每 vsync 对**所有窗口** `RedrawWindow(RDW_INVALIDATE)` → `WM_PAINT → draw_window(false)`，空闲窗口也持续产帧 |
+| `draw_window` | `require_presentation: false`，`force_render=false`；`invalidator.is_dirty()`（心跳 notify 置位）时走 `draw + present` |
+| `present` | `platform_window.draw(scene)` → DirectX `Present(0, DXGI_PRESENT(0))` 无条件全帧、无 dirty-rect 优化 |
+
+即：应用侧每 800ms 心跳确实完成 `draw + Present(0)`，帧日志与代码均证实——**屏幕却不更新，直到一次激活态变化（点击外部）**。唯一吻合的解释在合成器侧：后台、always-on-top、透明的 DirectComposition 视觉被 DWM 从重合成队列里丢弃（AweSun 远程捕获环境是已知重灾区），`Present` 提交的新帧停在队列里不上屏；激活变化强制 DWM 重新拾取。
+
+**修法（程序化的「点击」）**：恢复 `nudge_dwm_recomposition`（零位移 `SetWindowPos(SWP_FRAMECHANGED)`），由静止心跳调用——`InvalidateRect`（强制全帧 damage）+ nudge（强制 DWM 重拾视觉）+ `cx.notify()`。
+
+**与 §9.28 空白事故的区别**：那次 nudge 在 render 括弧中段触发，DWM 采到「区域全开 + 黑背板」瞬态并冻结。区域退役后窗口任何时刻都是同一个普通透明矩形，**不存在可被采样的瞬态**，静止态微推只能采到落定后的正确内容。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **207 passed**。
+
+> AI生成
