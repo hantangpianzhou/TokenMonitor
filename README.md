@@ -67,6 +67,11 @@ TokenMonitor 的桌面版与 TUI 版都是**单文件、自包含**的本地应�
 
 ## 悬浮球（桌面版）
 
+<p align="center">
+  <img src="resources/floating-ball-free.png" alt="悬浮球自由形态（圆形）" width="220">
+  <img src="resources/floating-ball-docked.png" alt="悬浮球停靠形态（贴边方块）" width="220">
+</p>
+
 桌面版提供一颗**常驻桌面的悬浮球**，实时显示当前统计周期的 Token 用量，无需打开主窗口即可读数：
 
 - **两种形态，贴边停靠**：自由时是圆形小球；按住拖到屏幕**左/右边缘**释放，停靠为贴边的圆角方块（计数切换为中文单位，如「3.4千万」）；拖离边缘自动以动画恢复为圆形。
