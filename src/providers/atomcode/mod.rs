@@ -1,32 +1,41 @@
 //! AtomCode data source: reads AtomCode session files under
-//! `~/.atomcode/sessions/`. Two formats coexist and both are parsed:
+//! `~/.atomcode/sessions/`. Three formats coexist and all are parsed:
 //! - legacy `.meta` — pretty-printed whole-file JSON with
 //!   `turn_stats[].model_usage[]` (real model id + per-call token breakdown);
-//! - current `.json` — full session with `messages` and `turn_stats[]` carrying
+//! - `.json` — full session with `messages` and `turn_stats[]` carrying
 //!   only an aggregate `total_tokens`. The model name lives in the System prompt
-//!   text, not a structured field (see `parse_json_new`).
+//!   text, not a structured field (see `parse_json_new`);
+//! - storage v13 `.index` + `.events` (observed in the wild from ~2026-10-16):
+//!   the `.index` is a superset of the legacy `.meta` — same
+//!   `turn_stats[].model_usage[]` plus a turn-less `detached_model_usage[]` —
+//!   while the `.events` JSONL replaces `.jsonl` as the per-turn timestamp
+//!   source (`turn_start` events). Migration renames the old `.meta` to
+//!   `.meta.migrated`, which the extension filter ignores. Missing support for
+//!   this format made every AtomCode session after the rollout invisible.
 //!
-//! ## Why `.meta`, not `.jsonl`
+//! ## Why `.meta`/`.index`, not `.jsonl`/`.events`
 //!
 //! AtomCode splits its usage data across two sibling files, and neither is
 //! complete alone:
 //!
-//! - `*.meta` — a **pretty-printed whole-file JSON** (hundreds of lines, NOT
-//!   JSONL). It carries `turn_stats[].model_usage[]` with the real model id,
-//!   per-call `input` / `output` / `cached_input`, and the session's
-//!   `working_dir`. But it has **no per-turn timestamp** — only session-level
-//!   `created_at` / `updated_at`.
-//! - `*.jsonl` — one JSON object per line, each with an exact epoch `ts` and a
-//!   `turn_id`. But it carries **no model name** and no cache breakdown.
+//! - `*.meta` / `*.index` — a **pretty-printed whole-file JSON** (hundreds of
+//!   lines, NOT JSONL). They carry `turn_stats[].model_usage[]` with the real
+//!   model id, per-call `input` / `output` / `cached_input`, and the session's
+//!   `working_dir`. But they have **no per-turn timestamp** — only
+//!   session-level `created_at` / `updated_at`.
+//! - `*.jsonl` / `*.events` — one JSON object per line, each with an exact
+//!   epoch timestamp and a turn identifier. But they carry **no model name**
+//!   and no cache breakdown.
 //!
-//! So this adapter reads the `.meta` for tokens/models and joins the sibling
-//! `.jsonl` on `turn_id` to recover real per-turn timestamps. Without that join
-//! every turn in a long session would be stamped with the session's last-update
-//! time, which buckets days of work onto a single day and wrecks the daily
-//! trend.
+//! So this adapter reads the `.meta`/`.index` for tokens/models and joins the
+//! sibling `.jsonl`/`.events` on the turn identifier to recover real per-turn
+//! timestamps. Without that join every turn in a long session would be stamped
+//! with the session's last-update time, which buckets days of work onto a
+//! single day and wrecks the daily trend.
 //!
 //! The multi-megabyte `*.snapshot` files in the same directory hold only
-//! conversation text — zero token data — so the scanner only matches `*.meta`.
+//! conversation text — zero token data — so the scanner only matches
+//! `*.meta` / `*.index` / session `*.json`.
 //!
 //! Field mappings and edge-case handling below follow the verified spec in
 //! `doc/增加AtomCode支持_完整指南.md` (its section 六):
@@ -42,7 +51,7 @@
 //! are spelled out here — but they use the same `fingerprint()` helper so the
 //! cheap check and a full scan stay in lockstep.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -68,7 +77,7 @@ const DEFAULT_MODEL: &str = "unknown";
 const SESSIONS_SUFFIX: &[&str] = &[".atomcode", "sessions"];
 
 // ---------------------------------------------------------------------------
-// `.meta` (whole-file JSON)
+// `.meta` / `.index` (whole-file JSON)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +88,11 @@ struct AtomCodeMeta {
     updated_at: Option<i64>,
     #[serde(default)]
     turn_stats: Vec<AtomCodeTurnStat>,
+    /// Storage-v13 `.index` only: tokens spent on calls that never landed in
+    /// any turn (session naming, background utilities). They carry no
+    /// timestamp of their own.
+    #[serde(default)]
+    detached_model_usage: Vec<AtomCodeModelUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,7 +122,7 @@ struct AtomCodeTokens {
 }
 
 // ---------------------------------------------------------------------------
-// `.jsonl` (timestamp source)
+// `.jsonl` / `.events` (timestamp source)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -117,11 +131,28 @@ struct AtomCodeJsonlLine {
     turn_id: Option<i64>,
 }
 
-/// Build a `turn_id -> start timestamp (ms)` map from the sibling `.jsonl`.
+/// One line of the storage-v13 `.events` JSONL: `{"seq":N,"at":ms,
+/// "event":{"kind":"turn_start","turn":N}}`. The first line is a header
+/// without an `event` object; message lines embed megabytes of text.
+#[derive(Debug, Deserialize)]
+struct AtomCodeEventLine {
+    at: Option<i64>,
+    #[serde(default)]
+    event: Option<AtomCodeEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtomCodeEvent {
+    kind: Option<String>,
+    turn: Option<i64>,
+}
+
+/// Build a `turn_id -> start timestamp (ms)` map from the sibling `.jsonl`
+/// (legacy) and `.events` (storage v13).
 ///
 /// A turn can be written more than once (streaming, retries, undo), so the
 /// earliest observation wins — that is when the turn actually began. A missing
-/// or unreadable `.jsonl` is not an error: older sessions have none, and the
+/// or unreadable sibling is not an error: older sessions have neither, and the
 /// caller falls back to the session-level timestamp.
 fn load_turn_timestamps(meta_path: &Path) -> HashMap<i64, i64> {
     let mut map: HashMap<i64, i64> = HashMap::new();
@@ -142,6 +173,34 @@ fn load_turn_timestamps(meta_path: &Path) -> HashMap<i64, i64> {
                     }
                 })
                 .or_insert(ts);
+        }
+    });
+    // Storage v13 replaced the `.jsonl` sibling with `.events`. Only
+    // `turn_start` records carry a turn's begin time; a substring pre-filter
+    // skips the multi-megabyte message lines without parsing them.
+    let events_path = meta_path.with_extension("events");
+    let _ = for_each_line(&events_path, |line, _idx| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("\"turn_start\"") {
+            return;
+        }
+        let Ok(rec) = serde_json::from_str::<AtomCodeEventLine>(trimmed) else {
+            return;
+        };
+        let Some(event) = rec.event else {
+            return;
+        };
+        if event.kind.as_deref() != Some("turn_start") {
+            return;
+        }
+        if let (Some(turn), Some(at)) = (event.turn, rec.at) {
+            map.entry(turn)
+                .and_modify(|existing| {
+                    if at < *existing {
+                        *existing = at;
+                    }
+                })
+                .or_insert(at);
         }
     });
     map
@@ -232,9 +291,10 @@ impl AtomCodeSource {
             .collect()
     }
 
-    /// All AtomCode session files under a root, recursively: legacy `.meta` and
-    /// current `.json`. Non-session siblings (`.snapshot`, `.jsonl`, `.ui.json`,
-    /// `.rewind.json`, `.lease`) are dropped by the extension filter.
+    /// All AtomCode session files under a root, recursively: legacy `.meta`,
+    /// `.json`, and storage-v13 `.index`. Non-session siblings (`.snapshot`,
+    /// `.jsonl`, `.events`, `.ui`, `.todos`, `.rewind`, `.lease`, `.lock`,
+    /// `*.migrated`) are dropped by the extension filter.
     fn meta_files(root: &ScanRoot, max_depth: usize, max_file_size: u64) -> Vec<PathBuf> {
         let mut out = Vec::new();
         for entry in WalkDir::new(&root.dir)
@@ -257,15 +317,21 @@ impl AtomCodeSource {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            // AtomCode persists two session formats:
+            // AtomCode persists three session formats:
             //  - legacy `.meta` (pretty JSON with `turn_stats[].model_usage`)
-            //  - current `.json` (full session with `messages` + aggregate
-            //    `turn_stats[].total_tokens`). Skip the non-session siblings
-            //    (`.ui.json`, `.rewind.json`, `.snapshot`, `.jsonl`, `.lease`).
+            //  - `.json` (full session with `messages` + aggregate
+            //    `turn_stats[].total_tokens`)
+            //  - storage-v13 `.index` (superset of `.meta`, see the module
+            //    docs). Skip the non-session siblings (`.ui.json`,
+            //    `.rewind.json`, `.todos.json`, `.snapshot`, `.jsonl`,
+            //    `.events`, `.lease`, `.lock`, `*.migrated`).
             let is_meta = ext == "meta";
-            let is_session_json =
-                ext == "json" && !stem.ends_with(".ui") && !stem.ends_with(".rewind");
-            if !is_meta && !is_session_json {
+            let is_index = ext == "index";
+            let is_session_json = ext == "json"
+                && !stem.ends_with(".ui")
+                && !stem.ends_with(".rewind")
+                && !stem.ends_with(".todos");
+            if !is_meta && !is_index && !is_session_json {
                 continue;
             }
             if let Ok(meta) = fs::metadata(entry.path()) {
@@ -275,10 +341,35 @@ impl AtomCodeSource {
                 out.push(entry.path().to_path_buf());
             }
         }
+        // A storage-v13 session keeps its live data in `.index`; if the same
+        // stem still carries a legacy `.meta`/`.json` (migration mid-flight, or
+        // an in-place upgrade that left the old file behind), the `.index` is
+        // authoritative — keep it and drop the legacy siblings so the same
+        // turns are never counted twice.
+        let index_stems: HashSet<PathBuf> = out
+            .iter()
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("index"))
+            })
+            .filter_map(|p| p.file_stem().map(|s| Path::new(s).to_path_buf()))
+            .collect();
+        if !index_stems.is_empty() {
+            out.retain(|p| {
+                let legacy = p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                    e.eq_ignore_ascii_case("meta") || e.eq_ignore_ascii_case("json")
+                });
+                let superseded = legacy
+                    && p.file_stem()
+                        .is_some_and(|s| index_stems.contains(Path::new(s)));
+                !superseded
+            });
+        }
         out
     }
 
-    /// Change-detection fingerprint over a root's `.meta` files. Shared by
+    /// Change-detection fingerprint over a root's session files. Shared by
     /// `scan` and `scan_fingerprint` so the cheap check and a full scan agree.
     fn meta_fingerprint(files: &[PathBuf]) -> String {
         let mut found = 0u64;
@@ -299,8 +390,8 @@ impl AtomCodeSource {
         fingerprint(found, max_mtime, total_bytes)
     }
 
-    /// Parse one AtomCode session file (legacy `.meta` or current `.json`) into
-    /// usage records.
+    /// Parse one AtomCode session file (legacy `.meta`, `.json`, or
+    /// storage-v13 `.index`) into usage records.
     fn parse_session(
         path: &Path,
         root: &ScanRoot,
@@ -327,6 +418,15 @@ impl AtomCodeSource {
         // aggregate-only files (legacy `.meta` without `model_usage`, and the
         // true new `.json` session whose model name lives only in the System
         // prompt) still fall through to `parse_json_new`.
+        //
+        // A storage-v13 `.index` must *never* take the `parse_json_new` route:
+        // its `turn_stats[].total_tokens` is a cumulative context counter that
+        // keeps growing across turns (30741 → 32523 → …), so summing it would
+        // inflate usage by roughly the turn count.
+        let is_index_file = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("index"));
         let has_rich_breakdown = v
             .get("turn_stats")
             .and_then(|ts| ts.as_array())
@@ -338,7 +438,8 @@ impl AtomCodeSource {
                 })
             })
             .unwrap_or(false);
-        let looks_new = !has_rich_breakdown
+        let looks_new = !is_index_file
+            && !has_rich_breakdown
             && (v.get("messages").is_some()
                 || v.get("turn_stats")
                     .and_then(|ts| ts.get(0))
@@ -348,7 +449,8 @@ impl AtomCodeSource {
             return Self::parse_json_new(&raw, &v, path, root, emit);
         }
 
-        // Legacy `.meta` format.
+        // Legacy `.meta` / storage-v13 `.index` format (same shape; the latter
+        // is a superset). `to_millis` normalizes second-stamped variants.
         let meta: AtomCodeMeta =
             serde_json::from_str(&raw).map_err(|e| format!("parse {:?}: {e}", path))?;
 
@@ -358,7 +460,9 @@ impl AtomCodeSource {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let fallback_ts = meta.updated_at.or(meta.created_at).unwrap_or(file_mtime);
+        let fallback_ts = to_millis(meta.updated_at)
+            .or(to_millis(meta.created_at))
+            .unwrap_or(file_mtime);
 
         let session_id = meta
             .id
@@ -468,6 +572,49 @@ impl AtomCodeSource {
                     format!("{}:{}:{}", rel.display(), turn_id, index),
                 ));
             }
+        }
+
+        // Storage-v13 `.index` also carries `detached_model_usage`: tokens
+        // spent on calls that never landed in any turn (session naming,
+        // background utilities). They have no timestamp of their own, so they
+        // are stamped with the session's last-update time — the best available
+        // day bucket — and get their own `detached` fingerprint slot so they
+        // never collide with turn records.
+        let detached_started_at = Utc
+            .timestamp_millis_opt(fallback_ts)
+            .single()
+            .unwrap_or_else(Utc::now);
+        for (index, usage) in meta.detached_model_usage.iter().enumerate() {
+            let Some(tokens) = &usage.tokens else {
+                continue;
+            };
+            let input = tokens.input.unwrap_or(0).max(0);
+            let output = tokens.output.unwrap_or(0).max(0);
+            let cache_read = tokens.cached_input.unwrap_or(0).max(0);
+            if input + output + cache_read == 0 {
+                continue;
+            }
+            let model = usage
+                .model_id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            emit(UsageRecord::new(
+                Provider::AtomCode,
+                project.clone(),
+                session_id.clone(),
+                Usage {
+                    model,
+                    started_at: detached_started_at,
+                    input_tokens: input as u64,
+                    output_tokens: output as u64,
+                    cache_read_tokens: cache_read as u64,
+                    cache_write_tokens: 0,
+                    cost_micros: 0, // priced by the scan pipeline
+                },
+                per_turn_bytes,
+                format!("{}:detached:{}", rel.display(), index),
+            ));
         }
 
         Ok(())
@@ -934,5 +1081,161 @@ mod tests {
             src.data_dirs().unwrap_err(),
             ProviderError::DataDirNotFound(Provider::AtomCode)
         ));
+    }
+
+    /// Storage v13 (observed in the wild from ~2026-10-16): session metadata
+    /// moved from `.meta` into `.index`, and per-turn timestamps from `.jsonl`
+    /// into `.events` (`turn_start` events). Missing support for either file
+    /// made every AtomCode session after the rollout invisible — the exact bug
+    /// behind "今天没找到 atomcode 的使用量".
+    #[test]
+    fn parses_storage_v13_index_with_events_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("07eba5f11d3c951b/sess-v13");
+
+        let index = r#"{
+  "v": 1,
+  "id": "sess-v13",
+  "name": "分析 teleagent 用量",
+  "working_dir": "E:/project/TokenMonitor",
+  "created_at": 1792399062525,
+  "updated_at": 1792479783157,
+  "turn_count": 2,
+  "turn_stats": [
+    {
+      "turn_id": 1,
+      "total_tokens": 30741,
+      "used_tokens": 30441,
+      "model_usage": [
+        { "provider_id": "AtomGit-glm5.3-flash", "model_id": "glm5.3-flash",
+          "tokens": { "input": 21899, "output": 3849, "cached_input": 403200 } }
+      ]
+    },
+    {
+      "turn_id": 2,
+      "total_tokens": 32523,
+      "used_tokens": 32297,
+      "model_usage": [
+        { "provider_id": "AtomGit-glm5.3-flash", "model_id": "glm5.3-flash",
+          "tokens": { "input": 3209, "output": 1742, "cached_input": 59840 } }
+      ]
+    }
+  ],
+  "detached_model_usage": [
+    { "provider_id": "AtomGit-glm5.3-flash", "model_id": "glm5.3-flash",
+      "tokens": { "input": 26404, "output": 1577, "cached_input": 0 } }
+  ],
+  "format_version": 13
+}"#;
+        write_file(&base.with_extension("index"), index);
+
+        // Turn 1 starts the day the session was created; turn 2 starts the
+        // next day — `turn_start.at` must keep them on separate days instead
+        // of collapsing both onto the session's last-update timestamp.
+        let events = concat!(
+            "{\"header\":{\"version\":13,\"id\":\"sess-v13\",\"created_at\":1792399062525,\"cwd\":\"E:\\\\project\\\\TokenMonitor\"}\n",
+            "{\"seq\":1,\"at\":1792399095234,\"event\":{\"kind\":\"turn_start\",\"turn\":1}}\n",
+            "{\"seq\":5,\"at\":1792400000000,\"event\":{\"kind\":\"turn_end\",\"turn\":1,\"stop\":\"EndTurn\"}}\n",
+            "{\"seq\":6,\"at\":1792444800000,\"event\":{\"kind\":\"turn_start\",\"turn\":2}}\n",
+            "{\"seq\":9,\"at\":1792479782057,\"event\":{\"kind\":\"turn_end\",\"turn\":2,\"stop\":\"Stopped\"}}\n",
+        );
+        write_file(&base.with_extension("events"), events);
+
+        let (out, records) = scan_collect(&source_for(dir.path()));
+        assert!(out.errors.is_empty());
+        assert_eq!(out.found_files, 1); // the .events sibling is not counted
+        assert_eq!(records.len(), 3); // two turns + one detached entry
+
+        let r1 = &records[0];
+        let r2 = &records[1];
+        assert_eq!(r1.provider, Provider::AtomCode);
+        assert_eq!(r1.project, "TokenMonitor");
+        assert_eq!(r1.session_id, "sess-v13");
+        assert_eq!(r1.usage.model, "glm5.3-flash");
+        assert_eq!(r1.usage.input_tokens, 21899);
+        assert_eq!(r1.usage.output_tokens, 3849);
+        assert_eq!(r1.usage.cache_read_tokens, 403200);
+        // Timestamp comes from the events turn_start, not updated_at.
+        assert_eq!(r1.usage.started_at.timestamp_millis(), 1792399095234);
+        assert_eq!(r2.usage.started_at.timestamp_millis(), 1792444800000);
+
+        // Turn-less usage survives and is stamped at the session level.
+        let r3 = &records[2];
+        assert_eq!(r3.usage.input_tokens, 26404);
+        assert_eq!(r3.usage.output_tokens, 1577);
+        assert_eq!(r3.usage.cache_read_tokens, 0);
+        assert_eq!(r3.usage.started_at.timestamp_millis(), 1792479783157);
+        assert!(r3.fingerprint.ends_with(":detached:0"));
+    }
+
+    /// Migration renames a session's `.meta` to `.meta.migrated`; while an
+    /// in-place upgrade could briefly leave a stale `.meta`/`.json` next to
+    /// the authoritative `.index`, only the `.index` may count.
+    #[test]
+    fn index_supersedes_stale_legacy_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("abc/sess-mig");
+
+        write_file(
+            &base.with_extension("meta"),
+            r#"{ "id": "sess-mig", "updated_at": 1787100000000,
+                "turn_stats": [ { "turn_id": 1, "model_usage": [
+                  { "model_id": "m", "tokens": { "input": 10, "output": 2 } } ] } ] }"#,
+        );
+        write_file(
+            &base.with_extension("index"),
+            r#"{ "id": "sess-mig", "updated_at": 1792479783157,
+                "turn_stats": [ { "turn_id": 1, "model_usage": [
+                  { "model_id": "m", "tokens": { "input": 100, "output": 20 } } ] } ] }"#,
+        );
+
+        let (out, records) = scan_collect(&source_for(dir.path()));
+        assert!(out.errors.is_empty());
+        assert_eq!(out.found_files, 1); // stale .meta dropped, no double count
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].usage.input_tokens, 100);
+        assert!(records[0].fingerprint.contains(".index"));
+    }
+
+    /// A v13 `.index` whose turns carry no `model_usage` must fall back to
+    /// `used_tokens` — never to `total_tokens`, which is a *cumulative*
+    /// context counter (30741 → 32523 → …) that would inflate usage by
+    /// roughly the turn count if summed.
+    #[test]
+    fn index_without_model_usage_uses_used_tokens_not_cumulative_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("abc/sess-v13b");
+
+        write_file(
+            &base.with_extension("index"),
+            r#"{ "id": "sess-v13b", "updated_at": 1792479783157,
+                "turn_stats": [
+                  { "turn_id": 1, "total_tokens": 30741, "used_tokens": 30441, "model_usage": [] },
+                  { "turn_id": 2, "total_tokens": 32523, "used_tokens": 32297, "model_usage": [] }
+                ] }"#,
+        );
+
+        let (_out, records) = scan_collect(&source_for(dir.path()));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].usage.input_tokens, 30441);
+        assert_eq!(records[1].usage.input_tokens, 32297);
+        assert_eq!(records[0].usage.model, DEFAULT_MODEL);
+    }
+
+    /// `xxx.todos.json` is a todo-list sibling, not a session file: it must
+    /// not be counted (nor parsed) even though its extension is `.json`.
+    #[test]
+    fn todos_json_sibling_is_not_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("abc/sess-7");
+        write_file(
+            &base.with_extension("todos.json"),
+            r#"{"todos":[{"content":"x","status":"completed"}],"message_count":3}"#,
+        );
+
+        let (out, records) = scan_collect(&source_for(dir.path()));
+        assert!(out.errors.is_empty());
+        assert_eq!(out.found_files, 0);
+        assert!(records.is_empty());
     }
 }

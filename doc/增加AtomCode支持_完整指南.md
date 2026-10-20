@@ -423,6 +423,37 @@ turns with model_usage: 973   without: 939
 绝对不要用 `total_tokens` 去回填 `input_tokens`：它和明细口径不一致，会
 把输入 token 算少 6 倍，成本与趋势全失真。
 
+### 坑 8（2026-10-20 新增）：存储 v13——`.meta` 变 `.index`、`.jsonl` 变 `.events`，扩展名全换了
+
+**现象**：2026-10-16 之后 AtomCode 升级了会话存储（`format_version: 13`），
+新会话/迁移后的会话目录里是这样的文件组合：
+
+```
+<uuid>.events   # 事件流 JSONL：{"seq":N,"at":<ms>,"event":{"kind":"turn_start","turn":N},...}
+<uuid>.index    # 元数据 JSON：结构是 .meta 的超集（turn_stats[].model_usage + detached_model_usage）
+<uuid>.rewind / .todos / .ui        # UI 状态，无 token 数据
+<uuid>.meta.migrated / .ui.json.migrated / .snapshot.migrated   # 旧文件改名后的墓碑
+```
+
+没有任何 `.meta`、`.json`、`.jsonl`。扩展名过滤器只认旧格式的话，升级后
+**所有 AtomCode 会话直接从统计里消失**——本机实测：10-16 之后的用量
+（含 10-20 当天 input 7.7M / cached 38.2M）全部漏计，连续 4 天为 0。
+
+**要点**：
+- `.index` 与旧 `.meta` 结构兼容（serde 可直接反序列化），`turn_stats[].model_usage[]`
+  原样保留，还多了个 `detached_model_usage[]`（不属于任何 turn 的调用，
+  如会话命名；无时间戳，落在会话 `updated_at` 那天）。
+- 每轮时间戳从 `.events` 的 `turn_start` 事件取（`at` 是毫秒时间戳，
+  `event.turn` 对应 `turn_stats[].turn_id`）；事件行里消息文本可能几 MB，
+  先做 `"turn_start"` 子串预过滤再解析。
+- `.index` 的 `total_tokens` 是**跨轮累计的上下文计数**（30741 → 32523 → …
+  逐轮递增），比坑 7 更危险：`parse_json_new` 会把它当每轮聚合值求和，
+  用量直接膨胀 N 倍。所以 `.index` 一律禁走聚合路径。
+- 同一 stem 若同时存在 `.index` 和旧 `.meta`/`.json`（迁移进行中），
+  以 `.index` 为准，旧文件丢弃，防止同一批 turn 双计。
+- `.todos.json`（stem 以 `.todos` 结尾）是任务清单不是会话，别当 `.json`
+  会话去数。
+
 ---
 
 ## 七、改完后的验证清单
@@ -452,3 +483,5 @@ python atomcode_usage.py --json out.json
 
 它已经处理了上面全部 6 个坑，还额外做了：跨天会话的时间戳校准、
 上下文占用率（22.1%）、按项目/模型/天三个维度的拆分。
+
+> AI生成

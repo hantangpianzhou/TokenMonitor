@@ -120,3 +120,51 @@ cargo run                           # 确认卡片出现 AtomCode 行且图标�
 ## 7. 顺带发现
 
 `AGENTS.md` 写「交付物沉淀到 `doc/`」，但仓库同时存在 `docs/`（`code-analysis.md`、`data-sources.md`）。目前 `doc/` 放调研与实施记录、`docs/` 放对外说明，两者并存。建议明确其一或在 `AGENTS.md` 里写清分工，避免后续文档散落。
+
+## 8. 2026-10-20：AtomCode 存储 v13 适配（`.index` + `.events`）
+
+### 现象与取证
+
+用户反馈「今天没找到 atomcode 的使用量，但用了很长时间」。取证
+`~/.atomcode/sessions/`：
+
+- 当天唯一活跃会话 `07eba5f11d3c951b/a8b8eef6-…`（working_dir
+  `E:\project\TokenMonitor`，即用 AtomCode 做本项目的会话）目录里只有
+  `.events`(4.9MB)/`.index`(11KB)/`.rewind`/`.todos`/`.ui`，`.meta` 已被
+  改名为 `.meta.migrated`（420B、`turn_stats: []` 墓碑）。
+- `.events` 首行 header `{"version":13,...}`，`turn_start` 事件带毫秒
+  `at`；`.index` 含 `turn_stats[].model_usage[]`（模型 glm5.3-flash）与
+  `detached_model_usage`。
+- 另一会话 `85237110acaa2c70/63b3d9cc-…` 的 `.events` 创建于 **10-16
+  09:18**——新格式当天已上线；此后 AtomCode 用量连续 4 天漏计
+  （10-16 129K input、10-19 400K input、10-20 **7.7M input / 38.2M
+  cached**，均不可见）。
+- 解析器 `meta_files()` 只匹配 `.meta`/`.json` 扩展名 → 新格式文件
+  全部被过滤掉，这就是根因（非猜测：文件级证据 + 逐日 token 反算）。
+
+### 修复（`src/providers/atomcode/mod.rs`）
+
+1. `meta_files()` 接受 `.index`；同一 stem 存在 `.index` 时丢弃其旧
+   `.meta`/`.json`（防迁移期双计）；`.todos.json` 不再计入会话文件。
+2. `load_turn_timestamps()` 增读 `.events`：`turn_start` 事件的
+   `event.turn` + `at`（最早者胜），与 `.jsonl` 的 `turn_id`+`ts` 合并；
+   先子串预过滤 `"turn_start"` 再解析，跳过 MB 级消息行。
+3. `parse_session()`：`.index` 一律禁走 `parse_json_new`（其
+   `total_tokens` 是跨轮累计计数，求和会膨胀 ~N 倍）；解析路径复用旧
+   `.meta` 反序列化（结构超集，serde 忽略未知字段）。
+4. 新增 `detached_model_usage` 产出：不属于任何 turn 的调用，时间戳取
+   会话 `updated_at`，指纹后缀 `:detached:N`。
+5. `fallback_ts` 统一经 `to_millis` 归一化（秒/毫秒两种戳法都兼容）。
+
+### 验证
+
+- 新增 4 个回归测试：`parses_storage_v13_index_with_events_timestamps`
+  （含 detached、双日 turn 分桶）、`index_supersedes_stale_legacy_meta`、
+  `index_without_model_usage_uses_used_tokens_not_cumulative_total`、
+  `todos_json_sibling_is_not_a_session`。
+- `cargo test --lib` 202 全绿（atomcode 模块 13/13）；`cargo fmt` /
+  `cargo check` 通过。
+- 待用户退出运行中的 TokenMonitor 后完成 exe 构建与真机验证：仪表盘
+  AtomCode 卡片应出现 10-16/10-19/10-20 三天的 glm5.3-flash 用量。
+
+> AI生成
