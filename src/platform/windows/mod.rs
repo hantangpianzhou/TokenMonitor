@@ -84,8 +84,8 @@ struct Rect {
 
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOSIZE: u32 = 0x0001;
-/// `SetWindowPos` flag forcing the WM_NCCALCSIZE / frame path to rerun — the
-/// nudge that makes DWM re-read a window region it failed to pick up.
+/// `SetWindowPos` flag that reruns the frame path — the nudge that makes DWM
+/// re-read a window region its composition queue missed.
 const SWP_FRAMECHANGED: u32 = 0x0020;
 const HWND_TOPMOST: isize = -1;
 const HWND_NOTOPMOST: isize = -2;
@@ -293,18 +293,25 @@ pub fn set_window_region(
 }
 
 /// Force DWM to re-read the window's region: a zero `SetWindowPos` that moves
-/// nothing, sizes nothing, and only asks for the frame to be reconsidered.
+/// nothing, sizes nothing, and only reruns the frame path.
 ///
-/// `SetWindowRgn(bRedraw=1)` is *supposed* to trigger the recomposition, but the
-/// undock landing of 2026-10-19 proved it can land without one: every later
-/// frame was drawn and presented (the frame log shows the heartbeat rendering
-/// into a verifiably correct region) while the compositor went on clipping the
-/// window to the **stale docked shape** — the shard was the new content showing
-/// through the old cut, and it sat there until a hover happened to re-install
-/// the region and healed it. The nudge after every region install makes the
-/// compositor's shape update part of the same call chain, so a missed redraw
-/// cannot survive even one frame.
-fn nudge_region_composition(hwnd: isize) {
+/// `SetWindowRgn(bRedraw=1)` can reach the region object without a DWM
+/// recomposition (the deterministic undock shard of 2026-10-19): the app goes
+/// on drawing and presenting correct content into a verifiably healthy region
+/// while the compositor keeps clipping to the stale shape, until some unrelated
+/// event — a hover — happens to recompose the correct state and "heals" it.
+///
+/// **Call this only while the window is at rest** — content laid out, region
+/// verified, nothing mid-bracket. The first attempt put this nudge inside the
+/// render, right after each `SetWindowRgn`: DWM then recomposed the bracket's
+/// *transient* states (open region over a backbuffer the resize had just
+/// invalidated) and froze on those — the window went solid black (2026-10-20).
+/// At rest every sampled state is the final, correct one, so the recomposition
+/// can only ever capture what the app intended.
+pub fn nudge_dwm_composition(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
     unsafe {
         SetWindowPos(
             hwnd,
@@ -346,7 +353,6 @@ fn cut_region(
         unsafe {
             SetWindowRgn(hwnd, hrgn, 1);
         }
-        nudge_region_composition(hwnd);
         true
     } else {
         // No region object: the previous cut (if any) is still in force, so
@@ -404,7 +410,6 @@ pub fn open_window_region(hwnd: isize, cw: i32, ch: i32) -> bool {
     unsafe {
         SetWindowRgn(hwnd, hrgn, 1);
     }
-    nudge_region_composition(hwnd);
     true
 }
 

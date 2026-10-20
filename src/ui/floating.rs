@@ -1042,20 +1042,24 @@ impl FloatingView {
                         "sentinel: region desync actual={actual:?} expected={expected:?} — waking render"
                     ));
                 }
-                // **Wake unconditionally at rest.** A matching region does not
-                // guarantee matching *content*: if the window was fully
-                // occluded mid-morph (behind the main window), GPUI/DWM can
-                // stop presenting, and the surface keeps the stale frame — the
-                // ball painted for the *previous* form's centre shows through
-                // the current form's off-centre cut as a quarter-arc shard
-                // (2026-10-19 ~21:4x, region verified healthy while the shard
-                // was on screen). A resting ball draws no frames of its own,
-                // so the only way stale pixels ever get replaced is a wake
-                // from out here — and the wake **invalidates the whole
-                // window**, so the present cannot shrink to a damage sub-rect
-                // and leave the other three quarters stale. 1.25 fps on a
-                // resting ball is nothing.
+                // **Recompose the whole window at rest, unconditionally.** Two
+                // failure modes die here. (1) A stale *shape*: the landing
+                // `SetWindowRgn(bRedraw=1)` can miss the DWM recomposition, and
+                // the compositor keeps clipping correct content to the stale
+                // form's cut — the deterministic undock shard until a hover
+                // recomposed the truth (2026-10-19). The frame-changed nudge
+                // makes the compositor re-read the region. (2) A stale
+                // *surface*: a window fully occluded mid-morph stops being
+                // presented and keeps old pixels on screen (the same shard,
+                // second appearance). The full invalidation forces the next
+                // present to cover the whole window. Both nudges are safe only
+                // because this runs **at rest** — content, region and memo all
+                // verified in the same frame; the first attempt nudged inside
+                // the render instead and froze the bracket's transient black
+                // state onto the screen (2026-10-20). 1.25 Hz on a resting
+                // ball costs nothing.
                 crate::platform::invalidate_whole_window(view.hwnd);
+                crate::platform::nudge_dwm_composition(view.hwnd);
                 cx.notify();
             });
         })

@@ -934,3 +934,15 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
 
 > AI生成
+
+### 9.28 第十五次：nudge 时机错误——render 中段微推把括弧瞬态冻上了屏（2026-10-20 取证）
+
+**现象**：§9.27 的 render 内微推上线后，残片变成了**整窗空白**：黑块 ≈ 悬浮窗整窗（376px），无区域裁剪、内容全黑；且球被拖到了**第二台显示器**（日志 x=3267、探针 x=3808，跨 DPI 96）。
+
+**根因（时机）**：nudge 本身方向正确（hover 复原 = 静止态重合成的偶然验证），但放在 render 内部 = 括弧（open→resize→cut）的**中段**——DWM 被强制重合成时采样到的是「区域全开 + resize 后未呈现的黑背板」这一瞬态，并把坏状态冻上屏：整窗空白。nudge 在 render 里每次 SetWindowRgn 后都触发，瞬态暴露面最大。
+
+**修正（挪到静止态心跳）**：`nudge_dwm_composition`（原 `nudge_region_composition` 改名）从 `cut_region` / `open_window_region` 内部**移除**，改由哨兵在静止态调用——此刻内容、区域、memo 三方已验证一致，重合成采样到的必然是最终正确状态，无论修「形状过期」（FRAMECHANGED 让 DWM 重读区域）还是「表面过期」（InvalidateRect 全窗失效）都只会捕捉到好状态。文档明确：**只许静止态调用**。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
+
+> AI生成
