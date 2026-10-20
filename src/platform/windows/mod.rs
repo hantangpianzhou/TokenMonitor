@@ -888,8 +888,19 @@ pub fn invalidate_whole_window(hwnd: isize) {
     }
 }
 
-/// Force DWM to recomposite the window: a zero `SetWindowPos` that moves
-/// nothing, sizes nothing, and only reruns the frame path.
+/// Whether the ball drag is in flight (the subclass holds capture and follows
+/// the cursor). Read by the heartbeat's recomposition nudge, which must not
+/// jiggle z-order while the drag is issuing its own `SetWindowPos`es.
+fn is_ball_dragging() -> bool {
+    DRAGGING
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+/// Force DWM to re-attach the window's visual: a **topmost band switch**
+/// (`NOTOPMOST → TOPMOST`) wrapped around the frame-path nudge.
 ///
 /// Why this exists: a frame the app draws and presents is not necessarily a
 /// frame the compositor shows. A background, always-on-top, transparent window
@@ -897,27 +908,49 @@ pub fn invalidate_whole_window(hwnd: isize) {
 /// recomposition queue — the frame log then shows correct content presented
 /// every heartbeat while the screen keeps the old pixels, until some
 /// activation change (a click anywhere) shames the compositor into catching
-/// up. The nudge is the programmatic equivalent of that click.
+/// up.
+///
+/// The weaker nudges are proven insufficient on exactly this window: the
+/// frame-path nudge (`SWP_FRAMECHANGED`, zero `SetWindowPos`) fired every
+/// heartbeat for the whole session of 2026-10-20 11:18 — 251 pairs of
+/// `WM_WINDOWPOSCHANGING/CHANGED` in the log, 206 unbroken heartbeat frames —
+/// and the screen still kept the stale pixels until a real click. What a
+/// click does that a frame-path nudge does not is **move the window between
+/// z-bands**, which forces DWM to unhook the visual from the composition tree
+/// and re-hook it — rebuilding exactly the queue entry that was dropped.
 ///
 /// **Safe at rest, dangerous mid-transition.** With the region retired the
 /// window is at every instant a plain transparent rectangle — there is no
 /// bracket, no transient open-region-over-black-backbuffer state for the
 /// recomposition to sample (that is exactly how an earlier mid-render nudge
-/// froze a black window onto the screen, 2026-10-20, see plan §9.28). At rest
-/// the only state to sample is the settled, correct one.
+/// froze a black window onto the screen, 2026-10-20, see plan §9.28). Skipped
+/// while a drag is in flight: the band switch jiggles z-order and would fight
+/// the drag's own `SetWindowPos`es.
 pub fn nudge_dwm_recomposition(hwnd: isize) {
-    if hwnd == 0 {
+    if hwnd == 0 || is_ball_dragging() {
         return;
     }
     unsafe {
+        // 1) Demote out of the topmost band, 2) let the frame path rerun,
+        // 3) promote back. Two `SetWindowPos` calls, neither moving nor
+        // sizing nor activating; between them DWM must re-place the visual.
         SetWindowPos(
             hwnd,
+            HWND_NOTOPMOST,
             0,
             0,
             0,
             0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
 }

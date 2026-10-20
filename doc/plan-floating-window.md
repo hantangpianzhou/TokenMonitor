@@ -993,3 +993,21 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **207 passed**。
 
 > AI生成
+
+### 9.31 第十八次：frame-path 微推被证明无效——改用 topmost 带切换重建视觉（2026-10-20 11:18 取证）
+
+**现象**：§9.30 微推构建（exe 11:18:31 与最后一次 `floating-start` 11:18:30 吻合，排除旧二进制）下球仍会静止后不更新，「外部点击」复原。
+
+**日志闭环（最后会话 803 行）**：
+
+- **206 帧零中断**——心跳渲染每 800 ms 稳定发生，无一处 >2 s 间隙；
+- **251 对 `WM_WINDOWPOSCHANGING/CHANGED`**——§9.30 的 `SWP_FRAMECHANGED` 微推每拍都在发且都被 OS 处理；
+- 帧几何全程正确（morph=0、client 360×360、center 180,180）。
+
+即：**画了、present 了、frame-path 微推也发了，屏幕仍旧**。结论：对被 DWM 丢弃的后台视觉，frame-path 级微推（重跑 WM_NCCALCSIZE）不足以让合成器重新拾取——它不改变窗口在合成树中的位置。
+
+**修法（升级为 z-band 切换）**：`nudge_dwm_recomposition` 改为两段 `SetWindowPos`——先 `HWND_NOTOPMOST` 再 `HWND_TOPMOST`（均 NOMOVE|NOSIZE|NOACTIVATE|FRAMECHANGED）。把窗口摘出 topmost band 再插回去，迫使 DWM **从合成树卸下并重挂该视觉**——重建的正是被丢弃的队列项。这就是「点击复原」的机制本质（点击改变 z 序/激活态），做了个程序化版本。拖拽进行中跳过（`is_ball_dragging` 读子类 `DRAGGING`），避免与拖拽自身的 `SetWindowPos` 打架；区域已退役，任何时刻窗口都是普通透明矩形，无瞬态可采。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **207 passed**。
+
+> AI生成
