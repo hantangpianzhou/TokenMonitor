@@ -48,6 +48,9 @@ unsafe extern "system" {
     /// Reads a window's style words — used for `GWL_EXSTYLE` to see which band
     /// (`TOPMOST`/`NOTOPMOST`) the window currently sits in.
     fn GetWindowLongW(hwnd: isize, n_index: c_int) -> c_int;
+    /// Writes a window's style word — `GWL_STYLE` chrome stripping (see
+    /// [`make_frameless`]).
+    fn SetWindowLongW(hwnd: isize, n_index: c_int, dw_new_long: c_int) -> c_int;
     /// Marks the whole client rect invalid so the next frame's present cannot
     /// be reduced to a damage sub-rect (see [`invalidate_whole_window`]).
     fn InvalidateRect(hwnd: isize, lprect: *const Rect, berase: i32) -> i32;
@@ -65,6 +68,26 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOSIZE: u32 = 0x0001;
 /// `GetWindowLongW` index of the extended style word.
 const GWL_EXSTYLE: c_int = -20;
+/// `GetWindowLongW` index of the ordinary style word.
+const GWL_STYLE: c_int = -16;
+/// Style bits that draw the non-client chrome: the caption bar (`WS_CAPTION`)
+/// and the resizable frame (`WS_THICKFRAME`). gpui's `PopUp` window carries
+/// both — which is why the floating window's client origin sat at `(8, 31)`
+/// inside its rect — and DWM paints their backdrop, the white base and the
+/// dark caption strip the fixed window exposed (see §9.34).
+const WS_CAPTION: c_int = 0x00C0_0000;
+const WS_THICKFRAME: c_int = 0x0004_0000;
+const WS_SYSMENU: c_int = 0x0008_0000;
+const WS_MINIMIZEBOX: c_int = 0x0002_0000;
+const WS_MAXIMIZEBOX: c_int = 0x0001_0000;
+/// `WM_NCCALCSIZE`: the OS asks how the window rect maps onto the client rect.
+/// Answering `0` (with `wparam` set) makes the client **the whole window** —
+/// the frame gets no pixels to draw into.
+const WM_NCCALCSIZE: u32 = 0x0083;
+/// `DWMWA_NCRENDERING_POLICY` / `DWMNCRP_DISABLED`: tells DWM to stop drawing
+/// the non-client area (the caption strip and frame base) entirely.
+const DWMWA_NCRENDERING_POLICY: u32 = 2;
+const DWMNCRP_DISABLED: c_int = 2;
 /// Extended-style bit marking a window as living in the topmost band.
 const WS_EX_TOPMOST: c_int = 0x0008;
 /// `SetWindowPos` flag that reruns the frame path — the nudge that makes DWM
@@ -495,6 +518,17 @@ unsafe extern "system" fn ball_drag_subclass(
                 client_size_device(hwnd),
             ));
         }
+        WM_NCCALCSIZE if wparam != 0 => {
+            // **The client is the whole window.** The OS computes the client
+            // rect by subtracting the non-client chrome from the window rect;
+            // answering 0 keeps every pixel of the window rect for the client,
+            // so no frame area is left for DWM to paint the caption strip and
+            // the white base into (the visible box §9.34 caught). gpui lays
+            // out from the client rect, so this changes nothing on its side —
+            // and the drag still works, because the caption drag loop keys off
+            // the `WM_NCHITTEST` answer, not off the `WS_CAPTION` bit.
+            return 0;
+        }
         WM_LBUTTONDBLCLK | WM_NCLBUTTONDBLCLK => {
             // The OS synthesised a double-click (window class has `CS_DBLCLKS`):
             // open the main window directly. Cancel any drag the first press
@@ -516,6 +550,58 @@ unsafe extern "system" fn ball_drag_subclass(
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
+/// Strip the non-client chrome from the floating window: drop the
+/// `WS_CAPTION` / `WS_THICKFRAME` style bits, tell DWM to stop rendering the
+/// non-client area entirely, and rerun the frame path so both take effect now.
+///
+/// gpui's `PopUp` window carries the caption + thickframe bits — the client
+/// origin sat at `(8, 31)` inside the window rect — and DWM painted their
+/// backdrop: the white base and the dark caption strip that the fixed window
+/// of §9.33 exposed as a visible box around the ball (2026-10-20, see plan
+/// §9.34). The style strip and the subclass's `WM_NCCALCSIZE` answer together
+/// make the window genuinely frameless; the DWM attribute is the belt to that
+/// suspenders, silencing the compositor's non-client painting even where a
+/// style bit survives a theme override.
+///
+/// `logical_side` is the client side the app opened the window for
+/// (`FLOAT_WIN`): with the frame gone the window rect **is** the client rect,
+/// so the one `SetWindowPos` here also shrinks the window from the
+/// chrome-inflated rect (360 + frame = 376×399 device px) down to the intended
+/// square. This runs once, at creation, before the first frame — it is not the
+/// per-frame resize machinery that §9.33 retired.
+pub fn make_frameless(hwnd: isize, logical_side: f32) {
+    if hwnd == 0 || !(logical_side > 0.0) {
+        return;
+    }
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let stripped =
+            style & !(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+        SetWindowLongW(hwnd, GWL_STYLE, stripped);
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &DWMNCRP_DISABLED,
+            std::mem::size_of::<c_int>() as u32,
+        );
+        // Resize onto the intended client (the frame path rerun is included in
+        // the same call via `SWP_FRAMECHANGED`) and keep the origin the
+        // creation put the window at.
+        let dpi = GetDpiForWindow(hwnd);
+        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+        let side = (logical_side * scale).round() as i32;
+        SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            side,
+            side,
+            SWP_NOMOVE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
 /// Subclass the floating ball HWND so it can be dragged with the native pointer
 /// (see the module note above). Idempotent per hwnd. Call once at creation,
 /// right after the window handle is known.
@@ -523,7 +609,7 @@ unsafe extern "system" fn ball_drag_subclass(
 /// Uses `SetWindowSubclass` (not `SetWindowLongPtrW`) on purpose: it composes
 /// with GPUI's own window proc instead of replacing it, so the window stays
 /// responsive and the subclass survives show/hide cycles.
-pub fn install_ball_drag(hwnd: isize) {
+pub fn install_ball_drag(hwnd: isize, logical_side: f32) {
     if hwnd == 0 {
         return;
     }
@@ -531,6 +617,9 @@ pub fn install_ball_drag(hwnd: isize) {
     unsafe {
         SetWindowSubclass(hwnd, ball_drag_subclass as *const (), DRAG_SUBCLASS_ID, 0);
     }
+    // After the subclass, so the `WM_NCCALCSIZE` rerun below is answered by
+    // the arm that keeps the client = the whole window (see [`make_frameless`]).
+    make_frameless(hwnd, logical_side);
 }
 
 // ── Docking against a screen edge ────────────────────────────────────────────

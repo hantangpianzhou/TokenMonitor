@@ -993,8 +993,10 @@ pub fn ensure_floating_window(cx: &mut App) {
                     set_always_on_top(hwnd, true);
                     // Drag the ball with our own Win32 subclass (not GPUI's
                     // `WindowControlArea::Drag`, which routes the move through
-                    // the OS caption loop and flashes a black square).
-                    install_ball_drag(hwnd);
+                    // the OS caption loop and flashes a black square). Also
+                    // strips the PopUp chrome gpui leaves on: without it DWM
+                    // paints a caption strip and a frame base around the ball.
+                    install_ball_drag(hwnd, FLOAT_WIN);
                 }
             }
             cx.new(|cx| FloatingView::new(window, cx))

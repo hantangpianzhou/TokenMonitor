@@ -1048,3 +1048,21 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` **零告警**；`cargo test --lib` **198 passed**（原 207 减去退役测试，新增 2 个固定窗口不变量测试，`a_morph_draws_one_shape_per_progress` 初版方向断言写反已修正）。
 
 > AI生成
+
+### 9.34 第二十一次：可见方框的根治——PopUp chrome 剥离，客户区=整窗（2026-10-20 像素实拍）
+
+**现象**：§9.33 固定窗口后，卡片周围出现**白色实心矩形 + 顶部黑条 + 右侧半黑**。像素采样：窗口四角 `(243,243,243)` / `(0,0,0)`，边中点 `(43,43,43)`——不是 gpui 画的（代码无任何白背景），实拍图与用户截图一致。
+
+**来源判定**：窗口 376×399 对 360 客户的 `(8, 31)` 客户区偏移 = gpui `PopUp` 窗口自带的 `WS_CAPTION | WS_THICKFRAME` 非客户区；白底与黑条是 **DWM 画的 chrome 背板**（caption 条 + frame 底）。此前一直存在，但被三层机制掩盖：区域机制裁掉它（退役前）→ docked 时窗口缩到卡片大小只剩窄边（§9.33 前）→ 透明合成盖不住它时只有窄边可见。固定窗口让它整个暴露：docked 态 360 窗口大半悬在屏上，chrome 背板全可见；每拍心跳的 `SWP_FRAMECHANGED` 又在持续重画它。
+
+**修法（真无边框三件套）**：
+
+1. **剥样式**：`GetWindowLongW(GWL_STYLE)` 清除 `WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX` 后写回；
+2. **子类接管 `WM_NCCALCSIZE`**（`wparam != 0` 时答 `0`）：客户区 = 整窗，不给 frame 留任何像素——gpui 布局读客户区，行为不变；拖拽依赖的是 `WM_NCHITTEST` 应答（`HTCAPTION`），与 `WS_CAPTION` 位无关，故拖动不受影响；
+3. **禁 DWM NC 渲染**：`DwmSetWindowAttribute(DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED)`——即使样式位被主题改回，合成器也不再画非客户区。
+
+配套：`make_frameless(hwnd, logical_side)` 在创建时一次性把窗口从 chrome 膨胀尺寸（376×399 device px）校正回 `FLOAT_WIN` 方形（`SWP_FRAMECHANGED` 同调用生效）——这是创建期的一次性几何校正，不是 §9.33 退役的逐帧 resize 机制；此后窗口仍恒定。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **198 passed**。
+
+> AI生成
