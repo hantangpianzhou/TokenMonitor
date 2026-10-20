@@ -84,6 +84,9 @@ struct Rect {
 
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOSIZE: u32 = 0x0001;
+/// `SetWindowPos` flag forcing the WM_NCCALCSIZE / frame path to rerun — the
+/// nudge that makes DWM re-read a window region it failed to pick up.
+const SWP_FRAMECHANGED: u32 = 0x0020;
 const HWND_TOPMOST: isize = -1;
 const HWND_NOTOPMOST: isize = -2;
 const SW_SHOW: c_int = 5;
@@ -289,6 +292,32 @@ pub fn set_window_region(
     )
 }
 
+/// Force DWM to re-read the window's region: a zero `SetWindowPos` that moves
+/// nothing, sizes nothing, and only asks for the frame to be reconsidered.
+///
+/// `SetWindowRgn(bRedraw=1)` is *supposed* to trigger the recomposition, but the
+/// undock landing of 2026-10-19 proved it can land without one: every later
+/// frame was drawn and presented (the frame log shows the heartbeat rendering
+/// into a verifiably correct region) while the compositor went on clipping the
+/// window to the **stale docked shape** — the shard was the new content showing
+/// through the old cut, and it sat there until a hover happened to re-install
+/// the region and healed it. The nudge after every region install makes the
+/// compositor's shape update part of the same call chain, so a missed redraw
+/// cannot survive even one frame.
+fn nudge_region_composition(hwnd: isize) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
 /// Shared core of [`set_window_region`] and [`set_window_circle_region`]: build
 /// and install the round-rect cut from an already-measured client rect
 /// (`cw` × `ch`, device px). Returns whether the cut was installed.
@@ -317,6 +346,7 @@ fn cut_region(
         unsafe {
             SetWindowRgn(hwnd, hrgn, 1);
         }
+        nudge_region_composition(hwnd);
         true
     } else {
         // No region object: the previous cut (if any) is still in force, so
@@ -374,6 +404,7 @@ pub fn open_window_region(hwnd: isize, cw: i32, ch: i32) -> bool {
     unsafe {
         SetWindowRgn(hwnd, hrgn, 1);
     }
+    nudge_region_composition(hwnd);
     true
 }
 

@@ -920,3 +920,17 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
 
 > AI生成
+
+### 9.27 第十四次：undock 落定的 SetWindowRgn 丢了 DWM 重合成——新内容一直被旧切口裁着（2026-10-20 取证）
+
+**用户复现描述（决定性）**：圆形居中 → 拖到边框变方形（dock）→ 再拖回屏幕中间（undock）→ **确定性出现扇形残片**；「稍微动一下屏幕」即复原。
+
+**日志闭环**（§9.26 心跳构建）：undock 落定帧（304946562）区域切到居中 (73,96,302,325)，其后 **20 秒静止心跳帧全部正确**——应用侧每 800ms 绘制并 present 的内容、读到的区域、memo 三方一致；直到 21.2s 后 hover 触发括弧重新 SetWindowRgn，残片才消失（「动一下就复原」的机制）。期间无 sentinel / region GONE。
+
+**根因（确定）**：undock 落定帧的 `SetWindowRgn(bRedraw=1)` **丢失了 DWM 重合成**——区域对象已换新，合成器仍持旧停靠切口裁剪此后的所有 present。残片 = 正确新内容 ∩ 旧停靠形状 = 停靠球轮廓的右下四分之一；心慌的「局部呈现/内容过期」假设（§9.26）被日志否定：present 一直在发生，坏的只是合成器侧的形状。
+
+**修法（把形状同步焊进调用链）**：新增 `platform::nudge_region_composition`——零位移 `SetWindowPos(SWP_NOMOVE|NOSIZE|NOZORDER|NOACTIVATE|FRAMECHANGED)` 强制帧路径重跑、DWM 重新拾取窗口形状；`cut_region` 与 `open_window_region` 每次 `SetWindowRgn` 成功后立即微推（`seed_window_region` 经 `set_window_circle_region` → `cut_region` 自动覆盖）。漏掉一次重合成也无法活过一帧。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **211 passed**。
+
+> AI生成
