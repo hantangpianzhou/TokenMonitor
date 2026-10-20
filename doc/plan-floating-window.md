@@ -1025,3 +1025,26 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **207 passed**。
 
 > AI生成
+
+### 9.33 第二十次：换一种方式——固定窗口，方形与圆形画在同一个 360px 矩形里（net −957 行）
+
+**决策**：§9.24–§9.32 的历程证明，凡是「resize + DWM 重合成」组合走过的路（普通 resize、plain 落定、frame-path 微推、两连发带切换、交替带切换）都无法在所有环境下保证落定后屏幕一致——最后两层修复（`f1d7079`、`a560dec`）只是压住了症状。根治换思路：**让 resize 从这个窗口的生命周期里彻底消失**。
+
+**方案**：窗口打开时是 360px，此后任何形态、任何帧都不再 resize——自由圆、停靠方、hover 放大、morph 中间的每一步，全部由 GPUI 在同一个固定矩形里**画**出来。表面尺寸恒定 ⇒ DWM 不再重新分配 surface ⇒ 残片/空白/消失这一整类「resize 落定被合成器采样」的问题失去物理载体。
+
+**停靠语义变化**：docked 不再缩小窗口；停靠静止位置改为「卡片居中于工作区边缘线」，固定窗口的不可见一半悬出屏幕外——无害，因为 `WM_NCHITTEST` 只在卡片圆内答 `HTCAPTION`，其余全部 `HTTRANSPARENT` 穿透，空白半区既吞不掉事件也不可见。render 每帧做一个**仅移动位置**的贴合（position-only move，表面内容随 origin 走，不可被采样出残片），保证卡片外缘始终在 `DOCK_GAP` 线上。
+
+**退役的机制**（共约 −1179 行 / +222 行）：
+
+- `fit_floating_card_window`（锚定贴合 resize）与 `resize_floating_window_plain`（origin 保持 resize）；
+- `fitted_origin`（锚定移动数学）与 `window_frame_size`（frame 换算，唯一调用方已退役）；
+- layout-centre walk 全家：`anim_from_center` / `anim_center_now` / `anim_screen_anchor` / `settle_plain` 四个字段、`morph_center` / `morph_walk_progress` / `morph_envelope` / `morph_geometry` 四个函数——固定窗口下卡片中心恒等于客户区中心，walk 退化为常量；
+- `window_side_for`（窗宽随形态变化函数）——窗口恒为 `WINDOW_SIZE`；
+- 平台侧三个 `fitted_origin` 测试、UI 侧 envelope/walk/settle 系列八个测试（主体已不存在），glow/fit 辅助簇（`card_pad`/`clip_diameter_for`/`glow_visible_radius`/`CLIP_PAD`/`GLOW_TAIL_SIGMA`）转为 `#[cfg(test)]` 供不变量测试使用；
+- 测试改造：`the_window_stays_fixed_in_every_form`（全形态窗宽恒定）替代 free-window 测试，`a_morph_draws_one_shape_per_progress`（corner ratio 单调钳制）替代 envelope-pin 测试。
+
+**保留不动**：拖拽子类（`HTCAPTION`/`HTTRANSPARENT`）、drop 时 snap 与着陆后 re-snap（`snap_floating_window_to_edge` 只移动位置）、哨兵心跳（InvalidateRect + 交替带切换微推）、`floating_card_frac` 发布链。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` **零告警**；`cargo test --lib` **198 passed**（原 207 减去退役测试，新增 2 个固定窗口不变量测试，`a_morph_draws_one_shape_per_progress` 初版方向断言写反已修正）。
+
+> AI生成

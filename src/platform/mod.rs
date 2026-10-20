@@ -18,9 +18,8 @@ pub use windows::*;
 /// size it publishes to the dock logic.
 #[cfg(target_os = "windows")]
 pub use windows::{
-    client_origin_in_window, client_size_device, client_size_logical, dock_window_x,
-    fit_floating_card_window, fitted_origin, frame_log, install_ball_drag, is_window_alive,
-    monitor_work_area, move_window, resize_floating_window_plain, set_always_on_top,
+    client_origin_in_window, client_size_device, client_size_logical, dock_window_x, frame_log,
+    install_ball_drag, is_window_alive, monitor_work_area, move_window, set_always_on_top,
     set_floating_card_frac, set_floating_refresh_hit, shift_floating_window, show_window,
     snap_floating_window_to_edge, window_rect, window_scale, DockEdge, DOCK_GAP,
 };

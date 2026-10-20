@@ -60,13 +60,13 @@
 //! window edge itself must never land on a pixel the glow still visibly
 //! covers, or the transparent popup's rectangle would show as a faint square
 //! against some desktops. [`card_pad`] keeps that empty ring around the glow
-//! — and `clip_diameter_for`, the card's **fit**, is the docked window side
-//! built from it.
+//! — and `clip_diameter_for`, the card's **fit**, is the smallest side that
+//! holds the card plus that ring.
 //!
-//! The fit is derived from the **card**, never from the window: a fit that
-//! followed the window would silently shrink below what is drawn the moment the
-//! two disagree. Window and fit are one rectangle only when docked; free, the
-//! window is the fixed [`WINDOW_SIZE`] around a smaller fit.
+//! The fit is derived from the **card**, never from the window. The window is
+//! the fixed [`WINDOW_SIZE`] in every form — free and docked alike — which is
+//! always comfortably larger than the fit (the invariant tests pin that); the
+//! fixed window is what takes the resize machinery out of the picture entirely.
 //!
 //! ## 4. The glow is one blurred disc, never a stack of discs
 //!
@@ -117,36 +117,34 @@
 //!   a marker, not a panel. Everything scales with it — glow, corners, text
 //!   budget (the inscribed square of whatever side the morph is at, which is
 //!   inside a circle and a rounded square alike), the refresh icon.
-//! * The **window shrinks with it** (see [`window_side_for`]). Docked, the client
-//!   area is kept exactly as big as the card plus the room its glow needs, so the
-//!   invisible-but-real rectangle the widget occupies never reaches beyond what
-//!   it draws, and the resize is anchored on the card's outer edge, so the
-//!   shrinking square stays against the edge the snap left it at. Free, the window
-//!   is not resized at all — see the next section.
+//! * The card **glides to the edge** the snap left the window at. The window
+//!   itself never moves or resizes for the morph; the docked rest position
+//!   centres the card on the work-area edge, so the invisible half of the fixed
+//!   window hangs off-screen — which is harmless, because the hit test answers
+//!   only inside the card's circle and passes everything else through.
 //!
-//! # When the window is sized to the card — and when it deliberately is not
+//! # The window is fixed — on purpose
 //!
-//! Docked, the window **is** the card plus its glow. It used to be a fixed
-//! 360 px square with the card laid out inside it, which left most of the window
-//! empty: a 70–110 px docked card in a 360 px window sits in ~60% transparent
-//! margin. That margin is invisible, but it is not inert — it hangs a
-//! hundred-odd pixels off the screen edge when docked (so anything that pulls an
-//! off-screen window back inland drags the ball with it), it swallows hover and
-//! press events a long way from the ball, and it makes "where the widget is" mean
-//! a rectangle nowhere near the thing you can see. Sizing the window to the card
-//! removes that whole class of problem, and the only slack left is the empty
-//! [`CLIP_PAD`] ring the glow's blurred edge needs.
+//! The window is opened at [`WINDOW_SIZE`] and **never resized again**, in any
+//! form, on any frame. Every earlier revision resized it: docked, the window
+//! was shrunk to the card plus its glow; the hover pop resized it; the morph
+//! pinned itself to an "envelope" size to keep the number of resizes down. Each
+//! resize forces DWM to reallocate the window's surface, and the measured cost
+//! was 20–33 ms per call — which turned a 240 ms morph into five visible
+//! frames — and worse, every *landing* resize left a ~30 ms window in which the
+//! compositor could sample the old frame inside the new geometry: the
+//! quarter-arc shard of 2026-10-19, and after the region was retired the whole
+//! class of settle artefacts that no nudge could fully heal (plan §9.24–§9.32).
+//! With the surface constant, a morph is nothing but GPUI drawing — those DWM
+//! failure modes have no substrate left.
 //!
-//! **Free, the ball keeps the fixed [`WINDOW_SIZE`] window.** A circle never
-//! docks, so every problem above belongs to the docked form — while resizing the
-//! window under a *circle* costs something real. The ball is centred on the
-//! client rect, so as long as neither the window nor the measurement of it ever
-//! changes, the two are concentric by construction. Resizing turns that into an
-//! arithmetic guarantee that only holds if the two are computed from the *same*
-//! rectangle in the *same* frame — and a single frame where the card is laid
-//! out on a rectangle the window does not have slices a hard, one-sided bite
-//! out of the ball. Keeping the free window fixed keeps the circle exactly as
-//! it always was; only the docked square shrinks the window.
+//! The price is geometry, and it is paid deliberately: the docked card sits in
+//! the middle of a window that is much wider than it is, so half the window
+//! hangs off the screen edge when docked. That margin is invisible, and it is
+//! *inert by construction*: the Win32 hit test answers `HTCAPTION` only inside
+//! the card's circle and `HTTRANSPARENT` everywhere else, so the empty half
+//! cannot swallow hover or press events, and "where the widget is" for the user
+//! is the card, not the rectangle.
 
 use crate::platform::frame_log;
 use gpui::{
@@ -161,15 +159,18 @@ use std::time::{Duration, Instant};
 use crate::app::state::TimeTab;
 use crate::format::{format_int_grouped, format_tokens_wan};
 use crate::platform::{
-    client_origin_in_window, client_size_device, fit_floating_card_window, monitor_work_area,
-    move_window, resize_floating_window_plain, set_floating_card_frac, set_floating_refresh_hit,
-    snap_floating_window_to_edge, window_rect, window_scale, DockEdge, DOCK_GAP,
+    client_origin_in_window, client_size_device, monitor_work_area, move_window,
+    set_floating_card_frac, set_floating_refresh_hit, snap_floating_window_to_edge, window_rect,
+    DockEdge, DOCK_GAP,
 };
 
-/// Edge length (px) the floating window is **opened** at. Must stay in sync with
-/// `FLOAT_WIN` in `app::app`, and it is also the size the window *stays* at while
-/// the ball is free — a circle is never resized (`window_side_for`). Only the
-/// docked square shrinks it, onto the card; see the module note.
+/// Edge length (px) the floating window is **opened** at — and *stays* at for
+/// its whole life. Must stay in sync with `FLOAT_WIN` in `app::app`. The window
+/// is **never resized**: every form the ball takes (free circle, docked square,
+/// hover pop, every step of the morph between them) is drawn inside this one
+/// fixed rectangle, so the surface DWM has to recomposite never changes size —
+/// the resize-driven shard/freeze class of failure has no substrate left (see
+/// the module note on the fixed window).
 const WINDOW_SIZE: f32 = 360.0;
 /// **Solid-ball** diameter at zero usage (px). Deliberately an explicit
 /// minimum: the resting ball keeps a legible, unmistakably-round silhouette
@@ -190,31 +191,27 @@ const MAX_SPHERE: f32 = 175.0;
 const REF_TOKENS: f64 = 200_000_000.0;
 /// Hover pop scale — the ball lifts / grows a touch when the mouse is over it.
 const HOVER_SCALE: f32 = 1.06;
-/// Clear gap (px) the window keeps around the outermost *visible* glow pixel.
-/// The glow has to fade below one 8-bit level before the window's own edge, or
-/// the transparent popup's rectangle shows as a faint square. It is also the
-/// only reason the card is not flush with the client edge, and it is
-/// deliberately small: everything the window covers beyond this ring is dead
-/// weight (see the module note).
+/// Clear gap (px) the fit keeps around the outermost *visible* glow pixel —
+/// the invariant tests' bound. (The window itself no longer hugs the glow: it
+/// is the fixed [`WINDOW_SIZE`], and this ring lives inside the fit.)
+#[cfg(test)]
 const CLIP_PAD: f32 = 12.0;
 /// Blur radius of the glow, as a multiple of the ball diameter. This is the
 /// gaussian's σ, so it sets how far the glow reaches and how soft it is: at
 /// 0.085 a ball 175 px across carries a glow that is still worth 2% of its peak
 /// a good 30 px out.
 const GLOW_BLUR_RATIO: f32 = 0.085;
-/// How many σ of the glow tail count as visible. A gaussian has no finite
-/// support, but past ~2σ its alpha is under 2% of the peak, i.e. below one 8-bit
-/// level against a light desktop — so this, and not 3σ, is the radius the
-/// window has to clear.
+/// How many σ of the glow tail count as visible — the invariant tests' bound
+/// for how much room the fit must leave.
+#[cfg(test)]
 const GLOW_TAIL_SIGMA: f32 = 2.0;
 /// Composited opacity of the glow at the ball's rim, before the blur halves it.
 /// A blurred disc covers its own edge with exactly half the source alpha, so
 /// this is the strength the glow *peaks* at, right where it meets the ball.
 const GLOW_PEAK_ALPHA: f32 = 0.24;
-/// Below this, a measured size is not believable (the client rect can read 0
-/// before the first layout) and the layout falls back to the size the frame is
-/// asking the window to be, rather than drawing a sub-pixel ball into a
-/// degenerate window.
+/// Below this, a measured client size is not believable (the client rect can
+/// read 0 before the first layout) and the layout falls back to [`WINDOW_SIZE`]
+/// rather than drawing into a degenerate rectangle.
 const MIN_SANE_WINDOW: f32 = 32.0;
 
 /// Corner roundness of the docked **square**, as the corner ellipse's diameter
@@ -333,12 +330,14 @@ fn glow_blur(sphere_d: f32) -> f32 {
 
 /// Radius (px) out to which the glow is still visible for a ball of `sphere_d`
 /// px: the ball's own radius plus [`GLOW_TAIL_SIGMA`] σ of blur tail.
+#[cfg(test)]
 fn glow_visible_radius(sphere_d: f32) -> f32 {
     sphere_d / 2.0 + GLOW_TAIL_SIGMA * glow_blur(sphere_d)
 }
 
-/// Room (px) the window keeps on each side of the card: the glow's visible
-/// tail, plus [`CLIP_PAD`] of empty pixels before the window's own edge.
+/// Room (px) the fit keeps on each side of the card: the glow's visible tail,
+/// plus [`CLIP_PAD`] of empty pixels — the invariant tests' bound.
+#[cfg(test)]
 fn card_pad(card_d: f32) -> f32 {
     glow_visible_radius(card_d) - card_d / 2.0 + CLIP_PAD
 }
@@ -346,34 +345,14 @@ fn card_pad(card_d: f32) -> f32 {
 /// Diameter (px) of the card's **fit** — the smallest window side that holds a
 /// card of `card_d` px plus its glow with [`card_pad`] to spare.
 ///
-/// Derived *from the card*, so the docked footprint can never come out too
-/// small for what is drawn. It is also the docked widget's whole footprint:
-/// docked, the window is resized to exactly this, so "the window is the card
-/// plus the room its glow needs" holds by construction rather than by
-/// arithmetic.
+/// Derived *from the card*, so the fit can never come out too small for what is
+/// drawn. It is the smallest side that holds the card plus the glow ring, and
+/// the invariant tests' bound; the *window* is no longer sized from it — the
+/// window is [`WINDOW_SIZE`] at every moment of every form (see the module
+/// note on the fixed window).
+#[cfg(test)]
 fn clip_diameter_for(card_d: f32) -> f32 {
     card_d + 2.0 * card_pad(card_d)
-}
-
-/// Client-area side (px) the floating window is asked to be, for a card of
-/// `card_d` px at morph progress `t`.
-///
-/// Two ends, deliberately different:
-///
-/// * **Free** (`t = 0`) — [`WINDOW_SIZE`], the size the app opens the window at.
-///   The window is *not* resized while the ball is a circle: the card is centred
-///   on the client rect, so it stays concentric with the window by construction.
-/// * **Docked** (`t = 1`) — [`clip_diameter_for`], the card's own fit. A card
-///   resting against the screen edge then carries no invisible margin beyond it,
-///   which is the whole point of docking: nothing the widget does can reach
-///   off-screen.
-///
-/// The walk between the two is linear in `t` — the same ramp as the corner radius
-/// and the card's side — so the shrink lands together with the rounding-up.
-fn window_side_for(card_d: f32, t: f32) -> f32 {
-    let free = WINDOW_SIZE;
-    let docked = clip_diameter_for(card_d);
-    free + (docked - free) * t.clamp(0.0, 1.0)
 }
 
 /// Note on where the frame's rectangle comes from (this used to be a function of
@@ -419,10 +398,9 @@ fn corner_ratio_for(t: f32) -> f32 {
 /// Side (px) of the card at morph progress `t`: the ball's own diameter while
 /// free (`t = 0`), [`DOCK_SIDE_RATIO`] of it once docked (`t = 1`).
 ///
-/// The morph therefore moves *two* things at once — the corner radius (see
+/// The morph therefore moves two things at once — the corner radius (see
 /// [`corner_ratio_for`]) and this side — and both are read from the same `t`, so
-/// what is drawn and the window sized around it (see [`window_side_for`]) can
-/// never disagree about how big the widget is. Linear in `t` on purpose:
+/// what is drawn is always one coherent shape. Linear in `t` on purpose:
 /// [`corner_ratio_for`] is linear too, so the shrink and the rounding-up land
 /// together instead of one arriving first.
 fn card_side_for(sphere_d: f32, t: f32) -> f32 {
@@ -500,102 +478,16 @@ fn ball_box(win_w: f32, win_h: f32, sphere_d: f32) -> (f32, f32, f32) {
 /// [`ball_box`] with the centre given explicitly rather than assumed at the
 /// layout box's middle.
 ///
-/// The morph's layout-centre walk needs this: while a transition runs, the
-/// card is drawn along a path from the old form's client centre to the new
-/// form's (see `FloatingView::render`), not at the envelope window's own
-/// centre. Everything downstream — the shading layers, the speculars, the
-/// text stack, the refresh icon — derives from this one box, so they follow
-/// the walk by construction.
+/// The render centres the card on the client rect it measured — always the
+/// fixed window's middle — and everything downstream (the shading layers, the
+/// speculars, the text stack, the refresh icon) derives from this one box, so
+/// the layers stay concentric by construction.
 fn ball_box_at(center_x: f32, center_y: f32, sphere_d: f32) -> (f32, f32, f32) {
     (
         center_x - sphere_d / 2.0,
         center_y - sphere_d / 2.0,
         sphere_d,
     )
-}
-
-/// Layout-box centre (client-area px) at morph progress `morph` of the walk
-/// from `from` to `to`. `morph` arrives already eased, so the walk itself is
-/// the plain interpolation — monotone, symmetric, and landing exactly on both
-/// endpoints, which are the resting centres of the two forms.
-fn morph_center(from: (f32, f32), to: (f32, f32), morph: f32) -> (f32, f32) {
-    (
-        from.0 + (to.0 - from.0) * morph,
-        from.1 + (to.1 - from.1) * morph,
-    )
-}
-
-/// Normalised walk progress (0 = the walk's start, 1 = its end) for a frame at
-/// `morph`, given the transition runs `morph_from → morph_target`.
-///
-/// **The raw `morph` value is not the progress.** Docking runs 0 → 1, so the
-/// two happen to coincide; undocking runs 1 → 0, where `morph == 1` is the
-/// *start* and `morph == 0` is the *end*. Feeding `morph` straight into
-/// [`morph_center`] made the undock take-off draw the card at the walk's far
-/// end — a 102 px instant jump of the card inside the layout box (and a
-/// matching jump of the window origin through the screen-anchor compensation),
-/// then a second jump back on the landing frame (measured in `tm-frame.log`
-/// 2026-10-19 20:07, `center=180.0` on a `morph=1.000` undock take-off whose
-/// card was at 78). Normalising against the transition's own endpoints makes
-/// the progress direction-agnostic: both take-off frames start at 0 (the card
-/// exactly where it is), both landing frames end at 1 (the card exactly where
-/// the resting layout puts it), and the handoffs at both ends are seamless
-/// whichever way the morph runs.
-fn morph_walk_progress(morph_from: f32, morph_target: f32, morph: f32) -> f32 {
-    let span = morph_target - morph_from;
-    if span.abs() > 1e-6 {
-        ((morph - morph_from) / span).clamp(0.0, 1.0)
-    } else {
-        // A zero-length transition: the card is already at its end.
-        1.0
-    }
-}
-
-/// The `(window side, card fit)` the transition runs on, instead of the
-/// per-frame geometry it is animating between.
-///
-/// A morph moves the card **and** the window together, and the window move costs
-/// 20–33 ms measured — `SetWindowPos` has to make DWM re-allocate the window's
-/// surface. Fifteen of those in a 240 ms animation do not fit in a 16 ms frame:
-/// they serialise on the main thread, so the timer falls behind by whatever the
-/// frame cost, and the transition lands as 5–6 frames at ~60 ms apart
-/// (measured) — `morph` jumping 0 → 0.03 → 0.26 → 1.0 with whole frames dropped
-/// in between. That is the jank.
-///
-/// So while a morph runs, both are pinned to the **envelope**: one shape large
-/// enough to hold the card at *both* ends of the transition plus the room its
-/// glow needs. The circle is the big end (`card_side_for` shrinks towards the
-/// square), so the envelope is the free circle's own geometry — and since the
-/// free window is [`WINDOW_SIZE`] and already exceeds that, the envelope window
-/// is simply `WINDOW_SIZE`. Which means a morph performs its one structural
-/// change at the **ends only**, and every frame in between is pure GPUI
-/// drawing.
-fn morph_envelope(sphere_d: f32) -> (f32, f32) {
-    let clip = clip_diameter_for(sphere_d);
-    (WINDOW_SIZE.max(clip), clip)
-}
-
-/// `(window side, card fit, corner ratio)` for a frame — the frame's own
-/// geometry while the ball is at rest, the **envelope**'s while a morph runs.
-///
-/// This is the single place the two regimes meet, so it is the single place that
-/// has to keep them consistent: at rest the window hugs the card (free, the fixed
-/// [`WINDOW_SIZE`]; docked, the card plus its glow), mid-transition both are held
-/// still at the envelope. A caller that read `window_side_for` directly would
-/// resume resizing the window on every frame of the transition, which is exactly
-/// the 20–33 ms per frame that [`morph_envelope`] exists to avoid.
-fn morph_geometry(sphere_d: f32, morph: f32, animating: bool) -> (f32, f32, f32) {
-    let card_d = card_side_for(sphere_d, morph);
-    if animating {
-        let (side, clip) = morph_envelope(sphere_d);
-        (side, clip, 1.0)
-    } else {
-        (
-            window_side_for(card_d, morph),
-            clip_diameter_for(card_d),
-            corner_ratio_for(morph),
-        )
-    }
 }
 
 /// `morph`'s value `elapsed` into a `from → target` transition.
@@ -826,52 +718,14 @@ pub struct FloatingView {
     /// content travels with the window — so deferring it costs no intermediate
     /// state.
     pending_snap: Option<DockEdge>,
-    /// Layout-box centre (client-area px) the in-flight morph started from: the
-    /// old form's client centre, snapshotted when the morph begins. The walk
-    /// interpolates from here to the target form's client centre every frame
-    /// (see [`morph_center`]), so the card arrives at the *new* client's own
-    /// centre **before** the window ever shrinks onto it.
+    /// Logical client size of the last frame that *proved* it — the OS
+    /// verifiably reported this client size when the frame went in.
     ///
-    /// That is the whole fix for the shard: the window's surface content
-    /// travels with the window origin, so a resize that moves the origin —
-    /// what the anchored `fitted_origin` math was designed to do, in screen
-    /// coordinates — leaves the still-shown previous frame at its old *window*
-    /// coordinates, which is outside the new small client no matter where the
-    /// screen-space centre lands. Only laying the card out at the target
-    /// centre moves the pixels inside the new client, and it has to happen a
-    /// frame before the shrink. (Forensics: `tm-frame.log` 2026-10-19 19:41,
-    /// the 31 ms gap between the landing `SetWindowPos` pair and the re-cut,
-    /// sampled as a quarter-arc shard.)
-    anim_from_center: (f32, f32),
-    /// The layout-box centre the walk has the card at **right now** — updated
-    /// every animated frame so a morph reversed mid-flight can re-snapshot the
-    /// new walk's start from where the card actually is, instead of assuming
-    /// it sits at the form's own client centre (which it does only at rest).
-    anim_center_now: (f32, f32),
-    /// Where the card's centre sits on **screen** (device px) when the morph
-    /// starts — the anchor the per-frame origin compensation holds it at while
-    /// the layout centre walks. Docking re-aims the x at the dock line every
-    /// frame (the card shrinks along it, so its centre creeps outward);
-    /// undocking holds both axes where the drag released them.
-    anim_screen_anchor: (f32, f32),
-    /// Whether **this** frame's resize must be the plain, origin-preserving
-    /// one ([`platform::resize_floating_window_plain`]). Set by the landing
-    /// frame of a docking morph; cleared once the resize has actually landed
-    /// (an un-landed settle retries plain the next frame rather than falling
-    /// back to the anchored move, which is the move that carries the old
-    /// content off-centre).
-    settle_plain: bool,
-    /// Logical client size of the last frame that *proved* it — the window was
-    /// verifiably this size when the frame went in.
-    ///
-    /// This is the fallback for a frame where no client rect can be read at all.
-    /// It is safe precisely because it is not a general-purpose "last known
-    /// size": a frame that reaches the fallback did **not** touch the window, so
-    /// the window still has exactly this geometry. Laying out in it keeps the
-    /// card centred on the real window; laying out in the size we *would* have
-    /// asked for does not, and a resize that never lands (a morph cancelled
-    /// mid-flight, a drag that outruns the message) would leave the ball drawn
-    /// for a window that does not exist.
+    /// The fallback for a frame where no client rect can be read at all (the
+    /// window is mid-creation or mid-destruction). The window is never resized,
+    /// so in every normal case this is simply [`WINDOW_SIZE`]; the field exists
+    /// so a frame that cannot measure still lays out on a rectangle that
+    /// really exists.
     last_verified_client: (f32, f32),
     /// Cached fit of the token-count string.
     num_fit: Option<TextFit>,
@@ -928,10 +782,6 @@ impl FloatingView {
             morph_target: 0.0,
             morph_started: None,
             pending_snap: None,
-            anim_from_center: (WINDOW_SIZE / 2.0, WINDOW_SIZE / 2.0),
-            anim_center_now: (WINDOW_SIZE / 2.0, WINDOW_SIZE / 2.0),
-            anim_screen_anchor: (0.0, 0.0),
-            settle_plain: false,
             last_verified_client: (WINDOW_SIZE, WINDOW_SIZE),
             num_fit: None,
             label_fit: None,
@@ -959,11 +809,12 @@ impl FloatingView {
     /// Dock the ball into its square form against `edge`, or release it back
     /// into the circle (`None`) — animated either way. Called from the app when
     /// the ball's Win32 drag subclass reports where it was dropped; the window
-    /// has already been snapped to (or away from) the screen edge by then, and the
-    /// morph resizes it around the card as it goes (see [`window_side_for`]).
+    /// has already been snapped to (or away from) the screen edge by then, and
+    /// the morph glides the card to (or back from) the edge the snap left the
+    /// window at. The window itself never resizes — see the module note.
     ///
     /// The edge is kept only while it is being *entered*: coming back out keeps
-    /// the last one so the resize stays anchored on the same side for the whole
+    /// the last one so the glide heads for the same side for the whole
     /// animation, and it is dropped once the expansion has landed (see
     /// [`Self::edge`]).
     pub fn set_docked(&mut self, edge: Option<DockEdge>, cx: &mut Context<Self>) {
@@ -1018,41 +869,12 @@ impl FloatingView {
             self.morph_started = None;
             return;
         }
-        // Snapshot the walk's two fixed points before the first animated
-        // frame: where the card's centre sits in the layout box now, and where
-        // it sits on screen — the anchor the per-frame origin compensation holds
-        // it at while the centre walks.
-        //
-        // At rest the card is centred in the client rect, so that centre is
-        // the answer. **Mid-flight reversal is the case that has to be careful**:
-        // the card is part-way along the previous walk, not at any form's
-        // centre, so the new walk must continue from the centre the previous
-        // walk actually had (`anim_center_now`) — snapshotting the client
-        // centre instead would teleport the card to the envelope's centre and
-        // jump the window origin through the screen-anchor compensation.
-        // On screen the card never moved (the compensation holds it at its
-        // anchor), so the anchor re-read from the client centre is wrong only
-        // while a walk is in flight — read the anchor the same way from
-        // `anim_center_now` instead.
-        if self.animating {
-            self.anim_from_center = self.anim_center_now;
-            // The card's screen position under the compensation is the anchor
-            // the previous walk was holding — keep holding it. The client's
-            // centre no longer describes it.
-        } else {
-            let scale = window_scale(self.hwnd);
-            if let Some((cw, ch)) = client_size_device(self.hwnd) {
-                self.anim_from_center = (cw as f32 / scale / 2.0, ch as f32 / scale / 2.0);
-                let (ox, oy) = client_origin_in_window(self.hwnd);
-                if let Some((wx, wy, _, _)) = window_rect(self.hwnd) {
-                    self.anim_screen_anchor = (
-                        wx as f32 + ox as f32 + self.anim_from_center.0 * scale,
-                        wy as f32 + oy as f32 + self.anim_from_center.1 * scale,
-                    );
-                }
-            }
-        }
-        self.anim_center_now = self.anim_from_center;
+        // Nothing else to snapshot: the window is fixed and the card is
+        // centred in it every frame, so the transition is carried entirely by
+        // `morph` and the frames the render loop is about to draw. A morph
+        // reversed mid-flight simply turns around — the card is where the
+        // last drawn frame put it, and the easing starts from the current
+        // `morph` value.
         self.morph_from = from;
         self.morph_target = target;
         self.morph_started = Some(Instant::now());
@@ -1065,8 +887,8 @@ impl FloatingView {
     ///
     /// The advance lives here, in `render`, rather than in a background timer,
     /// because of what the two cost. Measured on this widget: `render`'s own body
-    /// is **0.9–2.0 ms** per frame once the window is pinned to the morph
-    /// envelope, while a 16 ms `background_executor` timer delivered
+    /// is **0.9–2.0 ms** per frame at the fixed window size, while a 16 ms
+    /// `background_executor` timer delivered
     /// frames **19–77 ms** apart. The timer is not slow — it wakes on time — but
     /// it wakes on *its own* schedule, which has no relation to the display's
     /// refresh: a wake-up that lands just after a vsync waits a whole refresh
@@ -1091,21 +913,14 @@ impl FloatingView {
         }
         self.morph = self.morph_target;
         self.morph_started = None;
-        // The envelope is only for the transition; the frame that lands must go
-        // back to the geometry of the form it actually arrived in.
         self.animating = false;
-        // **Both landings settle with a plain resize.** The layout-centre walk
-        // has the card at the target client's own centre (the normalised walk
-        // ends at 1 in either direction), so the landing resize keeps the
-        // origin still (`platform::resize_floating_window_plain`): the previous
-        // frame's pixels — which the window origin carries unchanged — sit
-        // exactly at the new client's centre, and there is no shard-shaped gap
-        // for the compositor to catch between the resize and the repaint.
-        // Undocking needs nothing further (the free window is already the
-        // envelope, so the settle is usually a no-op); docking owes a re-snap,
-        // paid on the *next* frame with the fraction this frame publishes (see
-        // `snap_floating_window_to_edge`).
-        self.settle_plain = true;
+        // **The landing is pure state.** The window did not move or resize
+        // during the transition, so there is no geometry to settle. What is
+        // owed is only the docked re-snap: the drop-time snap estimated the
+        // card from the pre-morph fraction, and the settled card is
+        // `DOCK_SIDE_RATIO` of that estimate. The next frame publishes the
+        // settled fraction and re-snaps from it, putting the card's outer edge
+        // exactly on `DOCK_GAP` (see `snap_floating_window_to_edge`).
         if self.morph_target == 1.0 {
             if let Some(edge) = self.edge {
                 self.pending_snap = Some(edge);
@@ -1114,17 +929,9 @@ impl FloatingView {
                 window.request_animation_frame();
             }
         }
-        // **Undocking needs no landing correction.** The per-frame origin
-        // compensation held the card at its anchor the whole way, and the walk
-        // ends at the free form's client centre — which is also where the
-        // resting layout puts it — so the landing frame is a no-op. (The
-        // half-card drift `landing_shift` used to correct cannot occur: the
-        // card never moves on screen during the transition.)
+        // Undock landing: let go of the edge. Nothing else to do — the card is
+        // already centred in the fixed window, wherever the drag left it.
         if self.morph_target == 0.0 && !self.docked {
-            // The expansion has landed: the ball is a plain circle at rest again,
-            // so let go of the side the resize was anchored against. A stale edge
-            // would make the next hover grow the ball towards a screen edge it is
-            // nowhere near.
             self.edge = None;
         }
     }
@@ -1175,117 +982,46 @@ impl Render for FloatingView {
         // shape at every point of the transition.
         let morph = self.morph.clamp(0.0, 1.0);
         let card_d = card_side_for(self.sphere_diameter(), morph);
-        // While the morph runs, the window is held at the **envelope** rather
-        // than at this frame's geometry — see [`morph_envelope`] for why
-        // (fifteen `SetWindowPos` calls do not fit in a 240 ms transition's
-        // frame budget, and the measured cost of that overrun is the transition
-        // collapsing into five frames). The card itself still animates every
-        // frame: it is drawn by GPUI, which costs well under a millisecond.
-        let (want, clip_d, corner_ratio) =
-            morph_geometry(self.sphere_diameter(), morph, self.animating);
+        let corner_ratio = corner_ratio_for(morph);
 
+        // **The window is fixed — no `SetWindowPos` of any kind runs for
+        // layout.** Not a resize, not an envelope pin, not an origin
+        // compensation: the card is centred in the client area the window
+        // actually has (for every normal frame the [`WINDOW_SIZE`] the window
+        // was opened at), and the morph, the hover pop and the usage growth
+        // are all carried by what this function *draws*, never by the window's
+        // geometry. DWM never sees the surface change size, so the whole class
+        // of resize-sampled artefacts has nothing left to sample.
         let scale = window.scale_factor();
         let sane = scale > 0.0 && scale.is_finite();
-        // The client this frame is *asking for*, in device px.
-        let want_dev = sane && want.is_finite() && want > 0.0;
-        let want_client = if want_dev {
-            (
-                ((want * scale).round() as i32).max(1),
-                ((want * scale).round() as i32).max(1),
-            )
-        } else {
-            (0, 0)
-        };
-
-        // **One step: resize the window onto the requested geometry.**
-        //
-        // There is no Win32 region any more — the window is a plain transparent
-        // rectangle and the ball is drawn inside it, so a resize can no longer
-        // expose a hole or a shard: every state the window passes through is
-        // just "a differently-sized rectangle with the same content". The
-        // open → resize → cut bracket, its memo and its truth-check all existed
-        // only to keep `SetWindowRgn` in step with `SetWindowPos`, and died with
-        // the region.
-        //
-        // While the morph runs — and on the docking landing frame, and on any
-        // frame a plain settle has not landed yet — the resize is the **plain**
-        // one: the origin does not move. The card has already been walked to
-        // the target client's own centre, and a moving origin would carry the
-        // still-shown previous frame away from it (the quarter-arc shard of
-        // 2026-10-19; see `platform::resize_floating_window_plain`). At rest
-        // the anchored fit stays: hover pops and DPI changes resize a client
-        // the centred card already fits inside, and the anchored move keeps
-        // the card's screen position through those.
-        let plain_resize = self.animating || self.settle_plain;
-        let client_dev = if plain_resize {
-            resize_floating_window_plain(hwnd, want, scale)
-        } else {
-            fit_floating_card_window(hwnd, want, scale, card_d, self.edge)
-        }
-        .filter(|(w, h)| (*w as f32) >= MIN_SANE_WINDOW && (*h as f32) >= MIN_SANE_WINDOW);
-        // A settle that has not landed retries the plain resize next frame
-        // instead of falling back to the anchored move — the anchored move is
-        // precisely the one that carries the old content off-centre.
-        if client_dev == Some(want_client) {
-            self.settle_plain = false;
-        }
-        let (win_w, win_h) = match client_dev {
-            Some((w, h)) if sane => (w as f32 / scale, h as f32 / scale),
+        let measured = if sane { client_size_device(hwnd) } else { None }
+            .filter(|(w, h)| (*w as f32) >= MIN_SANE_WINDOW && (*h as f32) >= MIN_SANE_WINDOW);
+        let (win_w, win_h) = match measured {
+            Some((w, h)) => {
+                let logical = (w as f32 / scale, h as f32 / scale);
+                // A measured, sane client rect is the proof itself; the field
+                // only carries that proof across a frame that cannot measure.
+                self.last_verified_client = logical;
+                logical
+            }
             // No believable client rect: the window still has whatever geometry
             // the last verified frame gave it. Lay out in *that* rather than in
-            // the size we would have asked for — a layout box for a window that
-            // may never exist is the bug this whole arrangement exists to remove.
-            _ => self.last_verified_client,
+            // a size nothing vouches for.
+            None => self.last_verified_client,
         };
         let win = win_w.min(win_h);
 
         // The card as a fraction of the client area it was actually laid out in.
-        // Two readers depend on it: the dock snap (`platform::windows::dock_and_snap`)
-        // turns "the card's own edge" into screen px with it, and the next frame's
-        // resize anchors on it as the card that is currently on screen — which is
-        // why it is published after the resize, not before.
+        // The dock snap (`platform::windows::dock_and_snap`) turns "the card's
+        // own edge" into screen px with it, so it is published every frame —
+        // the drop-time snap and the post-landing re-snap both read it.
         set_floating_card_frac(card_d / win.max(1.0));
 
-        // Record the verified client only once the OS is known to actually sit
-        // on it — a fallback written for a resize that did not happen would
-        // make later frames lay out for a window that does not exist.
-        if client_dev == Some(want_client) && client_size_device(hwnd) == Some(want_client) {
-            self.last_verified_client = (win_w, win_h);
-        }
-
-        // The layout centre. At rest the card is centred in the client rect the
-        // frame laid out in. While a morph runs, the centre *walks* from the old
-        // form's client centre to the new form's own: the card has to arrive at
-        // the target client's centre before the window ever shrinks onto it,
-        // because the window's surface content travels with the window origin —
-        // an origin-moving resize cannot pull the old frame's pixels inside the
-        // new client, but laying them out at the target centre does, one frame
-        // early. `morph` is already eased, and the walk's endpoints are the
-        // resting centres of the two forms, so the handoff at both ends is
-        // seamless (the landing frame's resting centre *is* the walk's target).
-        //
-        // The interpolation argument is the **normalised** walk progress
-        // ([`morph_walk_progress`]), not `morph` itself: docking runs 0 → 1 so
-        // the two coincide, but undocking runs 1 → 0, where raw `morph` points
-        // at the wrong end of the walk — the undock take-off drew the card at
-        // the far end (a 102 px jump) before this was normalised.
-        let (center_x, center_y) = if self.animating {
-            let to = window_side_for(
-                card_side_for(self.sphere_diameter(), self.morph_target),
-                self.morph_target,
-            ) / 2.0;
-            let progress = morph_walk_progress(self.morph_from, self.morph_target, morph);
-            morph_center(self.anim_from_center, (to, to), progress)
-        } else {
-            (win_w / 2.0, win_h / 2.0)
-        };
-        // Remember where the walk has the card right now: a morph reversed
-        // mid-flight (dock ↔ undock in quick succession) re-snapshots the new
-        // walk's start from this, so the card continues from where it actually
-        // is instead of teleporting to the form's own centre.
-        if self.animating {
-            self.anim_center_now = (center_x, center_y);
-        }
+        // The layout centre: always the client rect's own middle. The fixed
+        // window and the centred card are concentric by construction, at rest
+        // and mid-morph alike — a transition changes what is *drawn*, never
+        // where the card's centre sits.
+        let (center_x, center_y) = (win_w / 2.0, win_h / 2.0);
 
         // One line per frame while `%TEMP%\tm-frame.on` exists: everything the
         // frame laid out, next to what the OS currently believes. The ball
@@ -1295,7 +1031,7 @@ impl Render for FloatingView {
         // dates the disagreement to the `WM_DPICHANGED` that caused it.
         crate::platform::frame_log(&format!(
             "frame morph={morph:.3} anim={} edge={:?} docked={} hovered={} \
-             sphere={:.1} card={card_d:.1} scale={scale:.4} want={want:.1} clip={clip_d:.1} \
+             sphere={:.1} card={card_d:.1} scale={scale:.4} \
              ratio={corner_ratio:.2} client={win_w:.1}x{win_h:.1} center={center_x:.1},{center_y:.1} \
              device={:?} snap={:?}",
             self.animating,
@@ -1307,34 +1043,32 @@ impl Render for FloatingView {
             self.pending_snap,
         ));
 
-        // While the morph runs, hold the card at its anchor **on screen**. The
-        // walk moves the card's centre through the layout box, so the window
-        // origin has to move the same distance the other way — a position-only
-        // move, which cannot clip anything (the surface content travels with
-        // the origin, so the content's screen position does not change).
-        // Docking re-aims the x at the dock line every frame — the card
-        // shrinks along it, so its centre creeps outward; undocking holds both
-        // axes where the drag released them.
-        if self.animating {
-            let (ax, ay) = self.anim_screen_anchor;
-            let card_dev = card_d * scale;
-            let target_x = match (self.docked, self.edge) {
-                (true, Some(DockEdge::Right)) => monitor_work_area(hwnd)
-                    .map(|(_, _, area_r, _)| area_r as f32 - DOCK_GAP * scale - card_dev / 2.0)
-                    .unwrap_or(ax),
-                (true, Some(DockEdge::Left)) => monitor_work_area(hwnd)
-                    .map(|(area_l, _, _, _)| area_l as f32 + DOCK_GAP * scale + card_dev / 2.0)
-                    .unwrap_or(ax),
-                _ => ax,
-            };
-            let (ox, oy) = client_origin_in_window(hwnd);
-            let cx_dev = ox as f32 + center_x * scale;
-            let cy_dev = oy as f32 + center_y * scale;
-            if let Some((wx, wy, _, _)) = window_rect(hwnd) {
-                let x = (target_x - cx_dev).round() as i32;
-                let y = (ay - cy_dev).round() as i32;
-                if x != wx || y != wy {
-                    move_window(hwnd, x, y);
+        // **Docked, aim the window so the card's outer edge stays on the dock
+        // line.** The card is centred in the fixed window, so anything that
+        // changes its size (the dock morph's shrink, the hover pop, usage
+        // growth) would otherwise let its outer edge drift off `DOCK_GAP` —
+        // the fix is a position-only move of the window, which cannot clip
+        // anything (the surface content travels with the origin). No resize
+        // ever runs here. Undocked there is no line to hold, and the card
+        // simply grows around its centre.
+        if sane && self.docked {
+            if let Some(edge) = self.edge {
+                let card_dev = card_d * scale;
+                let line = match edge {
+                    DockEdge::Right => monitor_work_area(hwnd)
+                        .map(|(_, _, area_r, _)| area_r as f32 - DOCK_GAP * scale - card_dev / 2.0),
+                    DockEdge::Left => monitor_work_area(hwnd)
+                        .map(|(area_l, _, _, _)| area_l as f32 + DOCK_GAP * scale + card_dev / 2.0),
+                };
+                if let Some(line_x) = line {
+                    let (ox, _) = client_origin_in_window(hwnd);
+                    let centre_dev = ox as f32 + win_w / 2.0 * scale;
+                    let x = (line_x - centre_dev).round() as i32;
+                    if let Some((wx, wy, _, _)) = window_rect(hwnd) {
+                        if x != wx {
+                            move_window(hwnd, x, wy);
+                        }
+                    }
                 }
             }
         }
@@ -1351,9 +1085,8 @@ impl Render for FloatingView {
         }
 
         // Centre on each axis independently, so a client area that is not exactly
-        // square (a frame or two while the OS applies a resize) still keeps every
-        // layer concentric — at the walked centre while a morph runs, at the
-        // client's own centre at rest.
+        // square (a frame during window creation) still keeps every layer
+        // concentric at the client's own centre.
         let (card_left, card_top, _) = ball_box_at(center_x, center_y, card_d);
         let ball_x = px(card_left);
         let ball_y = px(card_top);
@@ -1715,7 +1448,7 @@ mod tests {
         for ball in BALLS {
             for morph in MORPHS {
                 let sphere = card_side_for(ball, morph);
-                let win = window_side_for(sphere, morph);
+                let win = WINDOW_SIZE;
                 let (bx, by, _) = ball_box(win, win, sphere);
                 for &(cx, cy, r, _) in SPECULARS.iter() {
                     let (left, top, d) = specular_geometry(bx, by, sphere, (cx, cy, r));
@@ -1748,10 +1481,13 @@ mod tests {
         for ball in BALLS {
             for morph in MORPHS {
                 let card = card_side_for(ball, morph);
-                let side = window_side_for(card, morph);
-                // The window is square by construction; a non-square client area
-                // only exists for a frame or two while the OS applies a resize.
-                for (win_w, win_h) in [(side, side), (side + 40.0, side)] {
+                // The window is fixed and square; a non-square client area
+                // exists only on a window-creation frame, and the per-axis
+                // centring has to survive even that.
+                for (win_w, win_h) in [
+                    (WINDOW_SIZE, WINDOW_SIZE),
+                    (WINDOW_SIZE + 40.0, WINDOW_SIZE),
+                ] {
                     let (left, top, d) = ball_box(win_w, win_h, card);
                     assert_eq!(d, card, "the shared box must be the card's size");
                     assert!(left >= 0.0 && top >= 0.0);
@@ -1763,90 +1499,64 @@ mod tests {
         }
     }
 
-    /// **The whole point of the fix.** For every usage and every step of the morph
-    /// the window has to (a) hold the card, (b) clear the glow's outermost visible
-    /// pixel by [`CLIP_PAD`] — the window's own edge has to land on that empty
-    /// ring, or the transparent popup's rectangle shows as a faint square — and
-    /// (c) leave nothing *more* than that ring empty. The margin is not free: an
-    /// empty window is invisible but real, and it is what used to hang a hundred
-    /// pixels off the screen edge when docked.
-    ///
-    /// And the window has to be at least the card's fit — plus, **docked, exactly
-    /// the fit**, which is what makes the docked widget carry no margin at all.
-    /// Free, it is the untouched [`WINDOW_SIZE`], and the slack around the fit
-    /// is the price of never resizing it (see `the_free_ball_keeps_the_fixed_window`).
+    /// **The fixed window always has room for the card.** For every usage and
+    /// every step of the morph, [`WINDOW_SIZE`] has to hold the card plus its
+    /// glow with [`CLIP_PAD`] to spare — the fit is the smallest side that
+    /// does, and the fixed window is comfortably larger in every form.
     #[test]
-    fn window_wraps_the_card_and_its_glow() {
+    fn the_fixed_window_wraps_the_card_and_its_glow() {
         for tokens in USAGES {
             for hovered in [false, true] {
                 let ball = sphere_diameter_for(tokens, hovered);
                 for morph in MORPHS {
                     let card = card_side_for(ball, morph);
                     let fit = clip_diameter_for(card);
-                    let win = window_side_for(card, morph);
                     let tail = GLOW_TAIL_SIGMA * glow_blur(card);
                     let pad = card_pad(card);
                     assert!(fit > card, "the fit leaves no room for the glow");
                     assert!(
                         (pad - (tail + CLIP_PAD)).abs() < 0.01,
-                        "the window's room per side is {pad}px, not the glow's tail \
+                        "the room per side is {pad}px, not the glow's tail \
                          ({tail}px) plus CLIP_PAD ({CLIP_PAD}px) — card {card}, \
                          tokens {tokens}, t={morph}"
                     );
-                    // The window's edge sits `CLIP_PAD` beyond the glow's visible
+                    // The fit's edge sits `CLIP_PAD` beyond the glow's visible
                     // tail: still empty, or the edge would land on a visible pixel.
                     assert!(
                         pad >= tail + 1.0,
-                        "the window's edge ({pad}px) reaches the glow tail ({tail}px)"
+                        "the fit's edge ({pad}px) reaches the glow tail ({tail}px)"
                     );
-                    // A window smaller than the fit would clamp short of what is
-                    // drawn, i.e. a shaved rim.
+                    // The fixed window clears the fit — a side smaller than the
+                    // fit would shave the rim.
                     assert!(
-                        win >= fit - 0.01,
-                        "the window ({win}) is smaller than the fit it has to \
-                         hold ({fit}) — card {card}, t={morph}"
-                    );
-                    // ...and it never outgrows the one the app creates, so a first
-                    // frame is never clipped before the resize lands.
-                    assert!(
-                        win <= WINDOW_SIZE,
-                        "the window ({win}) outgrew the one the app creates"
+                        WINDOW_SIZE >= fit - 0.01,
+                        "the fixed window ({WINDOW_SIZE}) is smaller than the fit \
+                         it has to hold ({fit}) — card {card}, t={morph}"
                     );
                 }
-                // Docked, window == fit: no invisible margin beyond the card.
-                let docked_card = card_side_for(ball, 1.0);
-                assert!(
-                    (window_side_for(docked_card, 1.0) - clip_diameter_for(docked_card)).abs()
-                        < 0.01,
-                    "the docked window must be exactly the card's own fit"
-                );
             }
         }
     }
 
-    /// **The free ball is never resized.** The card is centred on the client
-    /// rect, so as long as the window stays at [`WINDOW_SIZE`] the ball is
-    /// concentric with the window *by construction*. Tying the free window to
-    /// the card is what turned that into an arithmetic guarantee — and one frame
-    /// where the card is laid out on a rectangle the window does not have took a
-    /// hard, one-sided bite out of the ball's rim.
+    /// **The window is never resized — in any form.** The card is centred on
+    /// the client rect, so as long as the window stays at [`WINDOW_SIZE`] the
+    /// ball is concentric with the window *by construction*, free or docked,
+    /// at rest or mid-morph. Resizing it was the substrate of every shard and
+    /// settle artefact on record.
     #[test]
-    fn the_free_ball_keeps_the_fixed_window() {
+    fn the_window_stays_fixed_in_every_form() {
         for tokens in USAGES {
             for hovered in [false, true] {
-                let card = card_side_for(sphere_diameter_for(tokens, hovered), 0.0);
-                assert_eq!(
-                    window_side_for(card, 0.0),
-                    WINDOW_SIZE,
-                    "the free window must stay exactly the size the app opened it at"
-                );
-                // ...and the fit is comfortably inside the window — the glow plus
-                // CLIP_PAD, exactly as the fitted circle always was.
-                let fit = clip_diameter_for(card);
-                assert!(
-                    fit < WINDOW_SIZE,
-                    "a fit as big as the window leaves the glow no empty ring"
-                );
+                for morph in MORPHS {
+                    let card = card_side_for(sphere_diameter_for(tokens, hovered), morph);
+                    // ...and the fit is comfortably inside the window — the
+                    // glow plus CLIP_PAD, in the docked form as much as the free.
+                    let fit = clip_diameter_for(card);
+                    assert!(
+                        fit < WINDOW_SIZE,
+                        "a fit as big as the window leaves the glow no empty ring"
+                    );
+                }
             }
         }
     }
@@ -1882,12 +1592,11 @@ mod tests {
                 "glow tail {}px is too thin to read as a glow",
                 visible - sphere / 2.0
             );
-            // The blur costs the window space (the window is the card plus the
-            // tail), so a glow reaching too far would push the window past the one
-            // the app creates before the first render fits it.
+            // The blur costs window space (the fit is the card plus the tail),
+            // so a glow reaching too far would outgrow even the fixed window.
             assert!(
-                window_side_for(MAX_SPHERE * HOVER_SCALE, 1.0) <= WINDOW_SIZE,
-                "the glow's tail outgrows the window the app creates"
+                clip_diameter_for(MAX_SPHERE * HOVER_SCALE) <= WINDOW_SIZE,
+                "the glow's tail outgrows the fixed window"
             );
         }
         // Blur tracks the ball: the ratio is what stays constant.
@@ -1908,7 +1617,6 @@ mod tests {
         for ball in BALLS {
             for morph in MORPHS {
                 let sphere = card_side_for(ball, morph);
-                let win = window_side_for(sphere, morph);
                 let budget = text_budget_side(sphere);
                 let cap = sphere * NUM_CAP_RATIO;
                 let probe = FIT_PROBE_PX.min(cap);
@@ -1921,7 +1629,7 @@ mod tests {
                 assert!(
                     drawn_w <= budget + 0.01,
                     "{text} would be {drawn_w}px wide in a {sphere}px ball \
-                     (budget {budget}, size {size}, win={win})"
+                     (budget {budget}, size {size})"
                 );
                 // ...and the budget is inside the circle: it is the inscribed
                 // square, scaled down by TEXT_BOX_FRACTION.
@@ -2075,254 +1783,27 @@ mod tests {
         }
     }
 
-    /// **The envelope must hold the whole transition.** While a morph runs the
-    /// window is pinned to one shape instead of the frame's own geometry, so
-    /// that shape has to enclose the card at *every* progress value — the
-    /// circle end (the big one) and the square end alike, each with the room
-    /// its glow needs.
-    ///
-    /// If it did not, the pinning would clip the card mid-flight, which is the
-    /// very failure the per-frame geometry was replaced to avoid — just with the
-    /// roles swapped.
+    /// **The pinning must actually pin.** The window is fixed, so a transition
+    /// is carried *entirely* by what the render draws; the only per-frame
+    /// geometry left is the corner ratio, and it has to be a pure function of
+    /// `morph` — monotone in `t` and clamped at both ends, so no frame of a
+    /// transition can overshoot the shape.
     #[test]
-    fn the_envelope_holds_every_frame_of_the_morph() {
-        for ball in BALLS {
-            let (side, clip) = morph_envelope(ball);
-            // The pinned window must be big enough for the pinned fit.
+    fn a_morph_draws_one_shape_per_progress() {
+        let mut prev = corner_ratio_for(0.0);
+        for step in 0..=8 {
+            let t = step as f32 / 8.0;
+            let ratio = corner_ratio_for(t);
+            assert!(ratio <= prev + 1e-6, "corner ratio went backwards at {t}");
             assert!(
-                side >= clip,
-                "envelope window {side} cannot hold its own fit {clip}"
+                (SQUARE_CORNER_RATIO..=1.0).contains(&ratio),
+                "corner ratio {ratio} left the two forms' span at {t}"
             );
-            assert!(
-                clip > ball,
-                "envelope fit {clip} must enclose the card at the big end {ball}"
-            );
-            for morph in MORPHS {
-                let card = card_side_for(ball, morph);
-                assert!(
-                    clip >= clip_diameter_for(card),
-                    "envelope fit {clip} slices the card's own fit {} at \
-                     morph {morph} (ball {ball})",
-                    clip_diameter_for(card)
-                );
-            }
+            prev = ratio;
         }
-    }
-
-    /// **The pinning must actually pin.** Every frame of a transition has to ask
-    /// for the *same* window — otherwise the pinning is nominal and
-    /// `SetWindowPos` still runs per frame, which is the 20–33 ms per frame that
-    /// made the morph collapse into five frames.
-    ///
-    /// At rest the geometry must still follow `morph`, or the ball would never
-    /// reach the docked square's shape.
-    #[test]
-    fn a_morph_holds_one_window_for_its_whole_run() {
-        for ball in BALLS {
-            let animating: Vec<(f32, f32, f32)> = MORPHS
-                .iter()
-                .map(|&m| morph_geometry(ball, m, true))
-                .collect();
-            for (i, g) in animating.iter().enumerate() {
-                assert_eq!(
-                    *g, animating[0],
-                    "frame {i} of the transition moved the window: {g:?} vs {:?}",
-                    animating[0]
-                );
-            }
-            // …and the resting geometry is still per-shape.
-            for morph in MORPHS {
-                let (side, clip, corner) = morph_geometry(ball, morph, false);
-                assert_eq!(side, window_side_for(card_side_for(ball, morph), morph));
-                assert_eq!(clip, clip_diameter_for(card_side_for(ball, morph)));
-                assert_eq!(corner, corner_ratio_for(morph));
-            }
-        }
-    }
-
-    /// **The walk progress must be direction-agnostic.** Docking runs
-    /// `morph` 0 → 1 and undocking runs 1 → 0, but the walk's own progress —
-    /// "how far from the start towards the end" — must start at 0 and end
-    /// at 1 **whichever way the morph runs**: the take-off frame's card is
-    /// wherever it actually is, and the landing frame's resting centre is the
-    /// walk's end. Feeding raw `morph` in made the undock take-off draw the
-    /// card at the far end — a 102 px jump, measured in `tm-frame.log`
-    /// 2026-10-19 20:07 (`center=180.0` on a `morph=1.000` take-off whose card
-    /// sat at 78) — so the regression is pinned for both directions.
-    #[test]
-    fn the_walk_progress_is_direction_agnostic() {
-        // Docking: 0 → 1. Progress starts at 0 (the free centre) and ends at 1.
-        assert_eq!(morph_walk_progress(0.0, 1.0, 0.0), 0.0);
-        assert_eq!(morph_walk_progress(0.0, 1.0, 1.0), 1.0);
-        assert!((morph_walk_progress(0.0, 1.0, 0.5) - 0.5).abs() < 1e-6);
-        // Undocking: 1 → 0. Progress STILL starts at 0 (the docked centre —
-        // where the card physically is at take-off) and ends at 1 (the free
-        // centre — where the resting layout puts it).
-        assert_eq!(morph_walk_progress(1.0, 0.0, 1.0), 0.0);
-        assert_eq!(morph_walk_progress(1.0, 0.0, 0.0), 1.0);
-        assert!((morph_walk_progress(1.0, 0.0, 0.5) - 0.5).abs() < 1e-6);
-        // Monotone along the walk in both directions.
-        let mut prev = morph_walk_progress(1.0, 0.0, 1.0);
-        for m in [0.9_f32, 0.7, 0.4, 0.1, 0.0] {
-            let p = morph_walk_progress(1.0, 0.0, m);
-            assert!(p >= prev - 1e-6, "walk went backwards at morph {m}");
-            prev = p;
-        }
-        // A degenerate (zero-length) transition is already at its end.
-        assert_eq!(morph_walk_progress(0.5, 0.5, 0.5), 1.0);
-    }
-
-    /// **The walk must interpolate the layout centre between the two forms'
-    /// own client centres.** Both endpoints are the resting centres — the free
-    /// 360's and the docked client's — so the handoff at each end is seamless
-    /// (the landing frame's resting centre *is* the walk's target, and the
-    /// take-off frame's resting centre is the walk's start). Anything else
-    /// and the transition starts or ends with a visible jump.
-    #[test]
-    fn the_morph_walks_the_layout_centre_between_the_two_client_centres() {
-        for ball in BALLS {
-            let docked_client = window_side_for(card_side_for(ball, 1.0), 1.0);
-            let from = (WINDOW_SIZE / 2.0, WINDOW_SIZE / 2.0);
-            let to = (docked_client / 2.0, docked_client / 2.0);
-            // The walk is indexed by its own progress, not by `morph`.
-            let start = morph_center(from, to, morph_walk_progress(0.0, 1.0, 0.0));
-            let end = morph_center(from, to, morph_walk_progress(0.0, 1.0, 1.0));
-            assert!((start.0 - from.0).abs() < 1e-4);
-            assert!((start.1 - from.1).abs() < 1e-4);
-            assert!((end.0 - to.0).abs() < 1e-4);
-            assert!((end.1 - to.1).abs() < 1e-4);
-            // The undock walk mirrors exactly — with its endpoints swapped:
-            // the docked centre is the undock walk's *start*, the free centre
-            // its *end* (the normalised progress makes the direction
-            // irrelevant to the handoffs).
-            let ustart = morph_center(to, from, morph_walk_progress(1.0, 0.0, 1.0));
-            let uend = morph_center(to, from, morph_walk_progress(1.0, 0.0, 0.0));
-            assert!(
-                (ustart.0 - to.0).abs() < 1e-4,
-                "undock take-off must start at the docked centre"
-            );
-            assert!(
-                (uend.0 - from.0).abs() < 1e-4,
-                "undock landing must end at the free centre"
-            );
-            for m in [0.25_f32, 0.5, 0.75] {
-                let c = morph_center(from, to, m);
-                assert!(c.0 > to.0 && c.0 < from.0, "walk left the span at {m}");
-                assert!(
-                    (c.0 - c.1).abs() < 1e-4,
-                    "the walk must stay on the diagonal"
-                );
-            }
-        }
-    }
-
-    /// **Every frame of the walk keeps the card inside the envelope client.**
-    /// The envelope window is the only thing holding the pixels while the
-    /// transition runs — so the walked card, glow included, has to stay inside
-    /// the 360 client at every progress value, both hover states and every ball.
-    #[test]
-    fn every_walked_frame_keeps_the_card_inside_the_envelope_client() {
-        let steps = [0.0_f32, 0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95, 0.99, 1.0];
-        for ball in BALLS {
-            for hovered in [false, true] {
-                let sphere = ball * if hovered { HOVER_SCALE } else { 1.0 };
-                let docked_client = window_side_for(card_side_for(sphere, 1.0), 1.0);
-                let from = (WINDOW_SIZE / 2.0, WINDOW_SIZE / 2.0);
-                let to = (docked_client / 2.0, docked_client / 2.0);
-                for m in steps {
-                    let card = card_side_for(sphere, m);
-                    let glow = glow_visible_radius(card);
-                    let c = morph_center(from, to, m);
-                    assert!(
-                        c.0 - glow >= -0.5 && c.0 + glow <= WINDOW_SIZE + 0.5,
-                        "walked card leaves the envelope client on x \
-                         (ball {ball}, hovered {hovered}, morph {m}): \
-                         centre {:.1}, glow {glow:.1}",
-                        c.0
-                    );
-                    assert!(
-                        c.1 - glow >= -0.5 && c.1 + glow <= WINDOW_SIZE + 0.5,
-                        "walked card leaves the envelope client on y \
-                         (ball {ball}, hovered {hovered}, morph {m}): \
-                         centre {:.1}, glow {glow:.1}",
-                        c.1
-                    );
-                }
-            }
-        }
-    }
-
-    /// **The shard regression, executable form.** The landing shrink keeps the
-    /// window origin still and the surface content travels with the origin, so
-    /// the previous frame's pixels keep their window coordinates. The walk has
-    /// put them at the target client's own centre — so the strictest
-    /// intermediate state of the landing (client already shrunk, content still
-    /// the previous frame) holds the card whole and dead centre.
-    ///
-    /// This is exactly the state the 2026-10-19 forensics caught being sampled
-    /// as a quarter-arc shard: the anchored move used to shift the origin by
-    /// the card's half-change, which cannot move the old pixels *inside* the
-    /// new client (they follow the origin, staying at the old 360-layout
-    /// centre in window coordinates) — the old card sat at (188, 211) inside a
-    /// 154 client, and the compositor showed a 23×23 corner slice of it for
-    /// the ~31 ms between the landing `SetWindowPos` pair and the repaint.
-    #[test]
-    fn the_settle_shrink_leaves_the_walked_card_inside_the_new_client() {
-        for ball in BALLS {
-            for hovered in [false, true] {
-                let sphere = ball * if hovered { HOVER_SCALE } else { 1.0 };
-                let card = card_side_for(sphere, 1.0);
-                let client = window_side_for(card, 1.0);
-                let glow = glow_visible_radius(card);
-                // The previous frame's card at the walk's end — the new
-                // client's own centre. Window and client coordinates differ
-                // by the client's constant offset inside the window, which
-                // cancels in a containment check.
-                let c = (client / 2.0, client / 2.0);
-                // The shrunken client rect holds the card, glow included.
-                assert!(
-                    c.0 - glow >= -0.5 && c.0 + glow <= client + 0.5,
-                    "the walked card sticks out of the landed client \
-                     (ball {ball}, hovered {hovered}): centre {:.1}, glow {glow:.1}, \
-                     client {client:.1}",
-                    c.0
-                );
-                assert!(
-                    c.1 - glow >= -0.5 && c.1 + glow <= client + 0.5,
-                    "the walked card sticks out of the landed client vertically
-                     (ball {ball}, hovered {hovered})"
-                );
-            }
-        }
-    }
-
-    /// **The take-off grow keeps the docked card inside the envelope.** The
-    /// origin does not move on the take-off either (the plain resize), so the
-    /// old frame's pixels stay at their window coordinates — the docked card
-    /// at the docked client's centre — and the 360 envelope client swallows
-    /// them whole. The growing direction is safe wherever the old card sits;
-    /// this pins it anyway because the walk starts from exactly that centre.
-    #[test]
-    fn the_undock_takeoff_keeps_the_docked_card_inside_the_envelope() {
-        for ball in BALLS {
-            for hovered in [false, true] {
-                let sphere = ball * if hovered { HOVER_SCALE } else { 1.0 };
-                let card = card_side_for(sphere, 1.0);
-                let docked_client = window_side_for(card, 1.0);
-                let glow = glow_visible_radius(card);
-                let c = (docked_client / 2.0, docked_client / 2.0);
-                assert!(
-                    c.0 - glow >= -0.5 && c.0 + glow <= WINDOW_SIZE + 0.5,
-                    "the docked card leaves the envelope client on x \
-                     (ball {ball}, hovered {hovered})"
-                );
-                assert!(
-                    c.1 - glow >= -0.5 && c.1 + glow <= WINDOW_SIZE + 0.5,
-                    "the docked card leaves the envelope client on y \
-                     (ball {ball}, hovered {hovered})"
-                );
-            }
-        }
+        // Clamped beyond both ends.
+        assert_eq!(corner_ratio_for(-0.5), corner_ratio_for(0.0));
+        assert_eq!(corner_ratio_for(1.5), corner_ratio_for(1.0));
     }
 
     /// **The re-snap must land the card that actually exists on the gap.** The
@@ -2342,8 +1823,9 @@ mod tests {
         const WORK_RIGHT: f32 = 1366.0;
         for ball in BALLS {
             let card = card_side_for(ball, 1.0);
-            let want = window_side_for(card, 1.0);
-            // The fraction the landing frame publishes (render: card / client).
+            // The window is fixed, so the fraction the landing frame publishes
+            // is the settled card over the fixed [`WINDOW_SIZE`].
+            let want = WINDOW_SIZE;
             let frac = card / want;
             let snapped = want * frac;
             assert!(
@@ -2498,7 +1980,7 @@ mod tests {
                     let t = step as f32 / 4.0;
                     let ratio = corner_ratio_for(t);
                     let card = card_side_for(ball, t);
-                    let win = window_side_for(card, t);
+                    let win = WINDOW_SIZE;
                     let needed = rounded_reach(card, ratio) + GLOW_TAIL_SIGMA * glow_blur(card);
                     let available = rounded_reach(win, ratio);
                     assert!(

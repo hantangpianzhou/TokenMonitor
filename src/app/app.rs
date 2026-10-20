@@ -935,9 +935,9 @@ impl Render for TokenMonitorApp {
 }
 
 /// Edge length the floating window is **opened** at (px), matching `WINDOW_SIZE`
-/// in `ui::floating`. Only the creation size: the view resizes the window to fit
-/// the ball on its first render (`platform::fit_floating_card_window`), so this
-/// only has to be big enough to hold the largest ball a first frame can draw.
+/// in `ui::floating`. It is also the size the window *stays* at for its whole
+/// life: the view never resizes it — every form the ball takes is drawn inside
+/// this one fixed rectangle (see the module note in `ui::floating`).
 const FLOAT_WIN: f32 = 360.0;
 
 /// Shared so the floating ball can persist its visibility preference on close
