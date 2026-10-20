@@ -1011,3 +1011,17 @@ hwnd=0x1506e4 Zed::Window rect=(125,21,1241,748) rgn_hr=0  rgn=(0,0,0,0)   ← �
 **验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **207 passed**。
 
 > AI生成
+
+### 9.32 第十九次：两连发带切换被 DWM 合并——改为交替式（状态驱动）切换（2026-10-20 13:2x 取证）
+
+**现象**：§9.31 构建下症状回归为最初的 ¼ 扇形，「点击**区域外**就还原」。
+
+**像素级实证**（残片在屏时双路抓取）：`PrintWindow(PW_RENDERFULLCONTENT)`（窗口自身合成内容）= **完整居中的球**；窗口样式 `topmost=True, layered=False, noredir=False, rgn_hr=0`（区域确已退役，gpui 走 DComp 呈现）。「区域外点击」是 `HTTRANSPARENT` **穿透**——球窗口收不到任何消息却复原了，**复原机制 100% 在 DWM 侧**，与应用状态无关（最终实锤）。
+
+**§9.31 的实现漏洞**：topmost 带切换的两发 `SetWindowPos`（先 `NOTOPMOST` 后 `TOPMOST`）**背靠背、中间无消息泵**——DWM 把这一对合并成净零变化，视觉从未被真正卸下重挂，等于没切。
+
+**修法（交替式切换）**：`nudge_dwm_recomposition` 改为状态驱动——每拍 `GetWindowLongW(GWL_EXSTYLE)` 读实际样式，向**另一侧**带移动一步（TOPMOST→NOTOPMOST，下一拍再回来）。每拍都是一次真实的 z 序移动，完整的降→升循环每两拍（1.6 s）完成，两半之间隔着整个消息泵，DWM 无法合并。拖拽中仍跳过。
+
+**验证**：`cargo fmt --check` 干净；`cargo check --all-targets` 零告警；`cargo test --lib` **207 passed**。
+
+> AI生成

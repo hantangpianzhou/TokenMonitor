@@ -45,6 +45,9 @@ unsafe extern "system" {
     fn ClientToScreen(hwnd: isize, lppoint: *mut Point) -> i32;
     fn GetDpiForWindow(hwnd: isize) -> u32;
     fn GetTickCount() -> u32;
+    /// Reads a window's style words — used for `GWL_EXSTYLE` to see which band
+    /// (`TOPMOST`/`NOTOPMOST`) the window currently sits in.
+    fn GetWindowLongW(hwnd: isize, n_index: c_int) -> c_int;
     /// Marks the whole client rect invalid so the next frame's present cannot
     /// be reduced to a damage sub-rect (see [`invalidate_whole_window`]).
     fn InvalidateRect(hwnd: isize, lprect: *const Rect, berase: i32) -> i32;
@@ -60,6 +63,10 @@ struct Rect {
 
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOSIZE: u32 = 0x0001;
+/// `GetWindowLongW` index of the extended style word.
+const GWL_EXSTYLE: c_int = -20;
+/// Extended-style bit marking a window as living in the topmost band.
+const WS_EX_TOPMOST: c_int = 0x0008;
 /// `SetWindowPos` flag that reruns the frame path — the nudge that makes DWM
 /// recomposite a window whose composition queue it has dropped (see
 /// [`nudge_dwm_recomposition`]).
@@ -899,25 +906,29 @@ fn is_ball_dragging() -> bool {
         .clone()
 }
 
-/// Force DWM to re-attach the window's visual: a **topmost band switch**
-/// (`NOTOPMOST → TOPMOST`) wrapped around the frame-path nudge.
+/// Force DWM to re-attach the window's visual: an **alternating topmost band
+/// switch**, driven by the window's actual style.
 ///
 /// Why this exists: a frame the app draws and presents is not necessarily a
 /// frame the compositor shows. A background, always-on-top, transparent window
 /// (this ball) can have its DirectComposition visual dropped from DWM's
 /// recomposition queue — the frame log then shows correct content presented
 /// every heartbeat while the screen keeps the old pixels, until some
-/// activation change (a click anywhere) shames the compositor into catching
-/// up.
+/// activation change (a click anywhere — *including a click that passes
+/// through the ball's window and never reaches the app*, which is how the user
+/// found the "click outside to heal" workaround) shames the compositor into
+/// catching up. The heal is 100% compositor-side.
 ///
-/// The weaker nudges are proven insufficient on exactly this window: the
-/// frame-path nudge (`SWP_FRAMECHANGED`, zero `SetWindowPos`) fired every
-/// heartbeat for the whole session of 2026-10-20 11:18 — 251 pairs of
-/// `WM_WINDOWPOSCHANGING/CHANGED` in the log, 206 unbroken heartbeat frames —
-/// and the screen still kept the stale pixels until a real click. What a
-/// click does that a frame-path nudge does not is **move the window between
-/// z-bands**, which forces DWM to unhook the visual from the composition tree
-/// and re-hook it — rebuilding exactly the queue entry that was dropped.
+/// What actually un-drops the visual is **moving the window between z-bands**:
+/// DWM must unhook the visual from the composition tree and re-hook it. The
+/// 2026-10-20 13:2x build fired the two `SetWindowPos` calls (demote, promote)
+/// back-to-back with no message pump in between — DWM coalesced the pair into
+/// a net-zero change and never rebuilt the visual, which is why that attempt
+/// still froze. This version alternates: read the window's actual ex-style,
+/// and step it **towards the other band** (`TOPMOST` → `NOTOPMOST`, then back
+/// on the next beat). Every beat therefore moves the visual for real, and a
+/// full demote→promote cycle completes every two heartbeats (1.6 s) with a
+/// whole message pump between the halves.
 ///
 /// **Safe at rest, dangerous mid-transition.** With the region retired the
 /// window is at every instant a plain transparent rectangle — there is no
@@ -931,21 +942,14 @@ pub fn nudge_dwm_recomposition(hwnd: isize) {
         return;
     }
     unsafe {
-        // 1) Demote out of the topmost band, 2) let the frame path rerun,
-        // 3) promote back. Two `SetWindowPos` calls, neither moving nor
-        // sizing nor activating; between them DWM must re-place the visual.
+        let topmost = GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST != 0;
         SetWindowPos(
             hwnd,
-            HWND_NOTOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
+            if topmost {
+                HWND_NOTOPMOST
+            } else {
+                HWND_TOPMOST
+            },
             0,
             0,
             0,
