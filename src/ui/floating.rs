@@ -171,7 +171,15 @@ use crate::platform::{
 /// fixed rectangle, so the surface DWM has to recomposite never changes size —
 /// the resize-driven shard/freeze class of failure has no substrate left (see
 /// the module note on the fixed window).
-const WINDOW_SIZE: f32 = 360.0;
+///
+/// The value is the smallest round number that always clears the card's fit:
+/// hover-popped max ball 175 × 1.06 = 185.5 px, plus twice the glow's visible
+/// tail (2σ ≈ 31.5 px) and twice the 12 px empty ring ≈ 272.6 px — 280 keeps
+/// ~7 px of slack, the same headroom the old 360 kept for the retired 232 px
+/// ball (the blank ring the user saw around the widget was that stale surplus).
+/// Growing the ball past this bound must re-derive the constant — the
+/// invariant tests pin the bound and fail first.
+const WINDOW_SIZE: f32 = 280.0;
 /// **Solid-ball** diameter at zero usage (px). Deliberately an explicit
 /// minimum: the resting ball keeps a legible, unmistakably-round silhouette
 /// instead of shrinking until the halo and the overlay text dominate it.

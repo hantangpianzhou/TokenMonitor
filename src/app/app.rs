@@ -935,10 +935,11 @@ impl Render for TokenMonitorApp {
 }
 
 /// Edge length the floating window is **opened** at (px), matching `WINDOW_SIZE`
-/// in `ui::floating`. It is also the size the window *stays* at for its whole
+/// in `ui::floating` (280 — the derivation of that bound lives on the
+/// `WINDOW_SIZE` doc). It is also the size the window *stays* at for its whole
 /// life: the view never resizes it — every form the ball takes is drawn inside
 /// this one fixed rectangle (see the module note in `ui::floating`).
-const FLOAT_WIN: f32 = 360.0;
+const FLOAT_WIN: f32 = 280.0;
 
 /// Shared so the floating ball can persist its visibility preference on close
 /// without holding its own `Collector` reference.
