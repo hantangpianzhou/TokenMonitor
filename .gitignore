@@ -13,6 +13,13 @@ Thumbs.db
 *.sqlite3
 
 /dist/
+/dist-release/
+/.temp/
+__pycache__/
+doc/prototype-turing-screen/build/
+doc/prototype-turing-screen/dist/
+*.rgb565
+/TokenMonitor-v*-windows-x64.wxs
 memmap_floor.txt
 
 .claude
