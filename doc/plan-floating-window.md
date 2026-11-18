@@ -112,6 +112,27 @@ pub fn is_floating_visible() / set_floating_visible(v) / send_tray_command(cmd)
 
 `WM_COMMAND` 分发：`TOGGLE_WINDOW → toggle_main_window()`（纯 Win32）；`FLOATING → send_tray_command(Floating)`；`EXIT → quit_app()`。
 
+### 4.1 悬浮球右键 = 托盘同款菜单（2026-10-21 新增）
+
+> 状态：**已实现，待用户目测验证**。右键悬浮球弹出与托盘图标**完全一致**的三项菜单（动态标签同步）。
+
+球的 Win32 子类（`ball_drag_subclass`，`src/platform/windows/mod.rs`）补三组消息：
+
+| 消息 | 处理 | 为什么 |
+|---|---|---|
+| `WM_NCRBUTTONDOWN` / `WM_RBUTTONDOWN` | 吞掉（`return 0`） | `WM_NCHITTEST` 在球上答 `HTCAPTION`，右键走非客户区路径；不吞的话 `DefWindowProc` 会在 caption 右键时弹**系统菜单**（还原/移动/关闭…），对这个无边框 popup 是一堆无效项加一个能用的"关闭" |
+| `WM_NCRBUTTONUP` / `WM_RBUTTONUP` / `WM_CONTEXTMENU` | `tray::show_ball_context_menu(hwnd)`，吞掉 | `WM_CONTEXTMENU` 兜住键盘路径（Shift+F10 / 菜单键） |
+| `WM_COMMAND` | `tray::handle_ball_menu_command(wparam)`，命中才吞 | 菜单选择的回执；非本菜单 ID 原样交还 GPUI |
+
+`tray.rs` 侧三个新部件：
+
+- `append_context_items(menu)` —— 菜单构建从 `show_context_menu` 提出来共享，**托盘与球两处菜单永不漂移**（同 items、同 id、同动态标签）；
+- `show_ball_context_menu(ball_hwnd)` —— **owner 用球自己的 hwnd**（不是主窗口）：主窗口此时往往隐藏着，而 `TrackPopupMenu` 需要 owner 在前台才能"点击外部关闭"，隐藏 owner 会让菜单关不掉。因此先 `SetForegroundWindow(ball)`，结束后 `PostMessageW(ball, WM_NULL)`（托盘路径靠 shell 处理点击时送前台，球路径必须自己保证）。**菜单显示期间还必须把球降出置顶带**（`set_always_on_top(ball,false)` → track → 恢复 `true`）：菜单窗口本身**不是 topmost**，而球是 `HWND_TOPMOST`，否则菜单开在自己 owner 的背后——球把菜单项挡住（topmost owner 弹菜单的经典坑，2026-10-21 首验抓到）；`TrackPopupMenu` 是模态循环，"菜单关闭后恢复"时点明确，`set_always_on_top` 只动 z 序（`SWP_NOMOVE|SWP_NOSIZE`）；
+- **菜单期间必须同时挂起心跳的 z-band 摆动**（`BALL_MENU_TRACKING` 标志，第二验抓到的真闪烁源）：球的 800ms 呈现心跳每拍都会调 `nudge_dwm_recomposition`，而这个 nudge 的机制**就是**把球在 TOPMOST↔NOTOPMOST 两个 z-band 之间来回切（治 DWM visual 丢失，平时球后面是桌面看不出来）。菜单打开后：降级 → 菜单可见；800ms 后 nudge 把球**顶回 TOPMOST 盖住菜单**（"一下遮挡"）；再 800ms nudge 又切回 NOTOPMOST（"一下不遮挡"）——**每 1.6s 一个来回，正是"像是在刷新"的节奏**。与拖动期间的跳过（`is_ball_dragging`）完全同构：z-band 切换会与正在安排窗口 z 序的另一方打架。标志**先于降级置位**（防 beat 落在间隙）、恢复置顶后才清零。`nudge_dwm_recomposition` 的守卫从 `is_ball_dragging()` 扩为 `|| is_ball_menu_tracking()`；
+- `handle_ball_menu_command(wparam) -> bool` —— 选择动作与托盘逐项一致：`ToggleMain → toggle_main_window()`（纯 Win32）、`ToggleFloating → send_tray_command(Floating)`、`Quit → quit_app()`。id → 动作的映射是纯函数 `ball_menu_command(id) → Option<BallMenuAction>`，单测锁住"恰好覆盖三个托盘 ID、其余返回 None"（`ball_menu_maps_only_the_tray_item_ids`），GPUI 自己的 `WM_COMMAND` 流量不被劫持。
+
+命令路由零新增：`Floating` 沿用既有 tray channel，`Quit` 沿用 `quit_app()`，主窗显隐沿用纯 Win32。左键三件套（拖动 / 双击开主窗 / 刷新按钮点击）不受影响——右键走独立消息组，无交集。
+
 ---
 
 ## 5. App 侧接线（src/app/mod.rs + src/app/app.rs）
@@ -163,6 +184,7 @@ cargo test                   # 通过
 - [x] 主窗口隐藏/显示不影响悬浮窗；反之亦然。
 - [x] 偏好持久化：重启后悬浮窗显隐状态一致。
 - [x] `cargo check --no-default-features --features tui` 通过（TUI 不被殃及）。
+- [ ] **悬浮球右键**：弹出与托盘一致的三项菜单（动态标签正确）；点击菜单外任意处可关闭；三项功能与托盘逐项一致（含从球上选"隐藏悬浮窗"后球消失、托盘可再开）；左键拖动 / 双击开主窗 / 刷新点击不受影响（见 §4.1）。
 
 ---
 

@@ -28,6 +28,7 @@ use std::sync::OnceLock;
 use async_channel::Sender;
 
 // Win32 message / constant values.
+const WM_NULL: u32 = 0x0000;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DESTROY: u32 = 0x0002;
 const WM_COMMAND: u32 = 0x0111;
@@ -76,6 +77,35 @@ pub enum TrayCommand {
     /// Where the ball was dropped: `Some(edge)` if it landed against a screen
     /// edge (docked, square form), `None` if it landed free (circle form).
     Dock(Option<super::DockEdge>),
+}
+
+/// The action behind one item of the ball's right-click menu. The pure half
+/// of [`handle_ball_menu_command`]: keeping the id → action mapping a
+/// plain function makes it testable without any Win32 window, while the
+/// action itself still runs the very same code the tray's own menu does —
+/// that is the whole point of the ball carrying the tray's menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BallMenuAction {
+    /// 显示/隐藏主窗口 — pure Win32, same as the tray's item.
+    ToggleMain,
+    /// 显示/隐藏悬浮窗 — crosses into GPUI as `TrayCommand::Floating`.
+    ToggleFloating,
+    /// 退出 — whole-process teardown via [`quit_app`].
+    Quit,
+}
+
+/// Map a context-menu selection id (the low word of `WM_COMMAND`'s wparam)
+/// to the action it means. `None` for anything that is not one of ours, so
+/// the ball's subclass can forward foreign `WM_COMMAND` traffic to GPUI
+/// untouched — the ball's window belongs to GPUI too, and its messages must
+/// keep flowing.
+pub(crate) fn ball_menu_command(id: usize) -> Option<BallMenuAction> {
+    match id {
+        TRAY_CMD_TOGGLE_WINDOW => Some(BallMenuAction::ToggleMain),
+        TRAY_CMD_FLOATING => Some(BallMenuAction::ToggleFloating),
+        TRAY_CMD_EXIT => Some(BallMenuAction::Quit),
+        _ => None,
+    }
 }
 
 #[link(name = "shell32")]
@@ -356,14 +386,12 @@ unsafe fn toggle_main_window() {
     }
 }
 
-unsafe fn show_context_menu() {
-    let Some(&hwnd) = MAIN_HWND.get() else {
-        return;
-    };
-    let menu = CreatePopupMenu();
-    if menu == 0 {
-        return;
-    }
+/// Append the tray's three context-menu items to `menu`, with labels that
+/// reflect each window's current visibility. Shared by the tray's own
+/// [`show_context_menu`] and the ball's [`show_ball_context_menu`] so the
+/// two menus can never drift apart — same items, same ids, same dynamic
+/// labels.
+unsafe fn append_context_items(menu: isize) {
     // Dynamic labels reflect current visibility state.
     let main_visible = MAIN_HWND
         .get()
@@ -384,6 +412,17 @@ unsafe fn show_context_menu() {
     AppendMenuW(menu, MF_STRING, TRAY_CMD_TOGGLE_WINDOW, main_label.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_CMD_FLOATING, floating_label.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_CMD_EXIT, exit.as_ptr());
+}
+
+unsafe fn show_context_menu() {
+    let Some(&hwnd) = MAIN_HWND.get() else {
+        return;
+    };
+    let menu = CreatePopupMenu();
+    if menu == 0 {
+        return;
+    }
+    append_context_items(menu);
     let mut point = Point { x: 0, y: 0 };
     GetCursorPos(&mut point);
     TrackPopupMenu(
@@ -396,6 +435,97 @@ unsafe fn show_context_menu() {
         std::ptr::null_mut(),
     );
     DestroyMenu(menu);
+}
+
+/// Show the same context menu the tray shows, from a right-click on the
+/// floating ball. Called by the ball's Win32 subclass
+/// (`ball_drag_subclass`), which owns the ball's whole pointer interaction.
+///
+/// Two things differ from the tray's [`show_context_menu`], both forced by
+/// the owner being the ball rather than the main window:
+///
+/// * **The menu's owner is the ball's own hwnd.** A selection therefore
+///   arrives as `WM_COMMAND` on the ball's subclass, which routes it through
+///   [`handle_ball_menu_command`]. Owning the menu on the main window would
+///   have saved that branch, but the main window is frequently *hidden* while
+///   the ball is up, and `TrackPopupMenu` needs a foreground owner to
+///   dismiss on an outside click — a hidden owner leaves a menu the user
+///   cannot click away.
+/// * **The ball is foregrounded before tracking and sent `WM_NULL` after.**
+///   That pair is the documented way to keep a context menu from a
+///   non-foreground window dismissable (the tray gets the first half for
+///   free from the shell's own click handling).
+pub(crate) unsafe fn show_ball_context_menu(ball_hwnd: isize) {
+    if ball_hwnd == 0 {
+        return;
+    }
+    let menu = CreatePopupMenu();
+    if menu == 0 {
+        return;
+    }
+    append_context_items(menu);
+    let mut point = Point { x: 0, y: 0 };
+    GetCursorPos(&mut point);
+    SetForegroundWindow(ball_hwnd);
+    // **The ball comes off TOPMOST for the menu's duration.**
+    // `TrackPopupMenu`'s menu window is *not* topmost, and the ball is
+    // (`HWND_TOPMOST`, pinned at creation), so the menu otherwise opens
+    // *behind its own owner*: the ball occluded the items under it. The
+    // classic fix for a topmost owner is to drop it to the normal band for
+    // the track and restore it after; the menu's modal loop makes "after"
+    // one well-defined point, and `set_always_on_top` is `SWP_NOMOVE |
+    // SWP_NOSIZE`, so nothing but the z-order changes.
+    //
+    // **And the heartbeat's z-band nudge is suspended for the same window.**
+    // The ball's 800 ms presentation heartbeat calls
+    // `nudge_dwm_recomposition` on every beat, whose very mechanism is
+    // flipping the ball between the TOPMOST and NOTOPMOST bands — invisible
+    // against the desktop at rest, but with the menu open a beat *promoted
+    // the ball on top of the menu* and the next beat demoted it back: the
+    // occlusion flapped every 800 ms, "一下遮挡一下不遮挡像是在刷新"
+    // (2026-10-21). The flag is raised **before** the demote so no beat can
+    // land in between, and lowered only after the promote has put the ball
+    // back where the heartbeat expects it.
+    super::set_ball_menu_tracking(true);
+    super::set_always_on_top(ball_hwnd, false);
+    TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON,
+        point.x,
+        point.y,
+        0,
+        ball_hwnd,
+        std::ptr::null_mut(),
+    );
+    DestroyMenu(menu);
+    super::set_always_on_top(ball_hwnd, true);
+    super::set_ball_menu_tracking(false);
+    PostMessageW(ball_hwnd, WM_NULL, 0, 0);
+}
+
+/// Route a selection from the ball's context menu: the `WM_COMMAND` its
+/// owner (the ball) receives after `TrackPopupMenu` returns. Returns whether
+/// the id was one of ours; the ball's subclass forwards anything else to
+/// GPUI untouched.
+///
+/// Each action runs the same code the tray's own menu runs, by design: the
+/// ball's menu is the tray's menu, just opened from a different window.
+pub(crate) unsafe fn handle_ball_menu_command(wparam: usize) -> bool {
+    match ball_menu_command(wparam & 0xFFFF) {
+        Some(BallMenuAction::ToggleMain) => {
+            toggle_main_window();
+            true
+        }
+        Some(BallMenuAction::ToggleFloating) => {
+            send_tray_command(TrayCommand::Floating);
+            true
+        }
+        Some(BallMenuAction::Quit) => {
+            quit_app();
+            true
+        }
+        None => false,
+    }
 }
 
 unsafe fn quit_app() {
@@ -503,6 +633,29 @@ mod tests {
     #[test]
     fn forwarding_reports_failure_when_there_is_no_sender() {
         assert!(!forward_command(None, TrayCommand::Quit));
+    }
+
+    /// The ball's right-click menu reuses the tray's item ids, so the mapping
+    /// from a `WM_COMMAND` low word to an action has to cover exactly those
+    /// three and nothing else — a stray id must fall through to GPUI
+    /// untouched, and no two items may share an id or one would shadow
+    /// another.
+    #[test]
+    fn ball_menu_maps_only_the_tray_item_ids() {
+        assert_eq!(
+            ball_menu_command(TRAY_CMD_TOGGLE_WINDOW),
+            Some(BallMenuAction::ToggleMain)
+        );
+        assert_eq!(
+            ball_menu_command(TRAY_CMD_FLOATING),
+            Some(BallMenuAction::ToggleFloating)
+        );
+        assert_eq!(ball_menu_command(TRAY_CMD_EXIT), Some(BallMenuAction::Quit));
+        assert_eq!(ball_menu_command(0), None);
+        assert_eq!(ball_menu_command(0xFFFF), None);
+        assert_ne!(TRAY_CMD_TOGGLE_WINDOW, TRAY_CMD_FLOATING);
+        assert_ne!(TRAY_CMD_TOGGLE_WINDOW, TRAY_CMD_EXIT);
+        assert_ne!(TRAY_CMD_FLOATING, TRAY_CMD_EXIT);
     }
 
     /// A sender whose receiver is gone (the app already shut down) is reported

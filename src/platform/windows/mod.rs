@@ -1,5 +1,6 @@
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -274,6 +275,17 @@ const WM_NCMOUSEMOVE: u32 = 0x00A0;
 // `CS_DBLCLKS`; otherwise we detect the double-click by timing two presses).
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
 const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
+// Right-button messages. `WM_NCHITTEST` answers `HTCAPTION` on the ball, so a
+// right press arrives on the *non-client* forms (`WM_NCRBUTTONDOWN`/`UP`); the
+// client forms and `WM_CONTEXTMENU` (the keyboard path — Shift+F10 / the menu
+// key — which skips the button messages entirely) cover every other route a
+// context menu can take.
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_NCRBUTTONDOWN: u32 = 0x00A4;
+const WM_NCRBUTTONUP: u32 = 0x00A5;
+const WM_CONTEXTMENU: u32 = 0x007B;
+const WM_COMMAND: u32 = 0x0111;
 /// `HTCAPTION` (2): the hit-test answer that makes the OS treat a press as a
 /// non-client caption press, delivering `WM_NCLBUTTONDOWN`.
 const HTCAPTION: isize = 2;
@@ -539,6 +551,32 @@ unsafe extern "system" fn ball_drag_subclass(
             crate::platform::windows::tray::show_main_window();
             return 0;
         }
+        // ── Right-click: the ball carries the tray's context menu ──────────
+        //
+        // The press is swallowed before `DefWindowProc` sees it: a caption
+        // right-click is exactly what makes `DefWindowProc` open the *system*
+        // menu (还原/移动/关闭…), and on this frameless popup that menu is a
+        // pile of no-ops plus a working 关闭 — not what a right-click should
+        // do here. The release shows the tray's menu instead
+        // (`show_ball_context_menu`): the same three items, the same dynamic
+        // labels, the same command routing as the tray icon's own menu, so the
+        // ball and the tray offer one menu from two places.
+        WM_NCRBUTTONDOWN | WM_RBUTTONDOWN => {
+            return 0;
+        }
+        WM_NCRBUTTONUP | WM_RBUTTONUP | WM_CONTEXTMENU => {
+            crate::platform::windows::tray::show_ball_context_menu(hwnd);
+            return 0;
+        }
+        WM_COMMAND => {
+            // A selection from the ball's own context menu arrives here, the
+            // menu's owner being the ball (see `show_ball_context_menu`).
+            // Ours are handled; any other WM_COMMAND traffic — GPUI's — keeps
+            // flowing through `DefSubclassProc` below.
+            if crate::platform::windows::tray::handle_ball_menu_command(wparam) {
+                return 0;
+            }
+        }
         _ => {}
     }
     // Chain to GPUI (and any other subclass) through `DefSubclassProc`. This is
@@ -566,9 +604,10 @@ unsafe extern "system" fn ball_drag_subclass(
 /// `logical_side` is the client side the app opened the window for
 /// (`FLOAT_WIN`): with the frame gone the window rect **is** the client rect,
 /// so the one `SetWindowPos` here also shrinks the window from the
-/// chrome-inflated rect (360 + frame = 376×399 device px) down to the intended
-/// square. This runs once, at creation, before the first frame — it is not the
-/// per-frame resize machinery that §9.33 retired.
+/// chrome-inflated rect (the `PopUp` chrome pads `logical_side` with a caption
+/// strip + thickframe) down to the intended square. This runs once, at
+/// creation, before the first frame — it is not the per-frame resize machinery
+/// that §9.33 retired.
 pub fn make_frameless(hwnd: isize, logical_side: f32) {
     if hwnd == 0 || !(logical_side > 0.0) {
         return;
@@ -965,6 +1004,28 @@ fn is_ball_dragging() -> bool {
         .clone()
 }
 
+/// Whether the ball's context menu is currently tracking — the modal
+/// `TrackPopupMenu` loop in `tray::show_ball_context_menu` is running. Read by
+/// the heartbeat's recomposition nudge, which must not flip the ball's
+/// z-band while the menu is open: the menu's duration deliberately demotes
+/// the ball below the menu window (menus are not topmost, so a topmost owner
+/// occludes its own menu), and a nudge mid-menu promotes the ball right back
+/// on top of it — then the next beat demotes it again, and the occlusion
+/// flapped every 800 ms — "一下遮挡一下不遮挡像是在刷新" (2026-10-21). Same
+/// shape as the drag's skip below: the band switch fights whoever else is
+/// arranging the window's z-order.
+static BALL_MENU_TRACKING: AtomicBool = AtomicBool::new(false);
+
+/// Mark the ball's context menu as opened / closed (see [`BALL_MENU_TRACKING`]).
+/// Set by `tray::show_ball_context_menu` around its modal `TrackPopupMenu`.
+pub(crate) fn set_ball_menu_tracking(tracking: bool) {
+    BALL_MENU_TRACKING.store(tracking, Relaxed);
+}
+
+fn is_ball_menu_tracking() -> bool {
+    BALL_MENU_TRACKING.load(Relaxed)
+}
+
 /// Force DWM to re-attach the window's visual: an **alternating topmost band
 /// switch**, driven by the window's actual style.
 ///
@@ -994,10 +1055,13 @@ fn is_ball_dragging() -> bool {
 /// bracket, no transient open-region-over-black-backbuffer state for the
 /// recomposition to sample (that is exactly how an earlier mid-render nudge
 /// froze a black window onto the screen, 2026-10-20, see plan §9.28). Skipped
-/// while a drag is in flight: the band switch jiggles z-order and would fight
-/// the drag's own `SetWindowPos`es.
+/// while a drag is in flight — the band switch jiggles z-order and would
+/// fight the drag's own `SetWindowPos`es — and while the ball's context menu
+/// is tracking, where the ball is deliberately held **below** the menu and a
+/// beat would promote it on top of the menu and back again every 800 ms
+/// (see [`BALL_MENU_TRACKING`]).
 pub fn nudge_dwm_recomposition(hwnd: isize) {
-    if hwnd == 0 || is_ball_dragging() {
+    if hwnd == 0 || is_ball_dragging() || is_ball_menu_tracking() {
         return;
     }
     unsafe {
