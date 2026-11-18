@@ -81,6 +81,16 @@ pub struct TokenMonitorApp {
     pub theme_color: ThemeColor,
     /// Whether the app is registered to launch at login (OS auto-start).
     pub autostart_enabled: bool,
+    /// Whether to push token usage to the Turing 3.5" screen after each scan.
+    pub screen_push_enabled: bool,
+    /// Owns the short-lived screen-push child process (spawned on scan complete).
+    screen_push: crate::app::screen_push::ScreenPush,
+    /// Owns the short-lived Trae auto-ingest child process (spawned on scan
+    /// complete; writes Trae local-DB usage into our SQLite).
+    trae_ingest: crate::app::trae_ingest::TraeIngest,
+    /// Receives "ingest finished" pings so the view can refresh without waiting
+    /// for the next 5-minute scan (the same-cycle refresh may precede the write).
+    trae_done_rx: async_channel::Receiver<bool>,
     /// Bumped on every auto-start write; a background result whose sequence is
     /// stale lost the race to a newer toggle and is discarded.
     autostart_seq: Arc<AtomicU64>,
@@ -151,6 +161,7 @@ impl TokenMonitorApp {
         let check_updates_on_startup = collector.check_updates_on_startup();
         let skipped_update_version = collector.skipped_update_version();
         let theme_color = collector.theme_color();
+        let screen_push_enabled = collector.screen_push_enabled();
 
         // Stateful dropdown / date-picker entities live for the app's lifetime;
         // recreating them each render would reset open state on every notify.
@@ -175,6 +186,10 @@ impl TokenMonitorApp {
             )
         });
         let chart_range_picker = cx.new(|cx| DatePickerState::range(window, cx));
+
+        // Trae auto-ingest: its completion ping lets us refresh the view once
+        // the local DB has been written, without waiting for the next scan tick.
+        let (trae_done_tx, trae_done_rx) = async_channel::unbounded();
 
         let mut app = TokenMonitorApp {
             state: AppState::default(),
@@ -207,6 +222,10 @@ impl TokenMonitorApp {
             // not run on the UI thread.
             autostart_enabled: false,
             autostart_seq: Arc::new(AtomicU64::new(0)),
+            screen_push_enabled,
+            screen_push: crate::app::screen_push::ScreenPush::new(),
+            trae_ingest: crate::app::trae_ingest::TraeIngest::new(trae_done_tx),
+            trae_done_rx,
         };
         // Expose a weak handle to this app so the floating ball can link
         // itself back onto the app when it is opened from the tray menu.
@@ -373,6 +392,24 @@ impl TokenMonitorApp {
         .detach();
     }
 
+    /// Toggle pushing token usage to the Turing 3.5" screen after each scan.
+    /// The preference is persisted; the actual push happens on the next scan.
+    pub fn set_screen_push(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.screen_push_enabled = enabled;
+        if let Err(e) = self.collector.set_screen_push_enabled(enabled) {
+            self.state.last_error = Some(format!("保存数显开关: {e}"));
+        }
+        // 打开开关时主动推一帧，让用户立刻看到效果；关闭时不推。
+        // 后续帧仍由每轮完整扫描（含手动刷新）驱动，见 ScanStatus 处理处。
+        if enabled {
+            match self.screen_push.push_frame() {
+                Ok(_) => {}
+                Err(e) => eprintln!("[TokenMonitor] screen push: {e}"),
+            }
+        }
+        cx.notify();
+    }
+
     /// Read the OS auto-start registration on the background executor and sync
     /// the switch to whatever it finds.
     fn refresh_autostart_enabled(&self, cx: &mut Context<Self>) {
@@ -514,6 +551,16 @@ impl TokenMonitorApp {
             }
         })
         .detach();
+
+        // Trae ingest finished: re-query so newly written rows show this cycle
+        // instead of only after the next 5-minute scan.
+        let trae_done_rx = self.trae_done_rx.clone();
+        cx.spawn(async move |this, cx| {
+            while trae_done_rx.recv().await.is_ok() {
+                let _ = this.update(cx, |app, cx| app.refresh_view(cx));
+            }
+        })
+        .detach();
     }
 
     fn handle_collector_event(&mut self, event: CollectorEvent, cx: &mut Context<Self>) {
@@ -534,7 +581,10 @@ impl TokenMonitorApp {
                     ScanStatus::Scanning { completed, .. } => completed + 1,
                     _ => 1,
                 };
-                self.state.scan_status = if completed >= total {
+                // One full scan emits ScanCompleted once per provider. Push the
+                // screen only on the final one, so a single scan = one frame.
+                let all_done = completed >= total;
+                self.state.scan_status = if all_done {
                     ScanStatus::Done {
                         records: summary.records,
                         at: Utc::now(),
@@ -546,6 +596,24 @@ impl TokenMonitorApp {
                 // the re-query + re-render so idle polls stay near-free.
                 if !summary.unchanged {
                     self.refresh_view(cx);
+                }
+                // Screen push follows the detection cadence: after every full
+                // scan (including manual refresh, which uses the same path),
+                // push one frame so usage + clock stay current. An unchanged
+                // scan still pushes — that is what refreshes the on-screen clock.
+                if all_done && self.screen_push_enabled {
+                    match self.screen_push.push_frame() {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[TokenMonitor] screen push: {e}"),
+                    }
+                }
+                // Trae 自动采集：每轮完整扫描（含手动刷新）拉起一次。--auto 只走
+                // 缓存 key，失效静默跳过；写库后通过 trae_done 通道触发一次刷新。
+                if all_done {
+                    match self.trae_ingest.ingest_once() {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[TokenMonitor] trae ingest: {e}"),
+                    }
                 }
             }
             CollectorEvent::ScanFailed { provider, error } => {

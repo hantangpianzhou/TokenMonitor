@@ -32,6 +32,9 @@ const THEME_COLOR_KEY: &str = "theme.color";
 /// Settings key for whether the floating usage ball is shown on launch.
 const FLOATING_WINDOW_KEY: &str = "floating.window.visible";
 
+/// Settings key for whether the Turing 3.5" screen push is enabled on scans.
+const SCREEN_PUSH_KEY: &str = "screen.push.enabled";
+
 /// Settings key + current value for the CodeBuddy fingerprint scheme. Bumping
 /// the value triggers a one-time rebuild of CodeBuddy rows so they land with the
 /// stable, request-id-based dedup keys instead of the old line-number keys.
@@ -227,6 +230,23 @@ impl Collector {
     pub fn set_floating_window_visible(&self, visible: bool) -> Result<()> {
         let conn = self.db.lock().expect("db lock poisoned");
         SettingsRepo::new(&conn).set(FLOATING_WINDOW_KEY, if visible { "true" } else { "false" })
+    }
+
+    /// Whether pushing token usage to the Turing 3.5" screen after each scan is
+    /// enabled (defaults to `false` — the screen is optional hardware).
+    pub fn screen_push_enabled(&self) -> bool {
+        let conn = self.db.lock().expect("db lock poisoned");
+        SettingsRepo::new(&conn)
+            .get(SCREEN_PUSH_KEY)
+            .ok()
+            .flatten()
+            .map(|value| value == "true")
+            .unwrap_or(false)
+    }
+
+    pub fn set_screen_push_enabled(&self, enabled: bool) -> Result<()> {
+        let conn = self.db.lock().expect("db lock poisoned");
+        SettingsRepo::new(&conn).set(SCREEN_PUSH_KEY, if enabled { "true" } else { "false" })
     }
 
     /// Persist the desktop window size (logical px) so the next launch can

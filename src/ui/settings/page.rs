@@ -108,6 +108,7 @@ fn general_page(weak: &WeakEntity<TokenMonitorApp>) -> SettingPage {
     SettingPage::new("通用").icon(IconName::Settings).group(
         SettingGroup::new()
             .item(autostart_item(&weak))
+            .item(screen_push_item(&weak))
             .item(scan_interval_item(&weak))
             .item(SettingItem::new("主题色", theme_color_field(&weak))),
     )
@@ -160,6 +161,31 @@ fn autostart_item(weak: &WeakEntity<TokenMonitorApp>) -> SettingItem {
         )
     })
     .keywords(["开机自启", "自启", "autostart"])
+}
+
+/// "数显推送" row: switch controlling whether each completed scan pushes one
+/// frame to the Turing 3.5" screen. The preference is persisted; when off, no
+/// child process is spawned and the screen simply keeps its last frame.
+fn screen_push_item(weak: &WeakEntity<TokenMonitorApp>) -> SettingItem {
+    let weak = weak.clone();
+    SettingItem::render(move |_, _, cx: &mut App| {
+        let p = crate::ui::palette(cx);
+        let enabled = weak
+            .read_with(cx, |app, _| app.screen_push_enabled)
+            .unwrap_or(false);
+        let weak = weak.clone();
+        setting_row(
+            "数显推送",
+            Switch::new("screen-push-switch")
+                .checked(enabled)
+                .on_click(move |checked: &bool, _, cx: &mut App| {
+                    let _ = weak.update(cx, |this, cx| this.set_screen_push(*checked, cx));
+                })
+                .into_any_element(),
+            &p,
+        )
+    })
+    .keywords(["数显推送", "小屏", "图灵", "screen"])
 }
 
 /// "扫描间隔" row: dropdown of the rescan intervals, reading/writing the live
