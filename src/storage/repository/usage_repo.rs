@@ -210,15 +210,49 @@ impl<'a> UsageRepo<'a> {
             .map_err(Into::into)
     }
 
-    /// Per-provider aggregates over a window, sorted by cost descending.
+    /// Per-provider ("agent") aggregates over a window, sorted by total token
+    /// usage descending. The dashboard's "Agent 用量" cards keep this order;
+    /// `report::data::load_report_by_provider` re-sorts by the same key, so
+    /// both frontends agree.
     pub fn aggregate_by_provider(&self, w: &TimeWindow) -> Result<Vec<(Provider, SumStats)>> {
-        self.aggregate_grouped("provider", w)?
+        let mut v = self
+            .aggregate_grouped("provider", w)?
             .into_iter()
             .map(|(id, s)| {
                 let provider = Provider::from_id(&id).ok_or_else(|| sqlite_error(&id))?;
                 Ok((provider, s))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        v.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+        Ok(v)
+    }
+
+    /// Most recent request time per provider, across **all** history.
+    ///
+    /// Unlike the windowed aggregates, this deliberately has no time window:
+    /// the dashboard badge uses it to show how fresh each agent's data is
+    /// (e.g. Trae's WAL checkpoint lag). A window would reset that signal to
+    /// zero whenever the selected tab has no rows for a provider, hiding the
+    /// very staleness the badge is meant to expose.
+    ///
+    /// `started_at` is stored as RFC3339 UTC text, so `MAX` is a correct
+    /// lexicographic maximum, and `idx_usage_provider_started` covers it.
+    pub fn latest_by_provider(&self) -> Result<BTreeMap<Provider, DateTime<Utc>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT provider, MAX(started_at) FROM usage_records GROUP BY provider")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let provider = Provider::from_id(&id).ok_or_else(|| sqlite_error(&id))?;
+            let latest = parse_rfc3339(&row.get::<_, String>(1)?)?;
+            Ok((provider, latest))
+        })?;
+        let mut map = BTreeMap::new();
+        for r in rows {
+            let (provider, latest) = r?;
+            map.insert(provider, latest);
+        }
+        Ok(map)
     }
 
     /// Per-provider per-model aggregates over a window; each provider's models
@@ -496,4 +530,83 @@ fn parse_rfc3339(s: &str) -> rusqlite::Result<DateTime<Utc>> {
         .map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::Period;
+    use crate::storage::sqlite;
+    use chrono::TimeZone;
+
+    /// A record at 02:00 UTC on 2026-10-23 with the given token/cost totals;
+    /// `seq` keeps fingerprints unique so records are not deduped away.
+    fn record(provider: Provider, tokens: u64, cost: u64, seq: u32) -> UsageRecord {
+        UsageRecord::new(
+            provider,
+            "proj".to_string(),
+            "s".to_string(),
+            Usage {
+                model: "test".to_string(),
+                started_at: Utc.with_ymd_and_hms(2026, 10, 23, 2, 0, seq).unwrap(),
+                input_tokens: tokens,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_micros: cost,
+            },
+            0,
+            format!("fp-{provider:?}-{seq}"),
+        )
+    }
+
+    /// The Agent 用量 card order is total-token descending: a provider with
+    /// far more tokens but less cost must outrank the expensive one.
+    #[test]
+    fn aggregate_by_provider_sorts_by_total_tokens_desc() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::init_schema(&conn).unwrap();
+        let repo = UsageRepo::new(&conn);
+        repo.batch_insert_dedup(&[
+            record(Provider::Claude, 1_000, 900, 1), // expensive, few tokens
+            record(Provider::Codex, 5_000, 100, 2),  // cheap, many tokens
+        ])
+        .unwrap();
+
+        let window = TimeWindow {
+            start: Utc.with_ymd_and_hms(2026, 10, 23, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 10, 24, 0, 0, 0).unwrap(),
+            period: Period::Day,
+        };
+        let v = repo.aggregate_by_provider(&window).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].0, Provider::Codex);
+        assert_eq!(v[0].1.total_tokens(), 5_000);
+        assert_eq!(v[1].0, Provider::Claude);
+        assert_eq!(v[1].1.cost_micros, 900);
+    }
+
+    /// latest_by_provider spans all history: a provider whose newest row is
+    /// outside the current window must still report it, so the badge keeps
+    /// exposing staleness instead of blanking out.
+    #[test]
+    fn latest_by_provider_ignores_window_and_returns_max() {
+        let conn = Connection::open_in_memory().unwrap();
+        sqlite::init_schema(&conn).unwrap();
+        let repo = UsageRepo::new(&conn);
+        let mut older = record(Provider::Trae, 100, 0, 1);
+        let mut newer = record(Provider::Trae, 100, 0, 2);
+        older.usage.started_at = Utc.with_ymd_and_hms(2026, 10, 1, 2, 0, 0).unwrap();
+        newer.usage.started_at = Utc.with_ymd_and_hms(2026, 11, 17, 7, 16, 12).unwrap();
+        older.fingerprint = "fp-trae-old".to_string();
+        newer.fingerprint = "fp-trae-new".to_string();
+        repo.batch_insert_dedup(&[older, newer]).unwrap();
+
+        let map = repo.latest_by_provider().unwrap();
+        assert_eq!(
+            map.get(&Provider::Trae),
+            Some(&Utc.with_ymd_and_hms(2026, 11, 17, 7, 16, 12).unwrap())
+        );
+        assert!(!map.contains_key(&Provider::Claude));
+    }
 }

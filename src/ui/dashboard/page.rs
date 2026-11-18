@@ -103,7 +103,8 @@ fn tab_bar(app: &TokenMonitorApp, cx: &Context<TokenMonitorApp>) -> impl IntoEle
 }
 
 /// The "Agent 用量" section: only agents with recorded usage in the selected
-/// window are shown, in cost-descending order (as returned by the DB query).
+/// window are shown, in total-token-descending order (as returned by the DB
+/// query).
 fn agent_section(app: &mut TokenMonitorApp, cx: &mut Context<TokenMonitorApp>) -> AnyElement {
     let p = crate::ui::palette(cx);
     let tab_label = app.state.time_tab.label();
@@ -147,6 +148,7 @@ fn agent_section(app: &mut TokenMonitorApp, cx: &mut Context<TokenMonitorApp>) -
                             app.weak_self.clone(),
                             *provider,
                             *stats,
+                            app.state.latest_by_provider.get(provider),
                             app.state.by_provider_model.get(provider),
                             app.state.expanded_provider == Some(*provider),
                             tab_label,

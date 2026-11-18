@@ -729,6 +729,7 @@ impl TokenMonitorApp {
         self.state.summary = snap.summary;
         self.state.by_provider = snap.by_provider;
         self.state.by_provider_model = snap.by_provider_model;
+        self.state.latest_by_provider = snap.latest_by_provider;
         self.state.by_project = snap.by_project;
         self.state.by_day = snap.by_day;
         if let Some(charts) = snap.charts {
@@ -799,6 +800,10 @@ fn compute_view_snapshot(
     }
     match repo.aggregate_by_provider_model(&window) {
         Ok(m) => snap.by_provider_model = m,
+        Err(e) => snap.error = Some(format!("query failed: {e}")),
+    }
+    match repo.latest_by_provider() {
+        Ok(m) => snap.latest_by_provider = m,
         Err(e) => snap.error = Some(format!("query failed: {e}")),
     }
     match repo.aggregate_by_project(&window) {

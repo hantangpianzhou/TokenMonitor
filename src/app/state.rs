@@ -148,6 +148,10 @@ pub struct AppState {
     pub summary: Option<SumStats>,
     pub by_provider: Vec<(Provider, SumStats)>,
     pub by_provider_model: BTreeMap<Provider, Vec<(String, SumStats)>>,
+    /// Most recent request timestamp per provider (all history). Powers the
+    /// "recent" badge on Agent cards so data staleness — e.g. Trae's WAL
+    /// checkpoint lag — is visible at a glance.
+    pub latest_by_provider: BTreeMap<Provider, DateTime<Utc>>,
     pub by_project: Vec<(String, SumStats)>,
     pub by_day: Vec<(String, SumStats)>,
     pub charts: ChartsState,
@@ -360,6 +364,8 @@ pub struct ViewSnapshot {
     pub summary: Option<SumStats>,
     pub by_provider: Vec<(Provider, SumStats)>,
     pub by_provider_model: BTreeMap<Provider, Vec<(String, SumStats)>>,
+    /// All-history latest request time per provider; see `AppState`.
+    pub latest_by_provider: BTreeMap<Provider, DateTime<Utc>>,
     pub by_project: Vec<(String, SumStats)>,
     pub by_day: Vec<(String, SumStats)>,
     pub charts: Option<ChartsSnapshot>,

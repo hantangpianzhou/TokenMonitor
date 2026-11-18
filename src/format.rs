@@ -1,6 +1,18 @@
 //! Display formatting helpers (presentation conventions, not domain logic).
 //! Pure text — shared by the GPUI and TUI frontends.
 
+use chrono::{DateTime, FixedOffset, Utc};
+
+/// Recent-request timestamp for the Agent card badge: `MM-DD HH:MM` in UTC+8.
+/// Absolute rather than relative ("31 min ago") because cards refresh on the
+/// scan tick, so a relative label would freeze between refreshes and mislead.
+pub fn format_recent_time(dt: &DateTime<Utc>) -> String {
+    let shanghai = FixedOffset::east_opt(8 * 3600).unwrap();
+    dt.with_timezone(&shanghai)
+        .format("%m-%d %H:%M")
+        .to_string()
+}
+
 /// Compact token count: `>=1e8` → "3.5亿", `>=1e6` → "9.1M", `>=1e3` → "641K",
 /// otherwise the raw number.
 pub fn format_tokens_compact(v: u64) -> String {
@@ -120,6 +132,13 @@ pub fn format_percent_f64(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_time_is_absolute_in_utc8() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2026, 11, 17, 7, 16, 12).unwrap();
+        assert_eq!(format_recent_time(&dt), "11-17 15:16");
+    }
 
     #[test]
     fn compact_formats_by_magnitude() {

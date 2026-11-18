@@ -1,5 +1,6 @@
 //! Provider usage card for the dashboard grid.
 
+use chrono::{DateTime, Utc};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, size, svg, AnyElement, App, Context, ElementId, InteractiveElement, IntoElement,
@@ -10,7 +11,7 @@ use gpui_component::{h_flex, v_flex, ActiveTheme, StyledExt};
 use crate::app::app::TokenMonitorApp;
 use crate::core::aggregation::SumStats;
 use crate::core::model::Provider;
-use crate::format::{format_cost_usd, format_tokens_compact};
+use crate::format::{format_cost_usd, format_recent_time, format_tokens_compact};
 use crate::ui::charts::DonutChart;
 
 /// One provider card: headline totals, cost, cache-hit ring, token details,
@@ -20,6 +21,7 @@ pub fn provider_card(
     weak: WeakEntity<TokenMonitorApp>,
     provider: Provider,
     stats: SumStats,
+    latest: Option<&DateTime<Utc>>,
     models: Option<&Vec<(String, SumStats)>>,
     expanded: bool,
     tab_label: &str,
@@ -55,13 +57,20 @@ pub fn provider_card(
                 )
                 .when(has_usage, |this| {
                     this.child(
-                        div()
+                        h_flex()
+                            .items_center()
+                            .gap_1()
                             .px_2()
                             .rounded(p.radius)
                             .bg(p.muted.opacity(0.2))
                             .text_xs()
                             .text_color(p.muted_foreground)
-                            .child(format!("{}", stats.records)),
+                            // Both halves carry a literal label so neither
+                            // number reads as a bare figure: "请求 N ｜ 最近 T".
+                            .child(format!("请求 {}", stats.records))
+                            .when_some(latest, |this, dt| {
+                                this.child(format!("｜ 最近 {}", format_recent_time(dt)))
+                            }),
                     )
                 }),
         )
