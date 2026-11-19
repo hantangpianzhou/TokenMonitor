@@ -61,6 +61,16 @@ impl TraeIngest {
         let dir = std::env::temp_dir().join("tokenmonitor-trae");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(EXE_NAME);
+        // 新实例没有缓存路径，但 exe 可能已在磁盘上——且上一轮采集进程可能
+        // 还在运行它：重写运行中的 exe 会撞共享冲突。载荷只在长度变化时才算
+        // 更新，大小匹配就复用磁盘文件。
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() == INGEST_EXE.len() as u64 {
+                let path = Arc::new(path);
+                self.exe_path = Some(path.clone());
+                return Ok((*path).clone());
+            }
+        }
         std::fs::write(&path, INGEST_EXE)?;
         let path = Arc::new(path);
         self.exe_path = Some(path.clone());
