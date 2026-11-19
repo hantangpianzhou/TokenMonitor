@@ -163,9 +163,10 @@ fn autostart_item(weak: &WeakEntity<TokenMonitorApp>) -> SettingItem {
     .keywords(["开机自启", "自启", "autostart"])
 }
 
-/// "数显推送" row: switch controlling whether each completed scan pushes one
-/// frame to the Turing 3.5" screen. The preference is persisted; when off, no
-/// child process is spawned and the screen simply keeps its last frame.
+/// "数显推送" row: switch controlling a resident Turing 3.5" screen pusher.
+/// When on, a long-lived process keeps the serial port open, draws a full
+/// baseline frame once, then pushes only changed regions (clock every minute,
+/// token data on scan). When off, the process is killed to free COM3.
 fn screen_push_item(weak: &WeakEntity<TokenMonitorApp>) -> SettingItem {
     let weak = weak.clone();
     SettingItem::render(move |_, _, cx: &mut App| {

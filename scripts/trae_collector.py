@@ -41,11 +41,28 @@ except ImportError:
 
 # ------------------------------------------------------------------ 配置 ---
 APPDATA = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
-TRAE_DIR = os.path.join(APPDATA, "Trae CN", "ModularData", "ai-agent")
+
+
+def _detect_trae_dir():
+    """兼容中文版（Trae CN）与国际版（Trae）：谁的 database.db 存在用谁。
+    两个都在时优先中文版（与 PROC_HINTS 的默认进程名一致）。都不在时返回
+    中文版默认路径，让后续报错信息指向最可能的位置。
+    """
+    for name in ("Trae CN", "Trae"):
+        d = os.path.join(APPDATA, name, "ModularData", "ai-agent")
+        if os.path.exists(os.path.join(d, "database.db")):
+            return d
+    return os.path.join(APPDATA, "Trae CN", "ModularData", "ai-agent")
+
+
+TRAE_DIR = _detect_trae_dir()
 TRAE_DB = os.path.join(TRAE_DIR, "database.db")
 TM_DB = os.path.join(APPDATA, "TokenMonitor", "tokenmonitor.db")
 KEY_CACHE = os.path.join(APPDATA, "TokenMonitor", "trae_key.json")
+KEY_FAIL = os.path.join(APPDATA, "TokenMonitor", "trae_key_fail.json")  # 提 key 失败时间戳（冷却用）
+TM_CONFIG_DIR = os.path.join(APPDATA, "TokenMonitor")
 WORK = os.path.join(tempfile.gettempdir(), "tm_trae_collector")
+EXTRACT_COOLDOWN_SEC = 30 * 60   # 自动提 key 失败后冷却 30 分钟，避免每轮扫描都卡 60s
 
 PAGE_SZ, SALT_SZ, RESERVE_SZ, IV_SZ, HMAC_SZ = 4096, 16, 80, 16, 64
 CRYPT_SZ = PAGE_SZ - RESERVE_SZ            # 4016
@@ -121,6 +138,37 @@ def save_cached_key(key: bytes, hdr: DbHeader):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     os.replace(tmp, KEY_CACHE)
+
+
+# -------------------------------------------------- 自动提 key 失败冷却层 ---
+def extract_in_cooldown() -> tuple:
+    """返回 (是否冷却中, 原因)。冷却期内 --auto 不再尝试扫内存，直接静默跳过。"""
+    try:
+        with open(KEY_FAIL, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        last = float(obj["failed_at"])
+        left = EXTRACT_COOLDOWN_SEC - (time.time() - last)
+        if left > 0:
+            return True, "上次自动提 key 失败，冷却中（剩 %d 分钟）" % (int(left / 60) + 1)
+        return False, "冷却期已过，可重试"
+    except (OSError, ValueError, KeyError, TypeError):
+        return False, "无失败记录"
+
+
+def mark_extract_failed(reason: str = ""):
+    os.makedirs(TM_CONFIG_DIR, exist_ok=True)
+    obj = {"failed_at": time.time(), "reason": reason}
+    tmp = KEY_FAIL + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, KEY_FAIL)
+
+
+def clear_extract_failed():
+    try:
+        os.remove(KEY_FAIL)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------- 内存提 key 层 ---
@@ -440,14 +488,24 @@ def main():
         return 1
 
     if auto:
-        # --auto 是后台自动模式：全程静默，只在真出错时写一行供排查。
-        # 关键约束：绝不扫内存提 key（那要管理员权限 + ≤60s + 近期有 agent 任务，
-        # 会拖垮 5 分钟一轮的扫描）。缓存 key 用当前库 salt+HMAC 校验，失效即退。
+        # --auto 后台自动模式：全程静默，只在真出错时写一行供排查。
+        # key 判断（2026-11-19）：先查缓存并用当前库 salt+HMAC 校验——有效就
+        # 直接复用（不扫内存）；无效则尝试自动提 key 并存缓存，让新电脑/换 key
+        # 后能自愈。提 key 要扫内存（≤60s + 需近期有 agent 任务），失败后写
+        # 30 分钟冷却，避免 Trae 没开时每轮扫描都卡 60s。
         try:
             hdr = DbHeader()
             key, why = load_cached_key(hdr)
             if not key:
-                return 2        # 缓存失效/不存在 → 静默跳过，等用户手动刷新缓存
+                cooling, cwhy = extract_in_cooldown()
+                if cooling:
+                    return 2        # 冷却期内静默跳过
+                # 缓存无效且不在冷却期 → 自动提一次 key（get_key 内部会存缓存）
+                key = get_key(hdr, force=True)
+                if not key:
+                    mark_extract_failed(cwhy or why)
+                    return 2        # 提取失败，写冷却后静默跳过
+                clear_extract_failed()
             plain = decrypt_main_db(key)
             probe = sqlite3.connect("file:" + plain + "?mode=ro", uri=True)
             ic = probe.execute("PRAGMA integrity_check").fetchone()[0]

@@ -52,6 +52,8 @@ PROVIDER_CN = {
     "workbuddy": "WorkBuddy", "claude": "Claude", "codex": "Codex",
     "gemini": "Gemini", "deepseek": "DeepSeek", "trae": "Trae",
     "qoder": "Qoder", "atomcode": "AtomCode", "codearts": "CodeArts",
+    "teleagent": "TeleAgent", "codebuddy": "CodeBuddy", "opencode": "OpenCode",
+    "openclaw": "OpenClaw", "antigravity": "Antigravity", "pi": "Pi",
 }
 
 
@@ -242,12 +244,13 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
         d.text((rx + 14 + rnw + 8, ct + 28 + (ub[1] - rb[1]) + (rb[3] - ub[3])),
                "次", font=fu, fill=CYAN, anchor="la")
 
-        # ---- 底部：左 = Agent 分布（3/4），右 = 时间天气（1/4）----
+        # ---- 底部：左 = Agent 分布（2/3），右 = 时间（1/3）----
+        # 文档第6章：原版 3:1 改成 2:1，时间区更宽松，可上更大字号。
         by = 150
-        lw = (w - M * 2) * 3 // 4          # 左列宽 336
+        lw = (w - M * 2) * 2 // 3          # 左列宽 ≈298（2/3）
         div_x = M + lw                      # 分隔线位置
         rx = div_x + 12                     # 右列起点
-        rcw = w - M - rx                    # 右列宽
+        rcw = w - M - rx                    # 右列宽 ≈148（1/3）
 
         # 左列 Agent 分布：top 3，名称 + 占比 + 比例条
         d.text((M, by), "AGENT 分布", font=font(12), fill=MUTED)
@@ -255,10 +258,10 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
         agents = data["providers"][:3] or [("-", 0)]
         for i, (name, v) in enumerate(agents):
             ry = by + 22 + i * 40
-            d.text((M, ry), name, font=font(13), fill=TEXT)
+            d.text((M, ry), name, font=font(14), fill=TEXT)
             d.text((div_x, ry + 1), f"{v / total_p * 100:.0f}%",
-                   font=font(12), fill=ACCENT, anchor="ra")
-            bar(d, (M, ry + 20, div_x, ry + 25), v / total_p)
+                   font=font(13), fill=ACCENT, anchor="ra")
+            bar(d, (M, ry + 20, div_x, ry + 26), v / total_p)
 
         # 分隔线
         d.rectangle((div_x + 4, by, div_x + 5, h - 14), fill=GRID)
@@ -268,13 +271,15 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
         env = data.get("env", default_env())
         d.text((cx, by), "当前时间", font=font(11), fill=MUTED, anchor="ma")
         clock = env.get("clock", "--:--")
-        fc = font(40, True)
+        fc = font(56, True)
+        while fc.size > 24 and d.textlength(clock, font=fc) > rcw - 12:
+            fc = font(fc.size - 4, True)   # 超宽自适应，避免被右侧裁切
+        # 垂直居中：anchor="ma" 的锚点是 ascender 线，墨迹实际占 [cy+cb[1], cy+cb[3]]
+        # 让墨迹中心落在「标题下方 ~ 底部留白」区域的中心，而不是把 cy 当顶部算。
         cb = d.textbbox((0, 0), clock, font=fc, anchor="ma")
-        clock_h = cb[3] - cb[1]
-        cy = by + 30 + ((h - 20) - (by + 30) - clock_h) // 2
+        zone_top, zone_bottom = by + 30, h - 14
+        cy = (zone_top + zone_bottom) / 2 - (cb[1] + cb[3]) / 2
         d.text((cx, cy), clock, font=fc, fill=TEXT, anchor="ma")
-        d.text((cx, h - 16), "更新 " + data["updated"],
-               font=font(10), fill=MUTED, anchor="ma")
     else:
         # ---- 竖屏：卡片上下排列 ----
         card(d, (M, 52, w - M, 140))
@@ -307,8 +312,6 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
         ey = 300
         d.rectangle((M, ey - 6, w - M, ey - 5), fill=GRID)
         d.text((M, ey), "当前时间", font=font(12), fill=MUTED)
-        d.text((w - M, ey + 1), "更新 " + data["updated"],
-               font=font(10), fill=MUTED, anchor="ra")
         draw_clock(d, data.get("env", default_env()),
                    x=M, y=ey + 22, clock_size=72, center_w=w - M * 2)
     return img

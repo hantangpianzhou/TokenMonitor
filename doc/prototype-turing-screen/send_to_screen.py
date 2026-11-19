@@ -38,6 +38,9 @@ class Command(IntEnum):
 
     SET_MIRROR = 122
     DISPLAY_PIXELS = 195
+    # 官方 UsbMonitor.exe 反编译 rid=482 发图时压入 198；权威开源库用 197。
+    # 只差 1，疑为不同固件子版本。留作 --bitmap-cmd 切换验证。
+    DISPLAY_BITMAP_ALT = 198
 
 
 class Orientation(IntEnum):
@@ -78,14 +81,15 @@ class Turing35RevA:
         buf[10] = h & 0xFF
         return bytes(buf)
 
-    def brightness_packet(self, level: int = 25) -> bytes:
+    def brightness_packet(self, level: int = 50) -> bytes:
         """官方：值越小越亮，0=最亮，255=最暗。"""
         assert 0 <= level <= 100
         absolute = int(255 - (level / 100) * 255)
         return self.command_packet(Command.SET_BRIGHTNESS, absolute, 0, 0, 0)
 
-    def bitmap_header(self, x0: int, y0: int, x1: int, y1: int) -> bytes:
-        return self.command_packet(Command.DISPLAY_BITMAP, x0, y0, x1, y1)
+    def bitmap_header(self, x0: int, y0: int, x1: int, y1: int,
+                      cmd: int = Command.DISPLAY_BITMAP) -> bytes:
+        return self.command_packet(cmd, x0, y0, x1, y1)
 
     def chunks(self, rgb565: bytes):
         """官方 chunked(data, width*8)：320*8=2560 字节/块（=4 行），共 120 块。"""
@@ -129,12 +133,13 @@ class Turing35RevA:
                 dst[(h - 1 - b) * w + a] = src[a * h + b]
         return bytes(out)
 
-    def build_stream(self, frame: bytes, orientation: Orientation, brightness: int) -> bytes:
+    def build_stream(self, frame: bytes, orientation: Orientation, brightness: int,
+                     bitmap_cmd: int = Command.DISPLAY_BITMAP) -> bytes:
         """产出完整字节流：方向 → 亮度 → 位图头 → 分块像素。供写入或测试。"""
         out = bytearray()
         out += self.orientation_packet(orientation)
         out += self.brightness_packet(brightness)
-        out += self.bitmap_header(0, 0, self.width - 1, self.height - 1)
+        out += self.bitmap_header(0, 0, self.width - 1, self.height - 1, cmd=bitmap_cmd)
         for chunk in self.chunks(frame):
             out += chunk
         return bytes(out)
@@ -213,7 +218,8 @@ def main() -> None:
     ap.add_argument("--port", help="COM 口，如 COM3")
     ap.add_argument("--frame", help="render_screen.py 导出的 .rgb565")
     ap.add_argument("--orient", choices=["portrait", "landscape"], default="portrait")
-    ap.add_argument("--brightness", type=int, default=25)
+    ap.add_argument("--brightness", type=int, default=50,
+                    help="亮度百分比 0-100：100 最亮、0 最暗（默认 50）")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--self-test", action="store_true")

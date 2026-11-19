@@ -83,7 +83,8 @@ pub struct TokenMonitorApp {
     pub autostart_enabled: bool,
     /// Whether to push token usage to the Turing 3.5" screen after each scan.
     pub screen_push_enabled: bool,
-    /// Owns the short-lived screen-push child process (spawned on scan complete).
+    /// Owns the resident screen-push child process (full frame once, then local
+    /// region updates driven by scan notifications + per-minute clock).
     screen_push: crate::app::screen_push::ScreenPush,
     /// Owns the short-lived Trae auto-ingest child process (spawned on scan
     /// complete; writes Trae local-DB usage into our SQLite).
@@ -231,6 +232,23 @@ impl TokenMonitorApp {
         // itself back onto the app when it is opened from the tray menu.
         APP_WEAK.set(app.weak_self.clone()).ok();
         app.sync_chart_app_select(window, cx);
+
+        // 常驻数显推送：若开关已持久化打开，启动时立即拉起常驻进程
+        // （首次 RESET + 全帧建基准，之后每分钟局部刷时钟）。短命进程模型
+        // 做不到时钟即时刷新，故改为常驻。关闭/退出由 ScreenPush::drop 兜底。
+        if app.screen_push_enabled {
+            if let Err(e) = app.screen_push.ensure_running() {
+                eprintln!("[TokenMonitor] screen push start: {e}");
+            }
+        }
+
+        // Trae 自动采集：启动时先拉一次。新装/换机时 key 缓存不存在，
+        // 采集器 --auto 会在冷静期内尝试从内存提 key 并缓存；若此时提不到
+        // （Trae 未运行或无近期 agent 任务），写 30 分钟冷却静默跳过，
+        // 后续每轮扫描结束仍会再试。这样开机即可尽快自愈，不必等首轮扫描。
+        if let Err(e) = app.trae_ingest.ingest_once() {
+            eprintln!("[TokenMonitor] trae ingest (startup): {e}");
+        }
 
         // Dispatch dropdown / date-picker events back into app handlers.
         {
@@ -399,13 +417,14 @@ impl TokenMonitorApp {
         if let Err(e) = self.collector.set_screen_push_enabled(enabled) {
             self.state.last_error = Some(format!("保存数显开关: {e}"));
         }
-        // 打开开关时主动推一帧，让用户立刻看到效果；关闭时不推。
-        // 后续帧仍由每轮完整扫描（含手动刷新）驱动，见 ScanStatus 处理处。
+        // 打开：拉起常驻进程（首次 RESET + 全帧，之后它自己每分钟局部刷时钟、
+        // 数据变化即时推局部）；关闭：kill 常驻进程释放 COM3，屏幕回到待机。
         if enabled {
-            match self.screen_push.push_frame() {
-                Ok(_) => {}
-                Err(e) => eprintln!("[TokenMonitor] screen push: {e}"),
+            if let Err(e) = self.screen_push.ensure_running() {
+                eprintln!("[TokenMonitor] screen push start: {e}");
             }
+        } else {
+            self.screen_push.stop();
         }
         cx.notify();
     }
@@ -597,14 +616,12 @@ impl TokenMonitorApp {
                 if !summary.unchanged {
                     self.refresh_view(cx);
                 }
-                // Screen push follows the detection cadence: after every full
-                // scan (including manual refresh, which uses the same path),
-                // push one frame so usage + clock stay current. An unchanged
-                // scan still pushes — that is what refreshes the on-screen clock.
+                // 常驻推送：扫描完成后写触发文件通知常驻进程推一帧局部刷新。
+                // 时钟刷新已由常驻进程自己每分钟驱动，不再依赖扫描周期。
                 if all_done && self.screen_push_enabled {
-                    match self.screen_push.push_frame() {
+                    match self.screen_push.notify() {
                         Ok(_) => {}
-                        Err(e) => eprintln!("[TokenMonitor] screen push: {e}"),
+                        Err(e) => eprintln!("[TokenMonitor] screen push notify: {e}"),
                     }
                 }
                 // Trae 自动采集：每轮完整扫描（含手动刷新）拉起一次。--auto 只走

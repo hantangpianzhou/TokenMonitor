@@ -9,7 +9,7 @@ echo   TokenScreen 一键打包（方案1 / PyInstaller）
 echo ============================================
 echo.
 
-"%PY%" build_exe.py --clean
+"%PY%" build_exe.py
 if errorlevel 1 (
     echo.
     echo [失败] 打包未成功，请看上方报错。
