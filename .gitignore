@@ -18,6 +18,8 @@ Thumbs.db
 __pycache__/
 doc/prototype-turing-screen/build/
 doc/prototype-turing-screen/dist/
+scripts/build/
+scripts/dist/
 *.rgb565
 /TokenMonitor-v*-windows-x64.wxs
 memmap_floor.txt
