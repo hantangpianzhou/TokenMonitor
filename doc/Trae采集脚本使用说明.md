@@ -1,6 +1,6 @@
 # Trae 采集脚本使用说明
 
-> 位置：`scripts/trae_collector.py` · 2026-11-17
+> 位置：`scripts/trae_collector.py` · 2026-11-17（2026-11-19 更新 `--auto` 自动提 key）
 > 作用：把本机 Trae（`chat_turn.context.token_usage`）的 token 用量采集进 TokenMonitor 的 `usage_records`（`provider='trae'`）。
 
 ---
@@ -8,20 +8,22 @@
 ## 一、它做什么（三步走）
 
 ```
-缓存 key 存在? ──否──> 扫 Trae 进程内存提 key ──失败──> 提示「请先发起一次 agent 任务再重试」
-     │是                        │
-     ▼                          ▼
-HMAC 校验通过? ──否──┘      保存 key 到缓存
-     │是
-     ▼
-复用缓存（跳过扫描，~1s）─> 解密主库 ─> 解析 chat_turn ─> fingerprint 去重入库
+缓存 key 存在且 HMAC 校验通过? ──否──> 扫 Trae 进程内存提 key ──成功──> 保存 key 到缓存
+              │是                            │失败
+              ▼                              ▼
+      复用缓存（跳过扫描，~1s）      写 30 分钟冷却 + 静默跳过（--auto）
+              │                                （手动模式提示「请先发起一次 agent 任务」）
+              ▼
+      解密主库 ─> 解析 chat_turn ─> fingerprint 去重入库
 ```
 
 | 环节 | 说明 |
 |---|---|
 | **key 缓存** | `%APPDATA%\TokenMonitor\trae_key.json`，含 `key_hex` / `salt_hex` / `db_size` / `verified_at` |
 | **HMAC 校验** | 每次启动用**当前主库 page1 的 salt** 重算 HMAC-SHA512 校验缓存 key；Trae 重启换了 key 会校验失败，自动重提 |
-| **提 key** | 扫 Trae CN / TeleAgent / ais 进程内存，用数据库 salt 做二进制锚点定位候选 key，HMAC 命中即确认；上限 60s |
+| **提 key** | 扫 Trae CN / 国际版 Trae / TeleAgent / ais 进程内存，用数据库 salt 做二进制锚点定位候选 key，HMAC 命中即确认；上限 60s |
+| **自动提 key**（11-19 新增） | `--auto` 缓存失效时不再静默跳过，会自动扫内存提 key 并存缓存；失败写 `%APPDATA%\TokenMonitor\trae_key_fail.json` 时间戳，**30 分钟冷却**内不再重试，避免 Trae 没开时每轮扫描卡 60s |
+| **换机自愈** | key 与本机 Trae 库 salt 绑定，不能跨机拷贝；新电脑上 `--auto` 自动提 key，无需手动 `--force-extract`；Trae 目录自动探测 `Trae CN`（中文版）与 `Trae`（国际版）|
 | **解密** | 只读主库 `database.db`，逐页 AES-256-CBC 解密到临时明文库 |
 | **去重入库** | fingerprint = `localdb:{session_id}:{created_at}:{id}`；表已有 UNIQUE 约束 + `INSERT OR IGNORE`，重复跑不产生重复行 |
 
@@ -34,7 +36,7 @@ python scripts\trae_collector.py                  :: 采集（缓存 key 优先�
 python scripts\trae_collector.py --check          :: 只看缓存 key 是否有效（0=有效 / 2=需重提）
 python scripts\trae_collector.py --force-extract  :: 忽略缓存，强制重新从内存提 key
 python scripts\trae_collector.py --dry-run        :: 解密+解析但不写库，预览条数与 token 合计
-python scripts\trae_collector.py --auto           :: 【主程序自动采集用】只用缓存 key，失效静默跳过
+python scripts\trae_collector.py --auto           :: 【主程序自动采集用】缓存 key 有效则复用，失效则自动提 key（带 30 分钟失败冷却）
 ```
 
 依赖：`pycryptodome`（`python -m pip install pycryptodome`）。本机验证环境 Python 3.13.12 + Crypto 4.5.0。
@@ -45,15 +47,15 @@ Trae 采集已集成进 TokenMonitor 主程序：**每轮完整扫描（5 分钟
 
 | 项 | 说明 |
 |---|---|
-| **触发** | app 层 `all_done`（一轮扫描最后一个 provider）时拉起，与数显推送同一时机 |
-| **模式** | `--auto` **只走缓存 key**（HMAC 校验当前库），命中即解密+幂等写库；**绝不扫内存** |
-| **失效处理** | 缓存 key 失效（Trae 重启换 key）时**静默跳过本轮**，不扫内存、不提示、不拖累扫描。用户下次发起 agent 任务后手动跑一次 `--force-extract` 刷新缓存即可恢复 |
+| **触发** | ① 程序启动时拉一次（11-19 新增，新机开机即尝试拿 key）；② app 层 `all_done`（一轮扫描最后一个 provider）时拉起，与数显推送同一时机 |
+| **模式** | `--auto` 先查缓存 key（HMAC 校验当前库），**有效则直接复用不扫内存**；**无效则自动从内存提 key 并存缓存**，全程静默 |
+| **失效处理** | 提 key 失败（Trae 未运行 / 无近期 agent 任务 / 权限不足）时写 30 分钟冷却，期间静默跳过不重复扫；冷却过后自动重试。用户在此期间发起一次 agent 任务后，下个冷却周期即能自动拿到 key，**无需手动 `--force-extract`** |
 | **即时刷新** | 写入完成后通过 `async_channel` 通知 UI 重新聚合，数据无需等下一个 5 分钟周期 |
 | **单文件分发** | exe 经 `include_bytes!` 编进主程序，首次释放到 `%TEMP%/tokenmonitor-trae/`；目标机无需 Python |
 | **防重入** | `AtomicBool` 保证同时只有一个采集进程；退出后清标志 |
 | **打包** | `python scripts\build_trae_exe.py --clean` → 复制 `scripts/dist/TraeCollector.exe` 到 `assets/TokenCollector.exe` → `cargo build --release` |
 
-> **重要**：自动采集依赖缓存 key 已建立。首次使用需手动跑一次 `python scripts\trae_collector.py`（缓存命中则直接写，未命中则扫内存提 key），之后主程序即可自动跟随。缓存失效后同理需手动刷新一次。
+> **换机说明**：拷 MSI 到新电脑后，缓存 key 不会随行（且与本机 Trae 库 salt 绑定，拷旧 key 也无效）。新电脑只要装了 Trae CN 或国际版 Trae，启动 TokenMonitor 后 `--auto` 会**自动从内存提 key**——前提是 Trae 正在运行且近期发起过 agent 任务。若开机时 Trae 没开，会写 30 分钟冷却，之后每轮扫描自动重试，直到成功。无需任何手动命令。
 
 ---
 

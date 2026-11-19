@@ -3,8 +3,9 @@
 """把 trae_collector.py 打包成单文件 exe，供 TokenMonitor 主程序内嵌自动采集。
 
 产物：scripts/dist/TraeCollector.exe
-  —— 目标机零 Python 依赖；主程序每轮扫描拉起 `--auto`，只用缓存 key，
-     失效静默跳过。含 pycryptodome（SQLCipher 解密所需）。
+  —— 目标机零 Python 依赖；主程序每轮扫描拉起 `--auto`：缓存 key 有效则复用，
+     失效则自动从内存提 key 并存缓存（失败写 30 分钟冷却）。含 pycryptodome
+     （SQLCipher 解密所需）。
 
 用法：
     python build_trae_exe.py             # 打包
