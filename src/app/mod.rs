@@ -2,7 +2,9 @@
 
 pub mod actions;
 pub mod app;
+pub mod screen_push;
 pub mod state;
+pub mod trae_ingest;
 pub mod update_check;
 pub mod window_state;
 
