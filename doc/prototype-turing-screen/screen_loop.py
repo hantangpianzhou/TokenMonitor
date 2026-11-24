@@ -94,12 +94,18 @@ def auto_port() -> str | None:
 
 
 def data_fingerprint(data: dict) -> tuple:
-    """只含 token 数据，不含时钟——避免时钟每分钟变化导致无意义重推。"""
+    """只含 token 数据与主题，不含时钟——避免时钟每分钟变化导致无意义重推。
+
+    主题必须进指纹：换了配色但数字没动时，指纹不变就不会重推，屏上会一直停在
+    旧配色上（虽然时钟每分钟变化会兜住，但最多要等 60s）。主程序换色后还会
+    额外写一次触发文件，两者是双保险。
+    """
     return (
         data.get("tokens", 0),
         data.get("records", 0),
         data.get("last_activity", "--:--"),
         tuple((n, v) for n, v in data.get("providers", [])),
+        data.get("theme", ""),
     )
 
 
@@ -469,6 +475,16 @@ class ScreenSession:
             log("两帧无像素变化，跳过")
             return True
         x0, y0, x1, y1 = rect
+        # 换主题会让几乎整屏像素变化，包围盒直接铺满全屏。那时光局部帧要一次性
+        # 写出近 300KB 的 crop，而全帧路径是分块写的、并且是唯一做过实机点亮
+        # 验证的路径（见 send_stream 注释）。面积过半就改走全帧：顺带用
+        # push_full 重建基准，比发一个巨型「局部」帧更稳。
+        area = (x1 - x0 + 1) * (y1 - y0 + 1)
+        full = self.dev.width * self.dev.height
+        if area * 2 > full:
+            log(f"脏区 {rect} 占 {area * 100 // full}% 已过半，改走全帧重建基准")
+            self.push_full(frame)
+            return True
         crop = crop_rect(frame, self.dev.width, x0, y0, x1, y1)
         hdr = self.dev.bitmap_header(x0, y0, x1, y1, cmd=self.args.bitmap_cmd)
         self.ser.write(hdr); self.ser.flush(); time.sleep(0.05)

@@ -37,16 +37,36 @@ def _pick_font(*names: str) -> str:
 FONT_REG = _pick_font("msyh.ttc", "simhei.ttf", "simsun.ttc", "Deng.ttf", "NotoSansCJK-Regular.ttc")
 FONT_BOLD = _pick_font("msyhbd.ttc", "msyh.ttc", "simhei.ttf", "NotoSansCJK-Bold.ttc")
 
-# 收敛的深色仪表盘配色：一个主色 + 一个辅色，去掉跳脱的纯绿与金额色。
+# 结构色：底、卡片、描边、分隔线、文字。**恒定，不随主题变** —— 软件里的主题
+# 本来也只换 accent、底色不动，屏上同构处理才与软件体感一致；且 RGB565 只有
+# 5/6/5 位色深，深底上的 1px 描边一旦往彩色偏就会糊成一片。
 BG = "#0A1120"
 PANEL = "#131D31"
 BORDER = "#26365A"
 GRID = "#1C2942"
 TEXT = "#EDF2FA"
 MUTED = "#8FA3C4"
-ACCENT = "#5B9CF8"
-CYAN = "#3FD0C9"
-BAR_DIM = "#335A94"
+
+# 主题 key → 屏端两个「数据色」：(主色, 辅色)
+#   主色 = 今日 TOKEN 大数字、占比百分比、比例条填充
+#   辅色 = logo 色块、live 点、「今日活跃 N 次」
+# 刻意不复用 Rust 侧 `ThemeColor::accent()`：UI 的 Ocean 是 #3b82f6，在 BG 上
+# 对比度只有 4.2:1，比屏端现行 #5B9CF8（6.8:1）暗一档 —— 3.5" 屏 + 强环境光
+# 下读不清。屏端各主题统一取比 UI accent 亮一级的色阶。
+# ocean 一行就是本功能上线前的原配色，默认主题零视觉回归。
+SCREEN_PALETTES: dict[str, tuple[str, str]] = {
+    "ocean": ("#5B9CF8", "#3FD0C9"),
+    "jade": ("#34D399", "#22D3EE"),
+    "amber": ("#FBBF24", "#FB923C"),
+    "rose": ("#FB7185", "#F0ABFC"),
+}
+DEFAULT_THEME = "ocean"
+
+
+def palette_for(theme: str | None) -> tuple[str, str]:
+    """主题 key → (主色, 辅色)；缺失或未知一律回退 ocean（即原配色）。"""
+    return SCREEN_PALETTES.get(theme or "", SCREEN_PALETTES[DEFAULT_THEME])
+
 
 PROVIDER_CN = {
     "workbuddy": "WorkBuddy", "claude": "Claude", "codex": "Codex",
@@ -84,8 +104,25 @@ def split_wan(v: int) -> tuple[str, str]:
     return s, ""
 
 
+def load_theme_key(conn) -> str:
+    """读 settings 表的 theme.color（与 Rust 侧 `THEME_COLOR_KEY` 同名）。
+
+    主题只在主程序「设置 → 外观」里改，落库即唯一真值源，屏端不需要主程序
+    额外传参 —— 复用 load_from_db 已打开的那条只读连接，成本为零。
+    旧库没有 settings 表、或行被清掉、或值是脏数据，都回退默认主题，
+    绝不因为配色读不到就让整帧渲染失败。
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'theme.color'").fetchone()
+    except sqlite3.Error:
+        return DEFAULT_THEME
+    return row[0] if row and row[0] in SCREEN_PALETTES else DEFAULT_THEME
+
+
 def load_from_db(db_path: str) -> dict:
     conn = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
+    theme = load_theme_key(conn)
     now = datetime.now(TZ8)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     start = (day_start.astimezone(timezone.utc)).isoformat()
@@ -134,6 +171,7 @@ def load_from_db(db_path: str) -> dict:
         "last_activity": last_activity,
         "providers": providers, "updated": now.strftime("%H:%M"),
         "date": now.strftime("%Y-%m-%d"),
+        "theme": theme,
         "env": collect_env(),
     }
 
@@ -143,6 +181,7 @@ def demo_data() -> dict:
         "tokens": 1_437_931, "records": 17, "last_activity": "22:41",
         "providers": [("WorkBuddy", 1_437_931)],
         "updated": "22:42", "date": "2026-11-15",
+        "theme": DEFAULT_THEME,
         "env": {"clock": "22:42"},
     }
 
@@ -163,8 +202,12 @@ def card(d: ImageDraw.ImageDraw, box) -> None:
     d.rounded_rectangle(box, radius=10, fill=PANEL, outline=BORDER, width=1)
 
 
-def bar(d: ImageDraw.ImageDraw, box, frac: float, color: str = ACCENT) -> None:
-    """带深色轨道的比例条；极小非零值也留最小可见宽度。"""
+def bar(d: ImageDraw.ImageDraw, box, frac: float, color: str) -> None:
+    """带深色轨道的比例条；极小非零值也留最小可见宽度。
+
+    color 必填而不给默认值：默认参数在 def 时求值，会悄悄钉死某一个主题的
+    主色，让 `palette_for` 的切换在比例条上失效。
+    """
     x0, y0, x1, y1 = box
     d.rounded_rectangle(box, radius=3, fill=GRID)
     if frac > 0:
@@ -173,8 +216,12 @@ def bar(d: ImageDraw.ImageDraw, box, frac: float, color: str = ACCENT) -> None:
 
 
 def big_number(d: ImageDraw.ImageDraw, x: int, y: int, v: int,
-               size: int = 34, unit_size: int = 17, color: str = ACCENT) -> None:
-    """数字大、单位小，底边严格对齐（按 bbox 实测，不靠字号差猜偏移）。"""
+               size: int, unit_size: int, color: str) -> None:
+    """数字大、单位小，底边严格对齐（按 bbox 实测，不靠字号差猜偏移）。
+
+    所有造型参数均必填：默认参数在 def 时求值，会把某个主题的颜色和字号
+    永久钉在这一份代码上。
+    """
     num, unit = split_wan(v)
     fn = font(size, True)
     d.text((x, y), num, font=fn, fill=color, anchor="la")
@@ -204,6 +251,10 @@ def draw_clock(d: ImageDraw.ImageDraw, env: dict, *, x: int, y: int,
 
 
 def render(data: dict, portrait: bool = False) -> Image.Image:
+    # 配色随 data["theme"]（load_from_db 从 settings 表读入）走。保持 render
+    # 单一入口：screen_loop 的每轮推送和本文件的 main() 都不必多传参数，
+    # 主题变化自然体现在下一帧上。
+    accent, accent2 = palette_for(data.get("theme"))
     w, h = (H, W) if portrait else (W, H)
     img = Image.new("RGB", (w, h), BG)
     d = ImageDraw.Draw(img)
@@ -212,9 +263,9 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
     # ---- 标题栏：小色块 logo + live 点 + 日期（统一 16px 网格）----
     d.rectangle((0, 0, w, 42), fill=PANEL)
     d.rectangle((0, 41, w, 42), fill=BORDER)
-    d.rounded_rectangle((M - 2, 13, M + 6, 29), radius=2, fill=CYAN)
+    d.rounded_rectangle((M - 2, 13, M + 6, 29), radius=2, fill=accent2)
     d.text((M + 14, 11), "TOKEN MONITOR", font=font(15, True), fill=TEXT)
-    d.ellipse((w - 98, 19, w - 92, 25), fill=CYAN)
+    d.ellipse((w - 98, 19, w - 92, 25), fill=accent2)
     d.text((w - M, 13), data["date"], font=font(12), fill=MUTED, anchor="ra")
 
     total_p = sum(p[1] for p in data["providers"]) or 1
@@ -229,20 +280,21 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
         card(d, (rx, ct, rx + cw, cb))
 
         d.text((lx + 14, ct + 9), "今日 TOKEN", font=font(12), fill=MUTED)
-        big_number(d, lx + 14, ct + 30, data["tokens"], size=34, unit_size=17)
+        big_number(d, lx + 14, ct + 30, data["tokens"],
+                   size=34, unit_size=17, color=accent)
 
         d.text((rx + 14, ct + 9), "今日活跃", font=font(12), fill=MUTED)
         d.text((rx + cw - 14, ct + 10), f"最近 {data.get('last_activity', '--:--')}",
                font=font(11), fill=MUTED, anchor="ra")
         rec = str(data.get("records", 0))
         fr = font(34, True)
-        d.text((rx + 14, ct + 28), rec, font=fr, fill=CYAN, anchor="la")
+        d.text((rx + 14, ct + 28), rec, font=fr, fill=accent2, anchor="la")
         rnw = d.textlength(rec, font=fr)
         rb = d.textbbox((0, 0), rec, font=fr, anchor="la")
         fu = font(15, True)
         ub = d.textbbox((0, 0), "次", font=fu, anchor="la")
         d.text((rx + 14 + rnw + 8, ct + 28 + (ub[1] - rb[1]) + (rb[3] - ub[3])),
-               "次", font=fu, fill=CYAN, anchor="la")
+               "次", font=fu, fill=accent2, anchor="la")
 
         # ---- 底部：左 = Agent 分布（2/3），右 = 时间（1/3）----
         # 文档第6章：原版 3:1 改成 2:1，时间区更宽松，可上更大字号。
@@ -260,8 +312,8 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
             ry = by + 22 + i * 40
             d.text((M, ry), name, font=font(14), fill=TEXT)
             d.text((div_x, ry + 1), f"{v / total_p * 100:.0f}%",
-                   font=font(13), fill=ACCENT, anchor="ra")
-            bar(d, (M, ry + 20, div_x, ry + 26), v / total_p)
+                   font=font(13), fill=accent, anchor="ra")
+            bar(d, (M, ry + 20, div_x, ry + 26), v / total_p, accent)
 
         # 分隔线
         d.rectangle((div_x + 4, by, div_x + 5, h - 14), fill=GRID)
@@ -284,7 +336,8 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
         # ---- 竖屏：卡片上下排列 ----
         card(d, (M, 52, w - M, 140))
         d.text((M + 14, 62), "今日 TOKEN 用量", font=font(12), fill=MUTED)
-        big_number(d, M + 14, 84, data["tokens"], size=40, unit_size=19)
+        big_number(d, M + 14, 84, data["tokens"],
+                   size=40, unit_size=19, color=accent)
 
         card(d, (M, 150, w - M, 238))
         d.text((M + 14, 160), "今日活跃", font=font(12), fill=MUTED)
@@ -292,21 +345,21 @@ def render(data: dict, portrait: bool = False) -> Image.Image:
                font=font(11), fill=MUTED, anchor="ra")
         rec = str(data.get("records", 0))
         fr = font(34, True)
-        d.text((M + 14, 180), rec, font=fr, fill=CYAN, anchor="la")
+        d.text((M + 14, 180), rec, font=fr, fill=accent2, anchor="la")
         rnw = d.textlength(rec, font=fr)
         rb = d.textbbox((0, 0), rec, font=fr, anchor="la")
         fu = font(15, True)
         ub = d.textbbox((0, 0), "次", font=fu, anchor="la")
         d.text((M + 14 + rnw + 8, 180 + (ub[1] - rb[1]) + (rb[3] - ub[3])),
-               "次", font=fu, fill=CYAN, anchor="la")
+               "次", font=fu, fill=accent2, anchor="la")
 
         ay = 248
         d.text((M, ay), "AGENT 分布", font=font(12), fill=MUTED)
         d.text((w - M, ay), "占比", font=font(11), fill=MUTED, anchor="ra")
         d.text((M, ay + 20), top[0], font=font(13), fill=TEXT)
         d.text((w - M, ay + 21), f"{top[1] / total_p * 100:.0f}%",
-               font=font(12), fill=ACCENT, anchor="ra")
-        bar(d, (M, ay + 40, w - M, ay + 46), top[1] / total_p)
+               font=font(12), fill=accent, anchor="ra")
+        bar(d, (M, ay + 40, w - M, ay + 46), top[1] / total_p, accent)
 
         # ---- 大时钟：仅时间 ----
         ey = 300

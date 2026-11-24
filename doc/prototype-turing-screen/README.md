@@ -97,6 +97,24 @@ $PY build_exe.py                  # 打包 → dist/TokenScreen.exe（PyInstalle
 - **重打包流程**：改 Python → `python build_exe.py`（PyInstaller 自带 `--clean`；直接跑，**不要传 `--clean`**——外层 `build_exe.py --clean` 的 `shutil.rmtree` 在沙箱里会被 safe-delete 拦截报 OSError）→ 把 `dist/TokenScreen.exe` 覆盖到 `assets/` → `cargo build --release`。
 - **验证**：`cargo check`、`cargo test --lib`（211 项）、`cargo fmt` 全通过；新 exe 以主程序同款参数 `--partial --interval 15` 实机跑通（全帧建基准 + 跨分钟局部刷新 4614B）。
 
+## 配色随主题（2026-11-20）
+
+屏上配色跟随主程序「设置 → 主题色」，四个主题一一对应：
+
+| 主题 | key | 主色（今日 TOKEN / 占比 / 比例条） | 辅色（logo / live 点 / 活跃次数） |
+|---|---|---|---|
+| 海蓝 | `ocean` | `#5B9CF8` | `#3FD0C9` |
+| 青玉 | `jade` | `#34D399` | `#22D3EE` |
+| 琥珀 | `amber` | `#FBBF24` | `#FB923C` |
+| 玫瑰 | `rose` | `#FB7185` | `#F0ABFC` |
+
+- **只换两个数据色，结构色恒定**：底 `#0A1120`、卡片 `#131D31`、描边 `#26365A`、文字白/灰全部不随主题变。理由有二：主程序换主题本来也只换 accent、底色不动，屏上同构处理才与软件体感一致；且 RGB565 只有 5/6/5 位色深，深底上的 1px 描边往彩色偏就会糊。
+- **不复用 Rust 的 `ThemeColor::accent()`**：UI 的 Ocean 是 `#3b82f6`，在深底上对比度 4.2:1，比屏端现行 `#5B9CF8`（6.8:1）暗一档，3.5 寸强环境光下读不清。屏端各主题统一取比 UI accent 亮一级的色阶，四套实测对比度均 ≥ 6.8:1。
+- **主题的真值源是 `settings` 表**：`render_screen.load_theme_key()` 复用 `load_from_db` 已打开的只读连接查 `theme.color`，主程序不需要向 Python 传任何东西；行缺失 / 脏值 / 旧库无 `settings` 表都回退 `ocean`（即上线前的原配色，默认主题零视觉回归）。
+- **即时上屏**：`select_theme_color` 末尾在开关开启时调一次 `screen_push.notify()` 写触发文件（失败只记 stderr）；`data_fingerprint` 也把 `theme` 纳入，形成双保险——即使主程序没喊，最迟 60s 内时钟跳变也会带出新配色。
+- **大面积脏块转全帧**：换主题会让包围盒铺满全屏（实测 75%），而局部路径要一次性写出近 300KB 的 crop、全帧路径才是分块写且唯一做过实机点亮验证的路径 ⇒ `push_diff` 里面积过半即改走 `push_full` 重建基准。实测时钟变化 1.5%、数字变化 2.0%，仍走局部，不会被误升。
+- **效果图**：`theme-preview/theme_compare_2x.png` 四主题对比（真实数据渲染）；单张见 `theme-preview/theme_<key>_2x.png`。
+
 ## Revision A vs B — 买屏/收货必看（官方 wiki 核对）
 
 | 判据 | Revision A（图灵 TURZX 3.5"，本方案支持） | Revision B（玄方 XuanFang，本脚本**不支持**） |

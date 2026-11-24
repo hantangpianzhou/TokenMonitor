@@ -376,6 +376,17 @@ impl TokenMonitorApp {
         // own, so it is covered too.
         cx.refresh_windows();
         cx.notify();
+
+        // 小屏配色跟着换：写一个触发文件让常驻推送进程立刻推一帧。颜色仍由
+        // Python 侧重新读 settings 表得到，不跨语言传色 —— 这里只负责"喊一声"，
+        // 否则要等时钟每分钟变化或下一次数据变化才上屏。
+        // 必须挂在开关上：notify() 发现进程没跑会顺手拉起它，关着开关换主题
+        // 不该把推送进程叫醒。失败只记 stderr，与扫描完成时的 notify 一致。
+        if self.screen_push_enabled {
+            if let Err(e) = self.screen_push.notify() {
+                eprintln!("[TokenMonitor] screen push notify (theme): {e}");
+            }
+        }
     }
 
     /// Toggle OS auto-start registration (Run key / XDG entry / LaunchAgent).
