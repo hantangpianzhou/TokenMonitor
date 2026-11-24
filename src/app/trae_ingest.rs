@@ -5,8 +5,10 @@
 //!     --TraeCollector.exe --auto--> tokenmonitor.db.usage_records (provider='trae')
 //!
 //! 设计要点：
-//! - `--auto` 只走缓存 key（HMAC 校验当前库），命中即解密+幂等写库；失效静默退出。
-//!   绝不扫内存提 key —— 那需要管理员权限、≤60s、近期有 agent 任务，会拖垮扫描。
+//! - `--auto` 优先用缓存 key（HMAC 校验当前库），命中即解密+幂等写库；缓存失效
+//!   且不在 30 分钟冷却期时会扫内存提 key（≤180s，需 Trae 活跃且近期有 agent
+//!   任务），让新电脑/换 key 后能自愈。提 key 失败写冷却并静默跳过。全程日志
+//!   落盘到 `%APPDATA%\TokenMonitor\trae_ingest.log`（子进程 stdout 被丢弃）。
 //! - 单文件分发：exe 通过 `include_bytes!` 编进主程序，首次释放到 `%TEMP%` 并复用。
 //! - 短命进程 + 防重入：每次 --auto 写完自退；上一次还在跑就跳过本轮。
 //! - 无黑框：Windows 用 `CREATE_NO_WINDOW`。

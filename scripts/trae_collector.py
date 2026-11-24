@@ -23,8 +23,10 @@ Trae -> TokenMonitor 采集脚本（Windows）
   python trae_collector.py --force-extract # 强制重新从内存提 key 并刷新缓存
   python trae_collector.py --dry-run       # 预览解析结果，不写库
   python trae_collector.py --auto          # 自动采集（主程序每轮扫描时拉起）
-      —— 只走缓存 key：命中即解密+幂等写库；失效立即静默退出（不扫内存、不提示）。
-         退出码 0=成功/无新数据，2=缓存失效跳过，其它=真错误。
+      —— 缓存有效即解密+幂等写库；失效且不在冷却期则扫内存提 key（≤180s，
+         需 Trae 活跃且近期有 agent 任务），失败写 30 分钟冷却后静默跳过。
+         每次运行全程落盘到 %APPDATA%\\TokenMonitor\\trae_ingest.log 供排查。
+         退出码 0=成功/无新数据，2=缓存失效/冷却/提key失败，6=异常。
 
 依赖：pycryptodome（python -m pip install pycryptodome）
 """
@@ -60,20 +62,62 @@ TRAE_DB = os.path.join(TRAE_DIR, "database.db")
 TM_DB = os.path.join(APPDATA, "TokenMonitor", "tokenmonitor.db")
 KEY_CACHE = os.path.join(APPDATA, "TokenMonitor", "trae_key.json")
 KEY_FAIL = os.path.join(APPDATA, "TokenMonitor", "trae_key_fail.json")  # 提 key 失败时间戳（冷却用）
+LOG_FILE = os.path.join(APPDATA, "TokenMonitor", "trae_ingest.log")     # 每次运行落盘，换机可排查
+LOG_MAX = 1024 * 1024       # 日志超过 1MB 轮转为 .1，避免无限增长
 TM_CONFIG_DIR = os.path.join(APPDATA, "TokenMonitor")
 WORK = os.path.join(tempfile.gettempdir(), "tm_trae_collector")
-EXTRACT_COOLDOWN_SEC = 30 * 60   # 自动提 key 失败后冷却 30 分钟，避免每轮扫描都卡 60s
+EXTRACT_COOLDOWN_SEC = 30 * 60   # 自动提 key 失败后冷却 30 分钟，避免每轮扫描都卡 180s
 
 PAGE_SZ, SALT_SZ, RESERVE_SZ, IV_SZ, HMAC_SZ = 4096, 16, 80, 16, 64
 CRYPT_SZ = PAGE_SZ - RESERVE_SZ            # 4016
 SQLITE_HDR = b"SQLite format 3\x00"
 KEY_SZ = 32
-PROC_HINTS = ('"trae cn.exe"', 'teleagent.exe', '"ais.exe"')
-MAX_SCAN_SECONDS = 60    # 单次提 key 的总时长上限，超时即走「请先发起一次 agent 任务」提示
+# 主进程（中文版 Trae CN / 国际版 Trae）放前面：key 通常驻留在主进程内存
+PROC_HINTS = ('"trae cn.exe"', '"trae.exe"', 'teleagent.exe', '"ais.exe"')
+MAX_SCAN_SECONDS = 180   # 单次提 key 总时长上限；配合「小进程优先」后实测命中只需秒级
+# x'hex' 模式（原始唯一一次成功提 key 的 tag=x96）：预筛必须保留含此模式的内存块，
+# 否则 key 若恰在无 binary salt 的块里会被直接丢弃。
+X96_RE = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
+
+
+_stdio_fixed = False
+
+
+def _fix_stdio():
+    """PyInstaller 打包程序在中文 Windows 下 stdout/stderr 默认 GBK，
+    打印 ✗/✓ 等符号会 UnicodeEncodeError 打断整个 --auto 流程。
+    强制切 UTF-8（在代码里做，不依赖 PYTHONIOENCODING 环境变量）。"""
+    global _stdio_fixed
+    if _stdio_fixed:
+        return
+    _stdio_fixed = True
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except Exception:
+            pass
 
 
 def log(*a):
-    print(*a, flush=True)
+    line = " ".join(str(x) for x in a)
+    # 1) 控制台：编码安全，即便 reconfigure 失效也不让符号打崩流程
+    _fix_stdio()
+    try:
+        print(line, flush=True)
+    except Exception:
+        try:
+            print(line.encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
+    # 2) 落盘：主程序把子进程 stdout/stderr 丢进 null，只有文件能留痕供换机排查
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+        os.makedirs(TM_CONFIG_DIR, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (datetime.datetime.now().strftime("%m-%d %H:%M:%S"), line))
+    except Exception:
+        pass
 
 
 class ExtractError(Exception):
@@ -172,17 +216,37 @@ def clear_extract_failed():
 
 
 # --------------------------------------------------------- 内存提 key 层 ---
+def _parse_mem_kb(cols):
+    """tasklist CSV 最后一列形如 '1,234 K'，解析成 KB 整数；失败返回大值。"""
+    try:
+        return int(re.sub(r"[^\d]", "", cols[-1]) or 10 ** 9)
+    except Exception:
+        return 10 ** 9
+
+
 def _target_pids():
     out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
                          capture_output=True, timeout=30).stdout.decode("gbk", errors="replace")
-    pids = []
+    primary, others = [], []
     for line in out.splitlines():
-        if any(k in line.lower() for k in PROC_HINTS):
-            try:
-                pids.append(int(line.split('","')[1]))
-            except Exception:
-                pass
-    return pids
+        cols = line.split('","')
+        low = line.lower()
+        for idx, k in enumerate(PROC_HINTS):
+            if k in low:
+                try:
+                    pid = int(cols[1])
+                    # (pid, 工作集 KB) —— 一次 tasklist 拿到，无需逐进程再查
+                    (primary if idx == 0 else others).append((pid, _parse_mem_kb(cols)))
+                except Exception:
+                    pass
+                break
+    # 关键修复（2026-11-23）：原始唯一成功提 key 的记录里，key 在仅 34MB 的
+    # PID 11636，但按 tasklist 顺序它排第 6，前 5 个大进程(294/315/1189/415/451MB)
+    # 白扫 251s，累计 254s 才命中 —— 超过 180s 上限必然超时。
+    # 按工作集升序：小进程先扫，key 驻留的轻量 agent 进程秒级命中。
+    primary.sort(key=lambda x: x[1])
+    others.sort(key=lambda x: x[1])
+    return [p for p, _ in primary] + [p for p, _ in others]
 
 
 def _setup_win32():
@@ -208,7 +272,6 @@ def _scan_regions(regions, hdr: DbHeader):
     """两阶段：只读内存，再只在 salt 锚点附近验证 key（避免对整块跑正则）。"""
     salt = hdr.salt
     salt_ascii = salt.hex().encode()
-    x96_re = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
 
     def hit(kc):
         return kc if hdr.verify(kc) else None
@@ -248,8 +311,8 @@ def _scan_regions(regions, hdr: DbHeader):
                                 continue
                             if got:
                                 return got
-        # 3) x'<64..192 hex>' 模式（参考实现）
-        for m in x96_re.finditer(data):
+        # 3) x'<64..192 hex>' 模式（原始唯一成功提 key 的命中方式）
+        for m in X96_RE.finditer(data):
             s = m.group(1).decode(errors="ignore")
             for j in range(0, max(1, len(s) - 63), 32):
                 kc = s[j:j + 64]
@@ -277,7 +340,7 @@ def extract_key_from_memory(hdr: DbHeader):
     for pid in pids:
         if time.perf_counter() - t0 > MAX_SCAN_SECONDS:
             log("[key] 扫描超过 %ds 上限" % MAX_SCAN_SECONDS)
-            break
+            raise ExtractError()
         h = k32.OpenProcess(0x0010 | 0x0400, False, pid)   # VM_READ | QUERY_INFO
         if not h:
             continue
@@ -285,6 +348,11 @@ def extract_key_from_memory(hdr: DbHeader):
         addr = ctypes.c_void_p(0x10000)
         mbi = MBI()
         while k32.VirtualQueryEx(h, addr, ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            # 内层也查超时：原来只在 pid 循环开头查，单个大进程读完就远超上限
+            if time.perf_counter() - t0 > MAX_SCAN_SECONDS:
+                log("[key] 扫描超过 %ds 上限" % MAX_SCAN_SECONDS)
+                k32.CloseHandle(h)
+                raise ExtractError()
             base, size = mbi.BaseAddress or 0, mbi.RegionSize
             if mbi.State == 0x1000 and mbi.Protect in READABLE and 0 < size < 600 * 1024 * 1024:
                 buf = (ctypes.c_ubyte * size)()
@@ -292,8 +360,10 @@ def extract_key_from_memory(hdr: DbHeader):
                 if k32.ReadProcessMemory(h, ctypes.c_void_p(base), buf, size, ctypes.byref(got)) and got.value:
                     chunk = bytes(buf[:got.value])
                     readable_regions += 1
-                    # 预筛：只保留含 salt 二进制锚点的块，避免对整块跑正则（性能关键）
-                    if salt in chunk:
+                    # 预筛（2026-11-23 修正）：binary salt 锚点 OR x'hex' 文本锚点都保留。
+                    # 原始唯一成功提 key 的 tag=x96 —— key 在文本模式里，若该内存块
+                    # 恰好没有 binary salt，旧预筛会把含 key 的块直接丢弃。
+                    if salt in chunk or b"x'" in chunk:
                         regions.append(chunk)
             addr = ctypes.c_void_p(base + size)
             if base + size > 0x7FFFFFFFFFFF:
@@ -322,7 +392,7 @@ def get_key(hdr: DbHeader, force: bool = False):
         key = extract_key_from_memory(hdr)
     except ExtractError:
         log("")
-        log("✗ 提 key 失败：请先发起一次 agent 任务再重试")
+        log("[X] 提 key 失败：请先发起一次 agent 任务再重试")
         log("  说明：SQLCipher key 只在 agent 任务运行时驻留 Trae 进程内存；")
         log("        若 Trae 刚启动或近期无 agent 任务，内存里没有 key 可提。")
         return None
@@ -452,7 +522,7 @@ def build_rows(turns):
 
 def import_rows(rows, commit=True):
     if not os.path.exists(TM_DB):
-        log("✗ TokenMonitor 数据库不存在：%s" % TM_DB)
+        log("[X] TokenMonitor 数据库不存在：%s" % TM_DB)
         return None
     con = sqlite3.connect(TM_DB, timeout=15)
     con.execute("PRAGMA busy_timeout=15000")
@@ -479,20 +549,20 @@ def main():
     force = "--force-extract" in args
     dry = "--dry-run" in args
     check_only = "--check" in args
-    auto = "--auto" in args     # 主程序每轮扫描拉起：只用缓存 key，失效静默跳过
+    auto = "--auto" in args     # 主程序每轮扫描拉起：缓存失效会尝试自动提 key
 
     if not os.path.exists(TRAE_DB):
         if auto:
             return 0            # 没装 Trae：静默无事，不打扰
-        log("✗ 未找到 Trae 数据库：%s" % TRAE_DB)
+        log("[X] 未找到 Trae 数据库：%s" % TRAE_DB)
         return 1
 
     if auto:
-        # --auto 后台自动模式：全程静默，只在真出错时写一行供排查。
+        # --auto 后台自动模式：stdout/stderr 被主程序丢弃，全程落盘 trae_ingest.log。
         # key 判断（2026-11-19）：先查缓存并用当前库 salt+HMAC 校验——有效就
         # 直接复用（不扫内存）；无效则尝试自动提 key 并存缓存，让新电脑/换 key
-        # 后能自愈。提 key 要扫内存（≤60s + 需近期有 agent 任务），失败后写
-        # 30 分钟冷却，避免 Trae 没开时每轮扫描都卡 60s。
+        # 后能自愈。提 key 要扫内存（≤180s + 需近期有 agent 任务），失败后写
+        # 30 分钟冷却，避免 Trae 没开时每轮扫描都卡 180s。
         try:
             hdr = DbHeader()
             key, why = load_cached_key(hdr)
@@ -518,8 +588,13 @@ def main():
                 import_rows(rows, commit=True)
             return 0
         except Exception as e:
-            # 自动模式不向 UI 抛错（子进程 stdout 被丢弃），仅留一行到 stderr 便于排查
-            print("[auto] Trae 采集跳过: %s" % e, file=sys.stderr, flush=True)
+            # 自动模式不向 UI 抛错（子进程 stdout 被丢弃）；落盘 + 写冷却，
+            # 避免异常分支不写冷却导致每轮扫描都卡满 180s。
+            log("[auto] Trae 采集跳过（异常）: %s" % e)
+            try:
+                mark_extract_failed("auto exception: %s" % e)
+            except Exception:
+                pass
             return 6
 
     hdr = DbHeader()
@@ -541,7 +616,7 @@ def main():
     ic = probe.execute("PRAGMA integrity_check").fetchone()[0]
     probe.close()
     if ic != "ok":
-        log("✗ 明文库 integrity_check 失败：%s（主库快照可能正在写入，请稍后重试）" % ic)
+        log("[X] 明文库 integrity_check 失败：%s（主库快照可能正在写入，请稍后重试）" % ic)
         return 4
 
     turns = parse_turns(plain)
